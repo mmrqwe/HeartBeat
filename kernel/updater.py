@@ -27,6 +27,20 @@ from . import toolsafety
 # 可进化模块清单（brain 层，允许 AI 替换升级）
 BUILTIN_MODULES = ("memory", "planner")
 
+# 包模块：版本单元是目录（多文件 + __init__.py + _contract.py），
+# 整体版本化（active 指向整个包版本，禁止包内混版本）。
+# 阶段2（2026-08-12）：brain 包化后 agent 控制流也进入进化域。
+PACKAGE_MODULES = ("brain",)
+# 包内子模块固定布局：文件名 -> 公开类名（内核强制，候选不可改——
+# 防止候选把类藏到任意文件里逃避契约检查）
+PACKAGE_LAYOUT = {
+    "brain": (
+        ("agent.py", "Agent"),
+        ("memory.py", "MemoryModule"),
+        ("planner.py", "Planner"),
+    ),
+}
+
 # 每个模块的公开契约：类名 + 必需方法（升级候选必须完整实现）
 # 维护约定：brain 层模块的公开方法即升级契约——方法签名/语义变更必须同步
 # 更新本清单（升级候选缺少任一方法会被 L1 拒绝）；新增契约方法属破坏性
@@ -43,6 +57,18 @@ REQUIRED_METHODS = {
         "pick_search_topic", "patrol_topics", "maybe_save_thought",
         "build_time_context", "build_recent_thread",
     },
+    # brain 包内 agent.py 的 Agent 类（控制流契约，阶段3 冒烟再扩展）
+    "Agent": {"chat", "think", "tick"},
+    "MemoryModule": {
+        "remember", "relevant", "profile", "extract_facts",
+        "followup_candidate", "parse_schedule_expiry", "format_memories",
+    },
+    "Planner": {
+        "rules_think", "greeting", "cooldown_ok", "proactive_budget_ok",
+        "mark_proactive", "is_quiet", "update_mood", "plugin_messages",
+        "pick_search_topic", "patrol_topics", "maybe_save_thought",
+        "build_time_context", "build_recent_thread",
+    },
 }
 
 
@@ -54,6 +80,8 @@ class Updater:
     BUILTIN_MODULES = BUILTIN_MODULES
     CLASSES = CLASSES
     REQUIRED_METHODS = REQUIRED_METHODS
+    PACKAGE_MODULES = PACKAGE_MODULES
+    PACKAGE_LAYOUT = PACKAGE_LAYOUT
 
     def __init__(self, data_dir):
         self.root = Path(data_dir) / "brain"
@@ -66,8 +94,8 @@ class Updater:
     # ---------- 审计 ----------
 
     def _base(self, name):
-        """模块根目录：内置模块在 <data>/brain/<name>/，进化工具在 <data>/tools/<name>/。"""
-        if name in BUILTIN_MODULES:
+        """模块根目录：内置/包模块在 <data>/brain/<name>/，进化工具在 <data>/tools/<name>/。"""
+        if name in BUILTIN_MODULES or name in PACKAGE_MODULES:
             return self.root / name
         return self.root.parent / "tools" / name
 
@@ -225,6 +253,8 @@ class Updater:
     # ---------- 加载 ----------
 
     def _load_version(self, name, version):
+        if name in PACKAGE_MODULES:
+            return self._load_package_version(name, version)
         src = self._base(name) / version / f"{name}.py"
         if not src.is_file():
             raise FileNotFoundError(f"{name} {version} 缺少模块文件")
@@ -248,6 +278,74 @@ class Updater:
             raise ValueError(f"{name} {version} 缺少类 {CLASSES[name]}")
         return module
 
+    def _load_package_version(self, name, version):
+        """加载包版本：版本目录作为包（__init__.py 入口），
+        子模块相对导入（from .memory import ...）经 sys.modules 注册解析。"""
+        return self._load_package_dir(name, self._base(name) / version, version)
+
+    def _load_package_dir(self, name, pkg_dir, tag):
+        """从任意目录加载包（版本加载 tag=vN，候选验证 tag='candidate'）。"""
+        pkg_dir = Path(pkg_dir)
+        init = pkg_dir / "__init__.py"
+        if not init.is_file():
+            raise FileNotFoundError(f"{name} 包目录缺少 __init__.py：{pkg_dir}")
+        mod_name = f"hb_pkg_{tag}_{name.replace('.', '_')}"
+        # 先清理同名残留，避免候选/多版本间污染
+        for key in list(sys.modules):
+            if key == mod_name or key.startswith(mod_name + "."):
+                del sys.modules[key]
+        spec = importlib.util.spec_from_file_location(
+            mod_name, init, submodule_search_locations=[str(pkg_dir)]
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"{name} 包无法加载")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(mod_name, None)
+            raise
+        self._check_package_contract(name, module)
+        return module
+
+    def _check_package_contract(self, name, module):
+        """包级契约：PACKAGE_LAYOUT 固定文件名->类名，逐项校验存在性。
+
+        子模块经 getattr(module, file) 不可达（模块不是属性），
+        直接按 spec.name 前缀从 sys.modules 取子模块。"""
+        base_name = module.__name__
+        for file_name, cls_name in PACKAGE_LAYOUT.get(name, ()):
+            sub = sys.modules.get(f"{base_name}.{file_name[:-3]}")
+            if sub is None:
+                raise ValueError(f"{name} 包缺少子模块 {file_name}")
+            if not callable(getattr(sub, cls_name, None)):
+                raise ValueError(f"{name} 包子模块 {file_name} 缺少类 {cls_name}")
+
+    def _package_exports(self, name, pkg_dir):
+        """读取候选包 _contract.py 的 EXPORTS 声明，与内核 PACKAGE_LAYOUT 比对。
+
+        返回 (ok, errors)。EXPORTS 必须与内核固定布局完全一致——
+        候选自声明只允许"确认"布局，不允许"修改"布局（防自我验收）。
+        """
+        contract = pkg_dir / "_contract.py"
+        if not contract.is_file():
+            return False, ["包候选缺少 _contract.py（声明 EXPORTS 与内核布局一致）"]
+        namespace: dict = {}
+        try:
+            code = contract.read_text(encoding="utf-8")
+            compile(code, str(contract), "exec")
+            exec(code, namespace)  # 仅读 EXPORTS 字面量（不执行候选业务代码）
+        except Exception as exc:
+            return False, [f"_contract.py 解析失败：{type(exc).__name__}: {exc}"]
+        declared = namespace.get("EXPORTS")
+        expected = dict(PACKAGE_LAYOUT.get(name, ()))
+        if not isinstance(declared, dict) or declared != expected:
+            return False, [
+                f"_contract.py EXPORTS 与内核布局不一致（期望 {expected}，声明 {declared}）"
+            ]
+        return True, []
+
     def load(self, name):
         """按 active 指针加载模块对象（不实例化）。"""
         version = self.active_version(name)
@@ -270,6 +368,8 @@ class Updater:
         candidate_dir = Path(candidate_dir)
         if name == "tool":
             return self._validate_tool_candidate(candidate_dir, upgrade_of=upgrade_of)
+        if name in PACKAGE_MODULES:
+            return self._validate_package_candidate(name, candidate_dir, run_smoke)
         src = candidate_dir / f"{name}.py"
         errors = []
         if not src.is_file():
@@ -294,6 +394,50 @@ class Updater:
         missing = sorted(REQUIRED_METHODS[name] - set(dir(cls)))
         if missing:
             return False, [f"L1 缺少方法：{', '.join(missing)}"]
+        # L2：宿主冒烟（构造真实 Agent 跑契约方法）
+        if run_smoke and self.smoke_runner is not None:
+            try:
+                ok = self.smoke_runner(name, module)
+            except Exception as exc:
+                return False, [f"L2 冒烟异常：{type(exc).__name__}: {exc}"]
+            if not ok:
+                return False, ["L2 冒烟未通过"]
+        return True, []
+
+    def _validate_package_candidate(self, name, candidate_dir, run_smoke=True):
+        """验证包候选：L0 逐文件编译 + 包加载；L1 布局/契约；L2 冒烟。
+
+        候选包目录即版本单元（__init__.py + 子模块 + _contract.py），
+        校验通过后整体拷入版本目录。"""
+        candidate_dir = Path(candidate_dir)
+        if not (candidate_dir / "__init__.py").is_file():
+            return False, ["包候选目录缺少 __init__.py"]
+        # L0：逐文件语法 + 包加载
+        for py in sorted(candidate_dir.glob("*.py")):
+            if py.name == "_contract.py":
+                continue
+            try:
+                compile(py.read_text(encoding="utf-8"), str(py), "exec")
+            except SyntaxError as exc:
+                return False, [f"L0 语法错误（{py.name}）：{exc}"]
+        try:
+            module = self._load_package_dir(name, candidate_dir, "candidate")
+        except Exception as exc:
+            return False, [f"L0 包加载失败：{type(exc).__name__}: {exc}"]
+        # L1：_contract 布局 + 类契约
+        ok, errs = self._package_exports(name, candidate_dir)
+        if not ok:
+            return False, errs
+        for file_name, cls_name in PACKAGE_LAYOUT.get(name, ()):
+            sub = sys.modules.get(f"hb_pkg_candidate_{name.replace('.', '_')}.{file_name[:-3]}")
+            if sub is None:
+                return False, [f"L1 包缺少子模块 {file_name}"]
+            cls = getattr(sub, cls_name, None)
+            if not callable(cls):
+                return False, [f"L1 子模块 {file_name} 缺少类 {cls_name}"]
+            missing = sorted(REQUIRED_METHODS.get(cls_name, set()) - set(dir(cls)))
+            if missing:
+                return False, [f"L1 {cls_name} 缺少方法：{', '.join(missing)}"]
         # L2：宿主冒烟（构造真实 Agent 跑契约方法）
         if run_smoke and self.smoke_runner is not None:
             try:
@@ -357,6 +501,8 @@ class Updater:
         """
         if name == "tool":
             return self._install_tool_candidate(candidate_dir, upgrade_of=upgrade_of)
+        if name in PACKAGE_MODULES:
+            return self._install_package_candidate(name, candidate_dir)
         ok, errors = self.validate_candidate(name, candidate_dir)
         if not ok:
             raise ValueError("；".join(errors))
@@ -373,6 +519,49 @@ class Updater:
         self._audit("install", name, version, detail=str(Path(candidate_dir)))
         self._notify_switched(name, version)
         return version
+
+    def _install_package_candidate(self, name, candidate_dir):
+        """包候选安装：验证 → 整体拷入版本目录（仅 .py，含 _contract.py）
+        → 加载预检 → active 原子切换。失败删除新版本，不破坏现状。"""
+        ok, errors = self.validate_candidate(name, candidate_dir)
+        if not ok:
+            raise ValueError("；".join(errors))
+        candidate_dir = Path(candidate_dir)
+        version = self._next_version(name)
+        version_dir = self._base(name) / version
+        version_dir.mkdir(parents=True, exist_ok=True)
+        for py in candidate_dir.glob("*.py"):
+            shutil.copy2(py, version_dir / py.name)
+        try:
+            self._load_version(name, version)  # 安装后完整性预检
+        except Exception as exc:
+            shutil.rmtree(version_dir, ignore_errors=True)
+            raise ValueError(f"安装后加载失败：{exc}")
+        self._write_active(name, version)
+        self._audit("install", name, version, detail=str(candidate_dir))
+        self._notify_switched(name, version)
+        return version
+
+    def source_files(self, name):
+        """读当前 active 版本的全部源码：单文件 -> {f'{name}.py': text}；
+        包 -> {相对路径: text}（含 __init__.py 与 _contract.py）。
+        进化基准（升级 = 基于 active 源码生成新版本）。"""
+        version = self.active_version(name)
+        if not version:
+            raise FileNotFoundError(f"模块 {name} 未安装")
+        version_dir = self._base(name) / version
+        if not version_dir.is_dir():
+            raise FileNotFoundError(f"模块 {name} active 版本目录缺失：{version_dir}")
+        if name in PACKAGE_MODULES:
+            files = sorted(version_dir.glob("*.py"))
+        else:
+            files = [version_dir / f"{name}.py"]
+        result: dict = {}
+        for path in files:
+            if not path.is_file():
+                raise FileNotFoundError(f"模块 {name} active 版本源码缺失：{path}")
+            result[path.name] = path.read_text(encoding="utf-8")
+        return result
 
     def _install_tool_candidate(self, candidate_dir, upgrade_of=None):
         """进化工具安装：验证 → <data>/tools/<TOOL_NAME>/vN/ → active 切换。

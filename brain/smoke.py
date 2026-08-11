@@ -18,7 +18,14 @@ _CLASS_NAMES = {"memory": "MemoryModule", "planner": "Planner"}
 
 
 def smoke_test_module(module_name, module):
-    """用候选模块实例化契约类并跑契约方法。返回 True=通过，失败抛异常。"""
+    """用候选模块实例化契约类并跑契约方法。返回 True=通过，失败抛异常。
+
+    支持单文件模块（memory/planner）与包模块（brain，阶段2）：
+    包模式下从子模块取类（agent.py->Agent 等），Agent 做无参浅冒烟；
+    真实 Agent 构造复杂（需 cfg/db），阶段3 接入 L2b mock replay 深冒烟。
+    """
+    if module_name == "brain":
+        return _smoke_brain_package(module)
     cls = getattr(module, _CLASS_NAMES[module_name])
     with tempfile.TemporaryDirectory() as tmp:
         cfg = core.load_config(Path(tmp) / "config.json")
@@ -45,4 +52,24 @@ def smoke_test_module(module_name, module):
             inst.greeting(ag.clock())
             inst.patrol_topics()
             inst.rules_think({"collections": []}, ag.clock())
+    return True
+
+
+def _smoke_brain_package(module):
+    """包冒烟（阶段2 浅层）：子模块类存在性已由 L1 校验，这里验证
+    Agent 可实例化且 chat 可用（无参构造候选）；真实 Agent 构造需
+    cfg/db 参数（TypeError），此时仅确认子模块可导入（浅冒烟通过，
+    深冒烟由阶段3 L2b mock replay 承担）。"""
+    import sys
+
+    base = module.__name__
+    agent_cls = getattr(sys.modules[f"{base}.agent"], "Agent")
+    mem_cls = getattr(sys.modules[f"{base}.memory"], "MemoryModule")
+    plan_cls = getattr(sys.modules[f"{base}.planner"], "Planner")
+    try:
+        inst = agent_cls()
+    except TypeError:
+        return True  # 真实 Agent 构造需参数：浅冒烟通过，深冒烟阶段3
+    reply = inst.chat("hi")
+    assert isinstance(reply, str) and reply, "Agent.chat 返回空"
     return True

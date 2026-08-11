@@ -399,6 +399,170 @@ def test_updater_tool_rejects_bad_contract(tmp_path):
         assert any(expect in e or "L0 加载失败" in e for e in errors), errors
 
 
+_PACKAGE_FILES = {
+    "agent.py": (
+        "class Agent:\n"
+        "    def chat(self, text):\n        return 'pkg:' + str(text)\n"
+        "    def think(self, *a, **k):\n        return None\n"
+        "    def tick(self, *a, **k):\n        return None\n"
+    ),
+    "memory.py": (
+        "class MemoryModule:\n"
+        "    def remember(self, *a, **k):\n        return None\n"
+        "    def relevant(self, *a, **k):\n        return []\n"
+        "    def profile(self, *a, **k):\n        return {}\n"
+        "    def extract_facts(self, *a, **k):\n        return []\n"
+        "    def followup_candidate(self, *a, **k):\n        return None\n"
+        "    def parse_schedule_expiry(self, *a, **k):\n        return None\n"
+        "    def format_memories(self, *a, **k):\n        return ''\n"
+    ),
+    "planner.py": (
+        "class Planner:\n"
+        "    def rules_think(self, *a, **k):\n        return None\n"
+        "    def greeting(self, *a, **k):\n        return None\n"
+        "    def cooldown_ok(self, *a, **k):\n        return True\n"
+        "    def proactive_budget_ok(self, *a, **k):\n        return True\n"
+        "    def mark_proactive(self, *a, **k):\n        return None\n"
+        "    def is_quiet(self, *a, **k):\n        return False\n"
+        "    def update_mood(self, *a, **k):\n        return None\n"
+        "    def plugin_messages(self, *a, **k):\n        return []\n"
+        "    def pick_search_topic(self, *a, **k):\n        return None\n"
+        "    def patrol_topics(self, *a, **k):\n        return []\n"
+        "    def maybe_save_thought(self, *a, **k):\n        return None\n"
+        "    def build_time_context(self, *a, **k):\n        return ''\n"
+        "    def build_recent_thread(self, *a, **k):\n        return ''\n"
+    ),
+    "__init__.py": (
+        "from .agent import Agent\n"
+        "from .memory import MemoryModule\n"
+        "from .planner import Planner\n"
+    ),
+    "_contract.py": "EXPORTS = {'agent.py': 'Agent', 'memory.py': 'MemoryModule', 'planner.py': 'Planner'}\n",
+}
+
+
+def _write_package_candidate(tmp_dir, files=None):
+    cand = Path(tmp_dir) / "brain_cand"
+    cand.mkdir(exist_ok=True)
+    for name, content in (files or _PACKAGE_FILES).items():
+        (cand / name).write_text(content, encoding="utf-8")
+    return cand
+
+
+def test_package_validate_accepts(tmp_path):
+    upd = _make_updater(tmp_path)
+    cand = _write_package_candidate(tmp_path)
+    ok, errors = upd.validate_candidate("brain", cand, run_smoke=False)
+    assert ok, errors
+    assert not errors
+
+
+def test_package_rejects_missing_contract(tmp_path):
+    upd = _make_updater(tmp_path)
+    files = dict(_PACKAGE_FILES)
+    del files["_contract.py"]
+    cand = _write_package_candidate(tmp_path, files)
+    ok, errors = upd.validate_candidate("brain", cand, run_smoke=False)
+    assert not ok
+    assert any("_contract.py" in e for e in errors), errors
+
+
+def test_package_rejects_layout_mismatch(tmp_path):
+    upd = _make_updater(tmp_path)
+    files = dict(_PACKAGE_FILES)
+    files["_contract.py"] = (
+        "EXPORTS = {'agent.py': 'Agent', 'memory.py': 'MemoryModule'}\n"
+    )
+    cand = _write_package_candidate(tmp_path, files)
+    ok, errors = upd.validate_candidate("brain", cand, run_smoke=False)
+    assert not ok
+    assert any("EXPORTS" in e for e in errors), errors
+
+
+def test_package_rejects_missing_method(tmp_path):
+    upd = _make_updater(tmp_path)
+    files = dict(_PACKAGE_FILES)
+    files["agent.py"] = "class Agent:\n    def chat(self, text):\n        return 'x'\n"
+    cand = _write_package_candidate(tmp_path, files)
+    ok, errors = upd.validate_candidate("brain", cand, run_smoke=False)
+    assert not ok
+    assert any("Agent 缺少方法" in e and "think" in e for e in errors), errors
+
+
+def test_package_rejects_missing_submodule(tmp_path):
+    upd = _make_updater(tmp_path)
+    files = dict(_PACKAGE_FILES)
+    del files["planner.py"]
+    cand = _write_package_candidate(tmp_path, files)
+    ok, errors = upd.validate_candidate("brain", cand, run_smoke=False)
+    assert not ok
+    assert errors, "应报告子模块缺失"
+
+
+def test_package_install_load_and_source(tmp_path):
+    upd = _make_updater(tmp_path)
+    cand = _write_package_candidate(tmp_path)
+    version = upd.install_candidate("brain", cand)
+    assert version == "v0.1"
+    assert upd.active_version("brain") == "v0.1"
+    module = upd.load("brain")
+    assert module.__name__.startswith("hb_pkg_v0.1_brain")
+    # 直接经子模块取类并实例化验证包内相对导入工作
+    import sys as _sys
+
+    sub = _sys.modules.get(f"{module.__name__}.agent")
+    assert sub is not None, "包内 agent 子模块应已加载"
+    agent = sub.Agent()
+    assert agent.chat("hi") == "pkg:hi"
+    # source_files 返回多文件
+    files = upd.source_files("brain")
+    assert set(files) == {
+        "__init__.py", "_contract.py", "agent.py", "memory.py", "planner.py"
+    }
+    assert "class Agent" in files["agent.py"]
+
+
+def test_package_install_bad_no_change(tmp_path):
+    upd = _make_updater(tmp_path)
+    good = _write_package_candidate(tmp_path)
+    upd.install_candidate("brain", good)
+    # 坏候选（agent.py 语法错误）安装必须失败且不破坏现有 active
+    files = dict(_PACKAGE_FILES)
+    files["agent.py"] = "class Agent {\n"
+    bad = _write_package_candidate(tmp_path, files)
+    try:
+        upd.install_candidate("brain", bad)
+        assert False, "坏候选应被拒绝"
+    except ValueError as exc:
+        assert "L0 语法错误" in str(exc), str(exc)
+    assert upd.active_version("brain") == "v0.1"
+    # 不残留半装版本目录
+    assert upd.list_versions("brain") == ["v0.1"]
+
+
+def test_package_rollback(tmp_path):
+    upd = _make_updater(tmp_path)
+    v1 = _write_package_candidate(tmp_path)
+    upd.install_candidate("brain", v1)
+    files = dict(_PACKAGE_FILES)
+    files["agent.py"] = (
+        "class Agent:\n"
+        "    def chat(self, text):\n        return 'v2:' + str(text)\n"
+        "    def think(self, *a, **k):\n        return None\n"
+        "    def tick(self, *a, **k):\n        return None\n"
+    )
+    v2 = _write_package_candidate(tmp_path, files)
+    assert upd.install_candidate("brain", v2) == "v0.2"
+    assert upd.active_version("brain") == "v0.2"
+    rolled = upd.rollback("brain")
+    assert rolled == "v0.1"
+    import sys as _sys
+
+    module = upd.load("brain")
+    sub = _sys.modules[f"{module.__name__}.agent"]
+    assert sub.Agent().chat("hi") == "pkg:hi"
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in sorted(globals().items()):
