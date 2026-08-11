@@ -41,6 +41,8 @@ fi
 FLAT_CACHE="$OUT_ROOT/fastembed_models_flat"
 rm -rf "$FLAT_CACHE"
 cp -RL "$FASTEMBED_CACHE" "$FLAT_CACHE"
+# 瘦身：snapshots 已解引用为实体，blobs/.locks 是 HF 去重缓存冗余（实测删后加载正常，95MB→91MB 实体）
+rm -rf "$FLAT_CACHE/models--Qdrant--bge-small-zh-v1.5/blobs" "$FLAT_CACHE/.locks"
 echo "[build] 嵌入模型就绪（$(du -sh "$FLAT_CACHE" | cut -f1)，已解符号链接）"
 
 echo "[3/5] 生成 HeartBeat.icns ..."
