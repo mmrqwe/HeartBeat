@@ -18,11 +18,8 @@ heartbeat.db-wal
 heartbeat.db-shm
 config.json
 
-# CodePapr 工具内部数据（保留 backup-mfiles 合并备份资产）
-.CodePapr/*
-!.CodePapr/tmp/
-.CodePapr/tmp/*
-!.CodePapr/tmp/backup-mfiles/
+# CodePapr 工具内部数据
+.CodePapr/
 
 # macOS
 .DS_Store

@@ -13,19 +13,21 @@ OUT_ROOT="${OUT_ROOT:-$HOME/HeartBeat-mac}"
 VENV="$OUT_ROOT/.venv"
 PY="$VENV/bin/python"
 DIST_DIR="$OUT_ROOT/dist"
+# uv 优先用 PATH 中的命令；可用 UV_CMD 环境变量覆盖（不再写死本机绝对路径）
+UV_CMD="${UV_CMD:-uv}"
 
 mkdir -p "$OUT_ROOT"
 
 if [ ! -x "$PY" ]; then
   echo "[build] 创建独立 venv: $VENV"
-  uv venv "$VENV" --python 3.12
+  "$UV_CMD" venv "$VENV" --python 3.12
 fi
 
 echo "[1/4] 安装/确认依赖..."
 if "$PY" -m pip --version >/dev/null 2>&1; then
   "$PY" -m pip install --quiet -r requirements.txt pyinstaller pillow onnxruntime
 else
-  uv pip install --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+  "$UV_CMD" pip install --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
     --python "$PY" -r requirements.txt pyinstaller pillow onnxruntime
 fi
 

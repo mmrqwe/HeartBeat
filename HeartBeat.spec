@@ -1,7 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('/plugins', 'plugins'), ('/brain', 'brain')]
+ROOT = os.path.abspath(SPECPATH)  # spec 所在目录（项目根），避免硬编码本机路径
+
+datas = [(os.path.join(ROOT, 'plugins'), 'plugins'), (os.path.join(ROOT, 'brain'), 'brain')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('fastembed')
@@ -13,7 +16,7 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
-    ['/main.py'],
+    [os.path.join(ROOT, 'main.py')],
     pathex=[],
     binaries=binaries,
     datas=datas,
@@ -43,7 +46,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['/assets/HeartBeat.icns'],
+    icon=[os.path.join(ROOT, 'assets', 'HeartBeat.icns')],
 )
 coll = COLLECT(
     exe,
@@ -57,6 +60,6 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='HeartBeat.app',
-    icon='/assets/HeartBeat.icns',
+    icon=os.path.join(ROOT, 'assets', 'HeartBeat.icns'),
     bundle_identifier=None,
 )
