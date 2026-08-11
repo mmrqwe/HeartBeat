@@ -1,0 +1,4 @@
+fastembed
+sqlite_vec
+PySide6
+pyobjc-framework-Cocoa; platform_system == "Darwin"

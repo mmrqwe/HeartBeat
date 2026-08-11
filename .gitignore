@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.log
+
+# 虚拟环境（OneDrive 下易被云同步破坏，不入库）
+.venv/
+
+# 模型与构建产物（可下载重建）
+models/
+build/
+dist/
+
+# 本地开发残留数据（正式数据在 user_data_dir，见 core.user_data_dir）
+heartbeat.db
+heartbeat.db-wal
+heartbeat.db-shm
+config.json
+
+# CodePapr 工具内部数据（保留 backup-mfiles 合并备份资产）
+.CodePapr/*
+!.CodePapr/tmp/
+.CodePapr/tmp/*
+!.CodePapr/tmp/backup-mfiles/
+
+# macOS
+.DS_Store
