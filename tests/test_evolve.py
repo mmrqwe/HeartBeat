@@ -330,6 +330,48 @@ def test_evolve_intent_tool_upgrade_shortcut(tmp_path):
     assert "已升级到 v0.2" in reply and "ping_check" in reply
 
 
+
+# ---------- 阶段3：brain 包级进化（子模块级整文件重写） ----------
+
+AGENT_CHAT_SRC = (ROOT / "brain" / "agent_chat.py").read_text(encoding="utf-8")
+# 模拟 LLM 输出：TARGET 声明 + 围栏代码（带一个标记注释，验证确实替换了该文件）
+AGENT_CHAT_EVOLVED = (
+    "# 进化标记：2026-08-12 包级生成测试\n" + AGENT_CHAT_SRC
+)
+BRAIN_TARGET_OUTPUT = (
+    "TARGET: agent_chat.py\n```python\n" + AGENT_CHAT_EVOLVED + "\n```"
+)
+
+
+def test_evolve_brain_package(tmp_path):
+    """包级进化：LLM 选 agent_chat.py 重写 → 组装候选包 → 验证安装 v1.1。"""
+    ev = _make_evolver(tmp_path, FakeBrain([BRAIN_TARGET_OUTPUT]))
+    version = ev.evolve("brain", "聊天时更热情一点")
+    assert version == "v1.1"
+    assert ev.updater.active_version("brain") == "v1.1"
+    files = ev.updater.source_files("brain")
+    assert "进化标记：2026-08-12 包级生成测试" in files["agent_chat.py"]
+    # 其它文件未被修改
+    assert "class Agent" in files["agent.py"]
+    assert "class Planner" in files["planner.py"]
+    # 候选目录已清理
+    assert not list(ev.candidate_root.glob("*"))
+
+
+def test_evolve_brain_rejects_unknown_target(tmp_path):
+    """LLM 输出无法确定 TARGET → 拒绝（不安装任何东西）。"""
+    fake = FakeBrain([
+        "```python\nclass SomethingElse:\n    pass\n```"
+    ])
+    ev = _make_evolver(tmp_path, fake)
+    try:
+        ev.evolve("brain", "随便改改")
+        raise AssertionError("应拒绝无法确定 TARGET 的输出")
+    except ValueError as exc:
+        assert "无法确定要替换的包内文件" in str(exc)
+    assert ev.updater.active_version("brain") == "v1.0"
+
+
 if __name__ == "__main__":
     import tempfile
     import traceback

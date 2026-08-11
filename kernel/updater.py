@@ -176,10 +176,11 @@ class Updater:
         shutil.copy2(src, version_dir / f"{name}.py")
         self._write_active(name, "v1.0")
 
-    # 包模块内置文件清单：PACKAGE_LAYOUT 三件套 + Agent 运行依赖
-    # （evolver 被 agent 直接引用；__init__/_contract 为包入口与契约声明）
+    # 包模块内置文件清单：PACKAGE_LAYOUT 三件套（Agent 控制流与领域）。
+    # evolver 是核心锁定集（进化引擎自身），agent.py 绝对导入宿主实现，
+    # 不随包版本漂移；__init__/_contract 为包入口与契约声明。
     _PACKAGE_BUNDLE = ("agent.py", "agent_chat.py", "agent_think.py",
-                       "memory.py", "planner.py", "evolver.py")
+                       "memory.py", "planner.py")
     _PACKAGE_INIT = (
         "from .agent import Agent\n"
         "from .memory import MemoryModule\n"

@@ -60,6 +60,7 @@ class ChatMixin:
         ("memory", ("记忆", "memory")),
         ("planner", ("规划", "planner", "主动", "思考", "巡视")),
         ("tool", ("工具", "加个功能", "新功能")),
+        ("brain", ("控制流", "agent", "聊天逻辑", "回复风格", "整体")),
     )
 
     def _try_evolve_intent(self, user_text):
@@ -193,7 +194,11 @@ class ChatMixin:
                 if use_stream:
                     pending_note = "\n🔧 " + tools.human_brief(name, arguments)
                     on_delta(shown + pending_note)
-                result = self._run_tool(name, arguments, source=tools.SOURCE_USER)
+                try:
+                    result = self._run_tool(name, arguments, source=tools.SOURCE_USER)
+                except Exception as exc:
+                    # 工具异常隔离：不中断对话（与巡视 _think_llm 一致）
+                    result = f"工具执行失败：{exc}"
                 if self.stats:
                     self.stats.record_tool()
                 messages.append({

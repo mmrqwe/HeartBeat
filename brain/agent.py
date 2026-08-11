@@ -23,7 +23,9 @@ from db import Database, Memory
 
 from .agent_chat import ChatMixin
 from .agent_think import ThinkMixin
-from .evolver import Evolver
+# 进化引擎自身是核心锁定集（不可进化），绝对导入宿主实现——
+# 包内 Agent 的进化能力永远跟随宿主内核，不随包版本漂移。
+from brain.evolver import Evolver
 from .memory import MemoryModule
 from .planner import Planner
 

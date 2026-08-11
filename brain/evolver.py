@@ -65,7 +65,10 @@ class Evolver:
 
     def current_source(self, name):
         """读当前 active 版本的完整源码（进化基准 = 正在运行的实现）。
-        包模式下 memory/planner 读 brain 包内对应文件。"""
+        包模式下 memory/planner 读 brain 包内对应文件；
+        name='brain'（包级进化）返回空（prompt 只给文件清单，不给全包源码）。"""
+        if name == "brain":
+            return ""
         version = self.updater.active_version(name)
         if not version:
             raise ValueError(f"{name} 尚未安装（先 ensure_installed）")
@@ -83,9 +86,11 @@ class Evolver:
     # ---------- Prompt 构建 ----------
 
     def _build_prompt(self, name, requirement, current_src):
+        allowed = ", ".join(sorted(ALLOWED_IMPORTS))
+        if name == "brain":
+            return self._build_brain_prompt(requirement, allowed)
         contract = sorted(self.updater.REQUIRED_METHODS[name])
         cls = self.updater.CLASSES[name]
-        allowed = ", ".join(sorted(ALLOWED_IMPORTS))
         system = (
             "你是桌宠「小跳」的自我进化引擎。主人要求你升级自己的某个领域模块。"
             "你会拿到该模块的当前完整源码和升级需求，请输出升级后的【完整模块源码】。\n"
@@ -104,6 +109,56 @@ class Evolver:
             f"模块：{name}\n升级需求：{requirement}\n\n"
             f"当前完整源码（{len(current_src)} 字符）：\n```python\n{current_src}\n```"
         )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+    def _build_brain_prompt(self, requirement, allowed):
+        """包级进化 prompt：LLM 选择一个子模块整文件重写。
+
+        输出格式：首行 TARGET: <文件名>，随后 ```python 围栏包裹完整文件源码。
+        文件职责说明帮助 LLM 选择正确的目标文件；需求里显式写的文件名
+        （如 "agent_chat.py"）会附带该文件当前源码作为改写基准；
+        契约由内核侧校验。
+        """
+        files = (
+            "- agent.py：Agent 主类（构造/状态/聊天入口/委托壳/回复解析）——改动风险最高\n"
+            "- agent_chat.py：聊天链路（ChatMixin：意图识别/进化触发/LLM 对话/消息组装）\n"
+            "- agent_think.py：自主思考（ThinkMixin：触发门控/巡视/工具执行）\n"
+            "- memory.py：记忆领域（MemoryModule：事实提取/画像/跟进/向量检索）\n"
+            "- planner.py：规则决策（Planner：问候/预算/冷却/时间感知/规则发言）\n"
+        )
+        system = (
+            "你是桌宠「小跳」的自我进化引擎。主人要求你升级自己的【某个子模块】。\n"
+            "你将拿到 brain 包全部文件清单与职责说明，请根据需求选择一个文件整文件重写。\n"
+            "候选文件与职责：\n" + files + "\n"
+            "输出格式（严格）：\n"
+            "TARGET: <选中的文件名，如 agent_chat.py>\n"
+            "```python\n<该文件的完整新源码>\n```\n\n"
+            "硬性要求：\n"
+            "1. 重写后必须保留该文件的类/混入名与全部公开方法签名（内部实现可改进）；\n"
+            "2. 只允许 import 白名单：" + allowed + "；"
+            "包内模块用相对导入（from .memory import ...）；"
+            "禁止 os/sys/subprocess/shutil/socket/ctypes/pickle/importlib/网络/文件写入；\n"
+            "3. 通过 self 或 self.agent 访问共享状态；不要 import agent；\n"
+            "4. 只改需要改的文件，不要修改其他文件；保持模块级常量的兼容性；\n"
+            "5. 除 ```python 围栏外不要输出任何解释文字。"
+        )
+        user = f"升级需求：{requirement}"
+        # 需求里显式指定文件时，附带该文件当前源码（完整改写基准）
+        req_match = re.search(r"([A-Za-z0-9_]+\.py)", requirement or "")
+        if req_match:
+            try:
+                files_map = self.updater.source_files("brain")
+                base = files_map.get(req_match.group(1))
+                if base:
+                    user += (
+                        f"\n\n目标文件 {req_match.group(1)} 当前完整源码"
+                        f"（{len(base)} 字符）：\n```python\n{base}\n```"
+                    )
+            except Exception:
+                pass
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -137,7 +192,12 @@ class Evolver:
         return ""
 
     def generate_candidate(self, name, requirement, feedback=""):
-        """LLM 生成候选源码并落盘。返回候选目录 Path。"""
+        """LLM 生成候选源码并落盘。返回 (候选目录 Path, 本次生成的文件名列表)。
+
+        name='brain'（包级进化）时：LLM 输出 TARGET 文件 + 完整源码，
+        与 active 包其余文件组装成完整候选包；否则单文件候选
+        （包模式下 memory/planner 同样组装为候选包）。
+        """
         messages = self._build_prompt(name, requirement, self.current_source(name))
         if feedback:
             messages.append({
@@ -145,20 +205,58 @@ class Evolver:
                 "content": "上次生成的代码验证失败：\n" + feedback +
                            "\n请修正后重新输出完整源码（保持契约方法与安全要求不变）。",
             })
-        raw = self.brain.complete(messages, max_tokens=MAX_GEN_TOKENS) or ""
-        code = self._extract_code(raw)
+        raw = self.brain.complete(messages, max_tokens=MAX_GEN_TOKENS, timeout=180) or ""
+        target, code = self._extract_target_code(raw, name, requirement)
         if not code:
             raise ValueError("模型未返回代码")
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         candidate_dir = self.candidate_root / f"{name}_{stamp}"
         candidate_dir.mkdir(parents=True, exist_ok=True)
-        (candidate_dir / f"{name}.py").write_text(code, encoding="utf-8")
-        if self._package_active():
-            # 包模式：从 active 包拷贝其余文件，组装成完整候选包
+        if name == "brain" or self._package_active():
+            # 包组装：active 包全部文件 + 覆盖目标文件
             for file_name, content in self.updater.source_files("brain").items():
                 (candidate_dir / file_name).write_text(content, encoding="utf-8")
+            (candidate_dir / target).write_text(code, encoding="utf-8")
+        else:
             (candidate_dir / f"{name}.py").write_text(code, encoding="utf-8")
-        return candidate_dir
+        return candidate_dir, [target]
+
+    def _extract_target_code(self, text, name, requirement=""):
+        """从模型输出提取 (目标文件名, 代码)。
+
+        brain 包级进化：目标文件解析优先级——
+        ① 需求文本里显式写的文件名（如 "agent_chat.py"）；
+        ② 模型输出的 TARGET: xxx.py 行；
+        ③ 代码内容里的类名/混入名反推。
+        单文件模块直接回退既有围栏/整段/截断逻辑。"""
+        if name != "brain":
+            return f"{name}.py", self._extract_code(text)
+        allowed_targets = [f for f, _ in self.updater.PACKAGE_LAYOUT.get("brain", ())] \
+            + ["agent_chat.py", "agent_think.py"]
+        target = None
+        # ① 需求显式文件名（用户可指定，如 "改 agent_chat.py 的 ..."）
+        if requirement:
+            req_match = re.search(r"([A-Za-z0-9_]+\.py)", requirement)
+            if req_match and req_match.group(1) in allowed_targets:
+                target = req_match.group(1)
+        # ② TARGET 行
+        if target is None:
+            match = re.search(r"^TARGET\s*[:：]\s*([A-Za-z0-9_]+\.py)", text, re.MULTILINE)
+            target = match.group(1) if match else None
+        code = self._extract_code(text)
+        # ③ 类名/混入名反推
+        if target is None and code:
+            for file_name, cls_name in self.updater.PACKAGE_LAYOUT.get("brain", ()):
+                if f"class {cls_name}" in code or f"class {cls_name}(" in code:
+                    target = file_name
+                    break
+            if target is None and "class ChatMixin" in code:
+                target = "agent_chat.py"
+            elif target is None and "class ThinkMixin" in code:
+                target = "agent_think.py"
+        if target not in allowed_targets:
+            raise ValueError(f"无法确定要替换的包内文件（期望 TARGET: 文件名.py）")
+        return target, code
 
     # ---------- 安全检查（L0 前） ----------
 
@@ -176,6 +274,10 @@ class Evolver:
                     if root not in ALLOWED_IMPORTS:
                         errors.append(f"禁止 import：{alias.name}")
             elif isinstance(node, ast.ImportFrom) and node.module:
+                # 包内相对导入（from .memory import ...）放行——限于包内，
+                # 不会逃逸到外部（候选包整体原子安装，_contract 约束布局）
+                if node.module.startswith("."):
+                    continue
                 root = node.module.split(".")[0]
                 if root not in ALLOWED_IMPORTS:
                     errors.append(f"禁止 import：{node.module}")
@@ -184,7 +286,22 @@ class Evolver:
                 if isinstance(func, ast.Name) and func.id in FORBIDDEN_CALLS:
                     errors.append(f"禁止调用：{func.id}()")
                 elif isinstance(func, ast.Attribute) and func.attr in FORBIDDEN_CALLS:
-                    errors.append(f"禁止调用：{func.attr}()")
+                    # 仅拦截 dunder 属性调用（如 x.__import__()）；普通方法名
+                    # （如 re.compile/x.eval）不是内置逃逸面，误杀得不偿失
+                    if func.attr.startswith("__"):
+                        errors.append(f"禁止调用：{func.attr}()")
+        return errors
+
+    def _check_candidate_safety(self, candidate_dir, files):
+        """只对本次生成的 .py 文件做安全检查（active 包拷贝来的文件
+        已由宿主验证过，不重复检查——避免误伤 evolver.py 等内置依赖）。"""
+        errors = []
+        for file_name in files:
+            path = Path(candidate_dir) / file_name
+            try:
+                errors.extend(self.check_safety(path.read_text(encoding="utf-8")))
+            except OSError as exc:
+                errors.append(f"候选文件读取失败：{file_name}: {exc}")
         return errors
 
     # ---------- 完整流水线 ----------
@@ -202,7 +319,7 @@ class Evolver:
 
         if name not in self.updater.BUILTIN_MODULES and name != "tool":
             raise ValueError(
-                f"不可进化：{name}（仅允许 memory/planner 与新增工具 tool）"
+                f"不可进化：{name}（仅允许 memory/planner/brain 与新增工具 tool）"
             )
         if name == "tool":
             return self._evolve_tool(requirement, on_status=on_status)
@@ -212,12 +329,10 @@ class Evolver:
         feedback = ""
         for attempt in range(1, MAX_ATTEMPTS + 2):
             status(f"生成候选代码（第 {attempt} 次尝试）…")
-            candidate_dir = self.generate_candidate(name, requirement, feedback)
+            candidate_dir, generated = self.generate_candidate(name, requirement, feedback)
             try:
                 status("安全检查…")
-                errors = self.check_safety(
-                    (candidate_dir / f"{name}.py").read_text(encoding="utf-8")
-                )
+                errors = self._check_candidate_safety(candidate_dir, generated)
                 if errors:
                     feedback = "；".join(errors)
                     continue

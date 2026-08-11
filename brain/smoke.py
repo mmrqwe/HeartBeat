@@ -69,7 +69,130 @@ def _smoke_brain_package(module):
     try:
         inst = agent_cls()
     except TypeError:
-        return True  # 真实 Agent 构造需参数：浅冒烟通过，深冒烟阶段3
+        return _smoke_agent_deep(agent_cls)  # 真实 Agent：L2b replay + L2c
     reply = inst.chat("hi")
     assert isinstance(reply, str) and reply, "Agent.chat 返回空"
     return True
+
+
+# ---------- 阶段3：L2b mock LLM replay + L2c headless 冒烟 ----------
+
+
+class _ReplayBrain:
+    """mock core.Brain：按剧本回放 LLM 响应（零网络零 API）。
+
+    剧本条目 (kind, payload)：
+      ("tools", (content, tool_calls))   —— complete_tools / complete_tools_stream
+      ("interrupt", partial_text)        —— complete_stream 抛 StreamInterrupted
+      ("plain", content)                 —— complete
+    """
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+
+    def _pop(self, kind):
+        if not self.script:
+            raise AssertionError("ReplayBrain 剧本耗尽")
+        entry = self.script.pop(0)
+        assert entry[0] == kind, f"剧本类型不符：期望 {kind} 实际 {entry[0]}"
+        self.calls.append(entry)
+        return entry[1]
+
+    def complete(self, messages, max_tokens=None, **kw):
+        return self._pop("plain")
+
+    def complete_tools(self, messages, decls, **kw):
+        return self._pop("tools")
+
+    def complete_tools_stream(self, messages, decls, cb, **kw):
+        content, tool_calls = self._pop("tools")
+        if content:
+            cb(content)
+        return content, tool_calls
+
+    def complete_stream(self, messages, handle, max_tokens=None, **kw):
+        payload = self._pop("interrupt") if self.script and self.script[0][0] == "interrupt" else self._pop("plain")
+        if isinstance(payload, tuple) and payload[0] == "interrupt":
+            raise core.StreamInterrupted(payload[1])
+        handle(payload)
+        return None
+
+
+def _tool_call(name, args, call_id="c1"):
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": args},
+    }
+
+
+def _smoke_agent_deep(agent_cls):
+    """L2b + L2c：用候选 Agent 类构造真实实例，mock LLM replay 聊天链路
+    5 场景 + headless 3 轮对话与心跳。失败抛异常（由 validate 捕获）。"""
+    import tempfile
+    import db as dbmod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = core.load_config(Path(tmp) / "config.json")
+        cfg["api"]["api_key"] = "mock"
+        cfg["embedding_enabled"] = False
+        cfg["tools_enabled"] = False
+        database = dbmod.Database(Path(tmp) / "heartbeat.db")
+        # 候选 Agent 类实例化（字段由候选 __init__ 自建）
+        ag = agent_cls(cfg, {}, tmp, stats=core.Stats(database), db=database)
+
+        # 场景 1：单轮工具 → 最终回复
+        ag.brain = _ReplayBrain([
+            ("tools", ("", [_tool_call("web_search", '{"query":"天气"}')])),
+            ("tools", ("今天天气不错～", [])),
+        ])
+        ag._run_tool = lambda *a, **k: "mock 搜索结果"
+        reply = ag._chat_llm_tools("查天气", None)
+        assert reply == "今天天气不错～", f"场景1 回复不符：{reply}"
+
+        # 场景 2：两轮工具（多轮循环上限内）
+        ag.brain = _ReplayBrain([
+            ("tools", ("", [_tool_call("web_search", '{"query":"a"}')])),
+            ("tools", ("", [_tool_call("web_search", '{"query":"b"}')])),
+            ("tools", ("多轮搞定", [])),
+        ])
+        reply = ag._chat_llm_tools("多轮", None)
+        assert reply == "多轮搞定", f"场景2 回复不符：{reply}"
+
+        # 场景 3：流式中断（部分内容接受）
+        ag.brain = _ReplayBrain([
+            ("interrupt", "部分内容"),
+        ])
+        deltas = []
+        reply = ag._chat_llm_stream("流式", lambda d: deltas.append(d))
+        assert reply == "部分内容", f"场景3 回复不符：{reply}"
+
+        # 场景 4：工具异常隔离（不中断对话）
+        ag.brain = _ReplayBrain([
+            ("tools", ("", [_tool_call("web_search", "{}")])),
+            ("tools", ("依然回复", [])),
+        ])
+        def boom(*a, **k):
+            raise RuntimeError("工具炸了")
+
+        ag._run_tool = boom
+        reply = ag._chat_llm_tools("异常", None)
+        assert reply == "依然回复", f"场景4 回复不符：{reply}"
+
+        # 场景 5：无工具直接回复（问候）
+        ag.brain = _ReplayBrain([
+            ("tools", ("你好呀！", [])),
+        ])
+        reply = ag._chat_llm_tools("你好", None)
+        assert reply == "你好呀！", f"场景5 回复不符：{reply}"
+
+        # L2c：headless 3 轮对话无异常 + 心跳（规则模式，零网络）
+        ag.brain = core.Brain(cfg, {}, core.Stats(database))
+        cfg["api"]["api_key"] = ""
+        for text in ("第一轮", "第二轮", "第三轮"):
+            r = ag.chat(text)
+            assert isinstance(r, str) and r, f"L2c 第 {text} 轮回复为空"
+        heartbeat = ag.think({"collections": []})
+        assert heartbeat is None or isinstance(heartbeat, str), "L2c 心跳异常"
+        return True

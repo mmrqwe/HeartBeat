@@ -119,7 +119,7 @@ def _make_parser():
     p_evolve = sub.add_parser(
         "evolve", help="自我进化：LLM 生成新版本 → 安全/契约/冒烟验证 → 原子安装（memory/planner/tool）"
     )
-    p_evolve.add_argument("module", choices=["memory", "planner", "tool"])
+    p_evolve.add_argument("module", choices=["memory", "planner", "brain", "tool"])
     p_evolve.add_argument("requirement", help="功能需求描述，如：每天上午9点提醒我喝水 / 查快递物流 / 升级 ping_check：支持超时参数")
     return parser
 
