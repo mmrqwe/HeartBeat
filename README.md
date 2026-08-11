@@ -265,9 +265,13 @@ py -3.12 -m PyInstaller --noconfirm --clean --onefile --windowed --name HeartBea
 
 ### 自我进化（除最小核心外都可自升级）
 
-桌宠可以在对话里主动升级自己，除最小核心（内核安全边界、聊天控制流、进化器自身、LLM 封装）锁定外：
+桌宠可以在对话里主动升级自己，除最小核心（内核安全边界 kernel/、进化器自身 brain/evolver.py、LLM 封装 core.py、工具分发 tools.py）锁定外，**策略层与控制流全部可进化**：
 
 - **策略层**：说“进化 planner：每天上午9点提醒我喝水”“升级记忆：多记住一些日程”——LLM 生成新版本模块 → 安全扫描 → 语法/接口契约/冒烟验证 → 原子切换 → 热加载，失败自动回滚。
+- **控制流（brain 包）**：说“进化 brain：agent_chat.py 的 _chat_rules 里……”“升级记忆：多记住一些日程”——整个 brain 以包形式版本化（`<用户数据目录>/brain/brain/vN/`，含 agent.py 主类 / agent_chat.py 聊天链路 / agent_think.py 自主思考 / memory.py / planner.py），LLM 可选择一个子模块整文件重写（TARGET 声明或需求里直接写文件名），其余文件从 active 包拷贝组装成新包版本。升级候选必须通过：
+  - L0 逐文件语法 + 包加载；L1 契约（内核维护的类/方法清单 + `_contract.py` 布局校验，防候选自我验收）；L2 冒烟——**mock LLM replay 5 场景**（单工具/多轮/流式中断/工具异常隔离/问候）+ **headless 3 轮对话与心跳**，坏 agent（chat 直接崩溃）在冒烟层被拦截；
+  - 安装后立即重载生效（准热切换），启动时 active 损坏自动回滚/重建。
+- **运行期安全网（Monitor）**：`kernel/monitor.py` 监控 tick 心跳（连续失败）与 chat 异常（窗口内累计），超阈值自动回滚 brain 包到上一可用版本（单次运行最多一次，防循环），阈值可用 `<用户数据目录>/monitor.json` 覆盖（损坏回退默认），动作写入 `updates.log` 审计；启动时自测回滚链路。
 - **能力层（工具）**：说“进化工具：查快递物流”“给自己加个功能：定时清理下载目录”——LLM 生成新工具模块，安装到 `<用户数据目录>/tools/`，聊天里立刻可用（下次对话 LLM 自动看到新工具声明）。工具运行在受限沙箱：
   - 只能 import 纯逻辑标准库（json/re/datetime 等），系统/项目模块全禁；
   - 网络、文件、命令只能通过受控原语 `ctx.*`（搜索/HTTP/run_bash/下载/安装），原语自带权限（写操作仍弹窗确认）；
