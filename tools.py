@@ -63,6 +63,9 @@ def _make_search_handler(param, kind, limit, label):
         if not query:
             return "缺少查询参数"
         entries = search.search_all(query, kind, limit)
+        if not entries and kind == "web" and search.web_search_diag().get("errors"):
+            # 全源故障而非真无结果：明确告知，避免误导"没找到"
+            return "搜索服务暂时不可用（" + "; ".join(search.web_search_diag()["errors"]) + "）"
         return search.format_results(entries, label)
 
     return handler

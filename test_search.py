@@ -49,7 +49,7 @@ def test_web_search_parses_bing(monkeypatch):
       <div class="b_caption"><p>Some <b>snippet</b> here</p></div>
     </li>
     """
-    monkeypatch.setattr(core, "http_text", lambda url, timeout=10: page)
+    monkeypatch.setattr(search, "_http_text_browser", lambda url, timeout=15: page)
     entries = search.web_search("example", 5)
     assert entries[0]["title"] == "Example Title"
     assert entries[0]["url"] == "https://example.com/"
@@ -62,11 +62,82 @@ def test_web_search_fallback_to_ddg(monkeypatch):
         "DDG Title</a>"
         '<td class="result-snippet">DDG snip</td>'
     )
-    monkeypatch.setattr(core, "http_text", lambda url, timeout=10: page)
+
+    def fake(url, timeout=15):
+        if "bing.com" in url:
+            raise RuntimeError("bing blocked")
+        return page
+
+    monkeypatch.setattr(search, "_http_text_browser", fake)
     entries = search.web_search("x", 5)
     assert entries and entries[0]["title"] == "DDG Title"
     assert entries[0]["url"] == "https://ddg.example/"
     assert entries[0]["snippet"] == "DDG snip"
+
+
+def test_web_search_fallback_to_ddg_html(monkeypatch):
+    """Bing 与 DDG lite 都不可用时，DDG html 端点兜底。"""
+    page = (
+        '<div class="result results_links_main">'
+        '<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fhtml.example%2F">'
+        "HTML Title</a>"
+        '<a class="result__snippet">html snip</a>'
+        "</div>"
+    )
+
+    def fake(url, timeout=15):
+        if "bing.com" in url:
+            raise RuntimeError("bing blocked")
+        if "lite.duckduckgo.com" in url:
+            return "<html>no results</html>"
+        return page
+
+    monkeypatch.setattr(search, "_http_text_browser", fake)
+    entries = search.web_search("x", 5)
+    assert entries and entries[0]["title"] == "HTML Title"
+    assert entries[0]["url"] == "https://html.example/"
+    assert entries[0]["snippet"] == "html snip"
+
+
+def test_web_search_all_sources_fail_diag(monkeypatch):
+    """全源失败：返回 [] 且 web_search_diag() 记录 3 个源的失败原因（不再静默）。"""
+
+    def boom(url, timeout=15):
+        raise RuntimeError("net down")
+
+    monkeypatch.setattr(search, "_http_text_browser", boom)
+    entries = search.web_search("x", 5)
+    assert entries == []
+    diag = search.web_search_diag()
+    assert len(diag["errors"]) == 3
+    assert all("net down" in e for e in diag["errors"])
+    assert any("bing" in e for e in diag["errors"])
+    assert any("ddg" in e for e in diag["errors"])
+
+
+def test_web_search_success_clears_diag(monkeypatch):
+    """失败后再成功：diag 被清空，调用方不会误判。"""
+    state = {"failed": True}
+
+    def fake(url, timeout=15):
+        if "bing.com" in url:
+            raise RuntimeError("bing down")
+        if "lite.duckduckgo.com" in url:
+            if state["failed"]:
+                return "<html>empty</html>"
+            return (
+                '<a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fok.example%2F">'
+                "OK</a>"
+            )
+        return "<html>empty</html>"
+
+    monkeypatch.setattr(search, "_http_text_browser", fake)
+    search.web_search("x", 5)  # bing 失败 + lite/html 空 → 全失败
+    assert search.web_search_diag()["errors"]
+    state["failed"] = False
+    entries = search.web_search("y", 5)  # lite 成功
+    assert entries
+    assert search.web_search_diag()["errors"] == []
 
 
 def test_news_search_parses_bing_rss(monkeypatch):

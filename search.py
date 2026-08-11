@@ -2,6 +2,7 @@
 
 import base64
 import html
+import logging
 import re
 import time
 import urllib.parse
@@ -9,10 +10,32 @@ import urllib.request
 
 import core
 
+logger = logging.getLogger("search")
+
+# 网页搜索用浏览器 UA：Bing/DDG 对非浏览器 UA 容忍度低（自定义 UA 更容易被限流/改版）
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+)
+
+# 最近一次 web_search 的诊断（全源失败时 errors 非空），供 selfcheck/工具层区分
+# "搜索服务故障"与"确实无结果"，不再静默失败。
+_WEB_DIAG = {"errors": [], "ts": 0.0}
+
 
 # 行情缓存：代码 -> (quote_dict, 时间戳)，60 秒内重复查询直接返回
 _QUOTE_CACHE = {}
 _QUOTE_TTL = 60
+
+
+def _http_text_browser(url, timeout=15):
+    """带浏览器 UA 的 UTF-8 抓取（web 搜索源专用）。"""
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": _BROWSER_UA, "Accept": "*/*"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
 
 
 def _http_text_enc(url, encoding="gbk", timeout=10):
@@ -62,7 +85,7 @@ def _web_search_bing(query, limit=6):
         + urllib.parse.quote(query)
         + "&setlang=zh-hans"
     )
-    page = core.http_text(url, timeout=15)
+    page = _http_text_browser(url)
     blocks = re.findall(r'<li class="b_algo".*?</li>', page, re.S)
     entries = []
     for block in blocks[:limit]:
@@ -84,7 +107,7 @@ def _web_search_bing(query, limit=6):
 
 def _web_search_ddg(query, limit=6):
     url = "https://lite.duckduckgo.com/lite/?q=" + urllib.parse.quote(query)
-    page = core.http_text(url, timeout=15)
+    page = _http_text_browser(url)
     links = re.findall(
         r'<a rel="nofollow" href="([^"]+)"[^>]*>(.*?)</a>',
         page,
@@ -105,35 +128,65 @@ def _web_search_ddg(query, limit=6):
     return entries
 
 
-def _web_search_mojeek(query, limit=6):
-    url = "https://www.mojeek.com/search?q=" + urllib.parse.quote(query)
-    page = core.http_text(url, timeout=15)
+def _web_search_ddg_html(query, limit=6):
+    """DuckDuckGo html 端点（与 lite 端点互为备份，偶发不稳定/返回首页）。"""
+    url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query)
+    page = _http_text_browser(url)
     links = re.findall(
-        r'class="title"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+        r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
         page,
         re.S,
     )
-    snippets = re.findall(r'<p class="s">(.*?)</p>', page, re.S)
+    snippets = re.findall(r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>', page, re.S)
     entries = []
     for index, (href, title) in enumerate(links[:limit]):
         entries.append({
             "title": _strip_tags(title),
-            "url": html.unescape(href),
+            "url": _decode_ddg_url(href),
             "snippet": _strip_tags(snippets[index]) if index < len(snippets) else "",
         })
     return entries
 
 
+# 网页搜索源（按顺序尝试）：Bing / DDG lite / DDG html。
+# Mojeek 已于 2026 年加入 JS challenge 反爬，实测 0 结果，已移除。
+_WEB_PROVIDERS = (
+    ("bing", _web_search_bing),
+    ("ddg-lite", _web_search_ddg),
+    ("ddg-html", _web_search_ddg_html),
+)
+
+
 def web_search(query, limit=6):
-    """网页搜索：依次尝试 Bing / DuckDuckGo / Mojeek。"""
-    for provider in (_web_search_bing, _web_search_ddg, _web_search_mojeek):
+    """网页搜索：依次尝试 Bing / DDG(lite) / DDG(html)。
+
+    全部失败时返回 []，同时把各源失败原因写入 _WEB_DIAG（web_search_diag()
+    可查）并打日志——调用方（selfcheck / 工具层）可区分"服务故障"与"无结果"。
+    """
+    errors = []
+    for name, provider in _WEB_PROVIDERS:
         try:
             entries = provider(query, limit)
             if entries:
+                if errors:
+                    logger.info("web_search 前 %d 个源失败，由 %s 恢复", len(errors), name)
+                _WEB_DIAG.update({"errors": [], "ts": time.time()})
                 return entries
-        except Exception:
-            continue
+        except Exception as exc:
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+            logger.warning("web_search 源 %s 失败: %s", name, exc)
+    _WEB_DIAG.update({"errors": errors, "ts": time.time()})
+    if errors:
+        logger.warning("web_search 全部源失败: %s", "; ".join(errors))
     return []
+
+
+def web_search_diag():
+    """最近一次 web_search 的诊断：{"errors": [源失败详情], "ts": 时间戳}。
+
+    errors 为空表示最近一次调用成功（或有结果）；非空表示全源故障。
+    """
+    return dict(_WEB_DIAG)
 
 
 def news_search(query, limit=6):

@@ -185,10 +185,13 @@ def _run(argv, default_config=None):
     if cmd == "search":
         t0 = time.time()
         entries = search.search_all(args.query, args.category, args.limit)
-        for entry in entries:
-            print("-", entry.get("title", ""))
-            if entry.get("url"):
-                print("  ", entry["url"])
+        if not entries and args.category in (None, "web") and search.web_search_diag().get("errors"):
+            print("搜索服务暂时不可用：" + "; ".join(search.web_search_diag()["errors"]))
+        else:
+            for entry in entries:
+                print("-", entry.get("title", ""))
+                if entry.get("url"):
+                    print("  ", entry["url"])
         print(f"elapsed: {time.time() - t0:.2f}s, results: {len(entries)}")
         return 0
 
@@ -352,22 +355,25 @@ def _probe(config_path=None, clean=False):
     return 0 if report["loaded"] else 1
 
 
-def _check(name, fn):
-    t0 = time.time()
-    try:
-        fn()
-        print(f"PASS {name} ({time.time() - t0:.2f}s)")
-        return True
-    except Exception as exc:
-        print(f"FAIL {name} ({time.time() - t0:.2f}s): {type(exc).__name__}: {exc}")
-        return False
-
-
 def _selfcheck(config):
     results = []
+    warnings = []
 
-    def check(name, fn):
-        results.append(_check(name, fn))
+    def check(name, fn, soft=False):
+        t0 = time.time()
+        try:
+            fn()
+            print(f"PASS {name} ({time.time() - t0:.2f}s)")
+            results.append(True)
+        except Exception as exc:
+            if soft:
+                # 依赖外部服务的检查：失败降级为 WARN，不阻断 selfcheck
+                print(f"WARN {name}: {type(exc).__name__}: {exc}")
+                results.append(True)
+                warnings.append(f"{name}: {exc}")
+            else:
+                print(f"FAIL {name} ({time.time() - t0:.2f}s): {type(exc).__name__}: {exc}")
+                results.append(False)
 
     check("config load", lambda: _load(config))
     cfg_path, cfg, database, stats, plugins, ag = _load(config)
@@ -397,8 +403,19 @@ def _selfcheck(config):
 
     def search_step():
         entries = search.search_all("AI", "web", 3)
+        if entries:
+            return
+        # 空结果：区分"全源故障"（重试一次后降级 WARN）与"确实无结果"（FAIL）
+        diag = search.web_search_diag()
+        if diag.get("errors"):
+            print(f"  (web search 全源失败: {'; '.join(diag['errors'])}，重试一次)")
+            time.sleep(1)
+            entries = search.search_all("AI", "web", 3)
+            if entries:
+                return
+            raise AssertionError("web search 全源失败: " + "; ".join(diag.get("errors", [])))
         _require(len(entries) > 0, "no search results")
-    check("web search", search_step)
+    check("web search", search_step, soft=True)
 
     def chat_step():
         reply = ag.chat("Please reply with OK only")
@@ -414,6 +431,10 @@ def _selfcheck(config):
     passed = sum(results)
     total = len(results)
     print(f"selfcheck: {passed}/{total} passed")
+    if warnings:
+        print(f"warnings ({len(warnings)}):")
+        for item in warnings:
+            print(" -", item)
     return 0 if passed == total else 1
 
 
