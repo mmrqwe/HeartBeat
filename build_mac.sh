@@ -41,6 +41,7 @@ rm -rf "$DIST_DIR" "$OUT_ROOT/build"
   --workpath "$OUT_ROOT/build" \
   --icon "$ROOT/HeartBeat.icns" \
   --add-data "$ROOT/plugins:plugins" \
+  --add-data "$ROOT/brain:brain" \
   --collect-all fastembed \
   --collect-all onnxruntime \
   --collect-all sqlite_vec \

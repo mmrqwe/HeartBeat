@@ -20,7 +20,7 @@ from brain.planner import CURIOSITY_QUESTIONS, Planner, PROACTIVE_DAILY_BUDGET
 class Agent:
     """桌宠的自主层：SQLite 记忆 + 向量检索 + 想法 + 主动行为。"""
 
-    def __init__(self, cfg, plugins=None, data_dir=None, clock=None, stats=None, db=None):
+    def __init__(self, cfg, plugins=None, data_dir=None, clock=None, stats=None, db=None, brain_loader=None):
         self.cfg = cfg
         self.plugins = plugins or {}
         self.data_dir = Path(data_dir) if data_dir else Path(".")
@@ -32,13 +32,20 @@ class Agent:
         self.brain = core.Brain(cfg, self.plugins, stats)
         self.tool_confirm_cb: Optional[Callable[[str], bool]] = None  # GUI 注入：confirm 档写命令的用户确认回调
         self.eventbus = None  # GUI 注入：kernel.eventbus（工具执行旁路通知）
+        self.brain_loader = brain_loader  # 自进化加载器（kernel.updater），None=用内置实现
         self.memory = Memory(self.db)
         self.chat_history = self.db.chat_items(100)
         self.state = self._load_state()
         self.clock = clock or datetime.now
-        # 领域模块（组合）：记忆 / 规划 —— brain 层可独立升级的进化单元
-        self.memory_module = MemoryModule(self)
-        self.planner = Planner(self)
+        # 领域模块（组合）：记忆 / 规划 —— brain 层可独立升级的进化单元。
+        # 注入 brain_loader（kernel.updater）时按 active 版本动态加载，
+        # 未注入（测试/CLI 直连）时 fallback 内置实现。
+        if self.brain_loader is not None:
+            self.memory_module = self.brain_loader.create("memory", self)
+            self.planner = self.brain_loader.create("planner", self)
+        else:
+            self.memory_module = MemoryModule(self)
+            self.planner = Planner(self)
 
     # ---------- 状态 ----------
 
@@ -83,6 +90,14 @@ class Agent:
             self.embedder = rag.default_embedder(cfg, self.data_dir)
         # 补索引挪到后台线程执行（reindex_async），避免保存设置卡 UI
         self._reindex_pending = True
+        # 领域模块重载：updater 切换版本后 reload 即生效（准热切换）；
+        # 加载失败保持旧模块（升级不破坏运行中会话）
+        if self.brain_loader is not None:
+            try:
+                self.memory_module = self.brain_loader.create("memory", self)
+                self.planner = self.brain_loader.create("planner", self)
+            except Exception:
+                pass
 
     def reindex_async(self):
         """后台补向量索引（保存设置后调用，不阻塞 UI）。"""

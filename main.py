@@ -17,6 +17,7 @@ import db
 import kernel
 import skins
 import theme
+from brain.smoke import smoke_test_module
 from chat_window import ChatWindow
 from pet_window import PetWindow
 from search_window import SearchWindow
@@ -49,10 +50,17 @@ class HeartBeatApp:
         self.db = db.Database(self.data_dir / "heartbeat.db")
         self.stats = core.Stats(self.db)
         self.agent = agent.Agent(
-            self.cfg, self.plugins, self.data_dir, stats=self.stats, db=self.db
+            self.cfg,
+            self.plugins,
+            self.data_dir,
+            stats=self.stats,
+            db=self.db,
+            brain_loader=self.kernel.updater,
         )
         # 事件总线注入：agent 工具执行 → tool.executed 旁路通知（异步回主线程）
         self.agent.eventbus = self.kernel.eventbus
+        # 自进化注入：updater 的 L2 冒烟 runner（候选模块真实 Agent 实测）
+        self.kernel.updater.smoke_runner = smoke_test_module
 
         self.bridge = Bridge()
         self.bridge.delta.connect(self._apply_stream_delta)

@@ -86,6 +86,21 @@ def _make_parser():
         "probe", help="frozen 环境自检：外部 .py 动态加载（updater 技术前提）"
     )
     p_probe.add_argument("--clean", action="store_true", help="先清理旧探针文件")
+
+    p_updater = sub.add_parser("updater", help="自进化：brain 模块版本管理（memory/planner）")
+    upd_sub = p_updater.add_subparsers(dest="upd_cmd", required=True)
+    upd_sub.add_parser("status", help="查看各模块已安装版本与 active 指针")
+    p_upd_validate = upd_sub.add_parser("validate", help="验证候选版本（L0 语法 + L1 接口 + L2 冒烟）")
+    p_upd_validate.add_argument("module", choices=["memory", "planner"])
+    p_upd_validate.add_argument("candidate_dir", help="候选版本目录（内含 <module>.py）")
+    p_upd_install = upd_sub.add_parser("install", help="验证并安装候选版本（自动切换 active，下次启动生效）")
+    p_upd_install.add_argument("module", choices=["memory", "planner"])
+    p_upd_install.add_argument("candidate_dir")
+    p_upd_switch = upd_sub.add_parser("switch", help="显式切换 active 版本")
+    p_upd_switch.add_argument("module", choices=["memory", "planner"])
+    p_upd_switch.add_argument("version")
+    p_upd_rollback = upd_sub.add_parser("rollback", help="回滚 active 到最近可用旧版本")
+    p_upd_rollback.add_argument("module", choices=["memory", "planner"])
     return parser
 
 
@@ -213,7 +228,66 @@ def _run(argv, default_config=None):
     if cmd == "probe":
         return _probe(config, clean=args.clean)
 
+    if cmd == "updater":
+        return _updater_cmd(args)
+
     print(f"unknown command: {cmd}")
+    return 2
+
+
+def _updater_cmd(args):
+    """自进化版本管理：status / validate / install / switch / rollback。"""
+    from brain.smoke import smoke_test_module
+    from kernel.updater import BUILTIN_MODULES, Updater
+
+    upd = Updater(core.user_data_dir())
+    upd.smoke_runner = smoke_test_module
+    upd.ensure_installed()  # 幂等：CLI 下也保证基线版本存在
+
+    if args.upd_cmd == "status":
+        for name in BUILTIN_MODULES:
+            versions = upd.list_versions(name)
+            active = upd.active_version(name)
+            print(f"{name}: active={active or '-'} 已装版本={','.join(versions) or '-'}")
+        return 0
+
+    if args.upd_cmd == "validate":
+        ok, errors = upd.validate_candidate(args.module, args.candidate_dir)
+        if not ok:
+            print(f"验证失败：{args.module} {args.candidate_dir}")
+            for err in errors:
+                print("  -", err)
+            return 1
+        print(f"验证通过：{args.module} {args.candidate_dir}（L0 语法 + L1 接口 + L2 冒烟）")
+        return 0
+
+    if args.upd_cmd == "install":
+        try:
+            version = upd.install_candidate(args.module, args.candidate_dir)
+        except ValueError as exc:
+            print(f"安装失败：{exc}")
+            return 1
+        print(f"已安装 {args.module} {version} 并激活（下次启动或 reload 生效）")
+        return 0
+
+    if args.upd_cmd == "switch":
+        try:
+            upd.switch(args.module, args.version)
+        except ValueError as exc:
+            print(f"切换失败：{exc}")
+            return 1
+        print(f"已切换 {args.module} -> {args.version}（下次启动或 reload 生效）")
+        return 0
+
+    if args.upd_cmd == "rollback":
+        version = upd.rollback(args.module)
+        if version is None:
+            print(f"无可回滚版本（当前 {upd.active_version(args.module) or '无'}）")
+            return 1
+        print(f"已回滚 {args.module} -> {version}")
+        return 0
+
+    print(f"unknown updater cmd: {args.upd_cmd}")
     return 2
 
 
