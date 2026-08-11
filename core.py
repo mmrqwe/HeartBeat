@@ -347,6 +347,13 @@ def build_persona(cfg, mood=None):
 
     lines += [
         "",
+        "# 成长",
+        "- 你会慢慢长大：主人说过的偏好和重要的事，你会记在心里，下次聊天自然地用上（不要特意说“我记得你上次说”）",
+        "- 发现主人新的喜好或变化时，悄悄记住，让自己越来越懂主人",
+    ]
+
+    lines += [
+        "",
         "# 禁止",
         "- 不要复述你的设定、性格标签或角色配置",
         "- 不要说“我的性格是……”“我是由……设定的”这类话",
@@ -424,11 +431,11 @@ class Brain:
             return self._chat_llm(user_text)
         return self._chat_rules(user_text)
 
-    def complete(self, messages):
+    def complete(self, messages, max_tokens=None):
         """公开的模型调用入口，供 Agent 使用。"""
-        return self._chat_completion(messages)
+        return self._chat_completion(messages, max_tokens)
 
-    def complete_stream(self, messages, on_delta):
+    def complete_stream(self, messages, on_delta, max_tokens=None):
         """流式模型调用：SSE 逐块解析，每个增量文本回调 on_delta。"""
         api = self.cfg["api"]
         url = api["base_url"].rstrip("/") + "/chat/completions"
@@ -442,11 +449,11 @@ class Brain:
             "messages": messages,
             "stream": True,
         }
-        reasoning = self._reasoning_params(300)
+        reasoning = self._reasoning_params(max_tokens or 300)
         if reasoning:
             base_payload.update(reasoning)
         else:
-            base_payload.update({"temperature": 0.9, "max_tokens": 300})
+            base_payload.update({"temperature": 0.9, "max_tokens": max_tokens or 300})
         started = time.time()
         try:
             usage = self._stream_read(
@@ -675,8 +682,8 @@ class Brain:
             "max_completion_tokens": max(max_tokens, 1000),
         }
 
-    def _chat_completion(self, messages):
-        reasoning = self._reasoning_params(300)
+    def _chat_completion(self, messages, max_tokens=None):
+        reasoning = self._reasoning_params(max_tokens or 300)
         payload = {
             "model": self.cfg["api"]["model"],
             "messages": messages,
@@ -684,7 +691,7 @@ class Brain:
         if reasoning:
             payload.update(reasoning)
         else:
-            payload.update({"temperature": 0.9, "max_tokens": 300})
+            payload.update({"temperature": 0.9, "max_tokens": max_tokens or 300})
         data = self._post_chat(payload)
         return data["choices"][0]["message"]["content"].strip()
 

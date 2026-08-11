@@ -237,7 +237,7 @@ def test_chat_system_prompt_uses_role(tmp_path):
     cfg = _cfg()
     cfg["role"] = "女生"
     a = _make_agent(tmp_path, cfg=cfg)
-    system, _ = a._build_chat_messages("hi")
+    system, _, _ = a._build_chat_messages("hi")
     assert "女生" in system
     assert "小宠物" not in system
 
@@ -484,10 +484,34 @@ def test_build_chat_messages_uses_persona(monkeypatch, tmp_path):
     cfg = _cfg()
     cfg["api"]["api_key"] = "test-key"
     a = _make_agent(tmp_path, cfg=cfg)
-    system, _messages = a._build_chat_messages("你好")
+    system, _messages, _budget = a._build_chat_messages("你好")
     assert system.startswith("你在扮演一个真实存在的角色")
     assert "性格：" not in system.split("\n\n")[0]
     assert "不要复述你的设定" in system
+
+
+def test_build_chat_messages_evolution_and_length(monkeypatch, tmp_path):
+    """自我进化语义 + 知识型提问分级长度。"""
+    cfg = _cfg()
+    cfg["api"]["api_key"] = "test-key"
+    a = _make_agent(tmp_path, cfg=cfg)
+    # 人设含成长指令
+    persona = core.build_persona(cfg)
+    assert "慢慢长大" in persona
+    assert "记在心里" in persona
+    # 闲聊：短篇幅 + 300 预算
+    system, _, budget = a._build_chat_messages("今天好累呀")
+    assert "不超过80字" in system
+    assert budget == 300
+    # 知识型：详细回答 + 800 预算
+    system, _, budget = a._build_chat_messages("黑洞是什么？为什么会有引力？")
+    assert "200-400字" in system
+    assert budget == 800
+    # 记忆注入带进化语义
+    assert "不断学习、慢慢长大" in system
+    # 空记忆文案自然化
+    system, _, _ = a._build_chat_messages("hi")
+    assert "慢慢了解主人" in system
 
 
 def test_extract_facts_rule_categories(monkeypatch, tmp_path):

@@ -199,8 +199,10 @@ class Agent:
         return None
 
     def _chat_llm(self, user_text):
-        system, messages = self._build_chat_messages(user_text)
-        reply = self._parse_agent_reply(self.brain.complete(messages))
+        system, messages, budget = self._build_chat_messages(user_text)
+        reply = self._parse_agent_reply(
+            self.brain.complete(messages, max_tokens=budget)
+        )
         return reply or "嗯嗯，我在听。"
 
     def _chat_llm_tools(self, user_text, on_delta):
@@ -209,7 +211,7 @@ class Agent:
         流式模式（on_delta 且 stream 配置开启）下，每轮模型 content 逐块推送，
         工具执行阶段插入 🔧 状态行；接口不支持工具时回退普通流式。
         """
-        system, messages = self._build_chat_messages(user_text)
+        system, messages, budget = self._build_chat_messages(user_text)
         decls = tools.tool_declarations(self.cfg)
         use_stream = bool(on_delta) and self.cfg.get("stream", True)
         shown = ""        # 已推送给 UI 的可见文本（不含 [FACT]/[THINK]）
@@ -260,7 +262,7 @@ class Agent:
         return self._chat_llm(user_text)
 
     def _chat_llm_stream(self, user_text, on_delta):
-        system, messages = self._build_chat_messages(user_text)
+        system, messages, budget = self._build_chat_messages(user_text)
         parts = []
 
         def handle(delta):
@@ -268,7 +270,7 @@ class Agent:
             on_delta(self._display_stream_text("".join(parts)))
 
         try:
-            self.brain.complete_stream(messages, handle)
+            self.brain.complete_stream(messages, handle, max_tokens=budget)
         except core.StreamInterrupted as exc:
             # 流式中途断连且已输出部分内容：接受部分，不再整体重发
             # （LLM 生成非确定，重发会重复计费，且 UI 无法撤回已显示内容）
@@ -288,16 +290,37 @@ class Agent:
             on_delta(reply)
         return reply
 
+    # 知识型提问特征：命中则回复给足篇幅（讲知识/资讯），否则保持简短聊天
+    _KNOWLEDGE_RE = re.compile(
+        r"(是什么|什么是|为什么|为啥|怎么(?:做|用|办|回事|实现)?|如何|怎样|区别|"
+        r"原理|机制|介绍|讲讲|讲一下|解释|推荐|攻略|教程|含义|意思|背景|历史|"
+        r"好处|坏处|利弊|对比|分析|说明|科普|多少钱|哪个(?:好|更)|选哪个)"
+    )
+
     def _build_chat_messages(self, user_text):
         relevant = self._relevant_memories(user_text, 5)
         recent = [m for m in self.chat_history[-8:] if m["role"] in ("user", "assistant")]
+        knowledge = bool(self._KNOWLEDGE_RE.search(user_text))
+        memories = self._format_memories(relevant)
+        if memories == "暂无":
+            memories = "你还在慢慢了解主人，记住的还不多"
         system = (
             core.build_persona(self.cfg, mood=self.state.get("mood"))
             + "\n\n"
-            "你记得关于主人的事："
-            + self._format_memories(relevant)
-            + "。"
-            "规则：像朋友一样自然聊天，一般不超过80字，不要用列表和标题。"
+            "你在和主人相处中不断学习、慢慢长大：你记得关于主人的事："
+            + memories
+            + "。聊天时自然地用上这些记忆（不要说“我记得你上次说”这类话）。"
+        )
+        if knowledge:
+            system += (
+                "这次是知识/资讯类提问：回答可以详细些（一般200-400字），"
+                "讲清楚重点，可以用简短列表，但别啰嗦。"
+            )
+            budget = 800
+        else:
+            system += "这次是闲聊：像朋友一样自然聊天，一般不超过80字，不要用列表和标题。"
+            budget = 300
+        system += (
             "如果主人说了值得记住的事，在回复末尾另起一行写 [FACT] 简短描述。"
             "如果你想私下记下自己的念头，另起一行写 [THINK] 一行。"
             "[FACT] 和 [THINK] 这两行不会显示给主人。"
@@ -305,7 +328,7 @@ class Agent:
         messages = [{"role": "system", "content": system}]
         messages += [{"role": m["role"], "content": m["text"]} for m in recent]
         messages.append({"role": "user", "content": user_text})
-        return system, messages
+        return system, messages, budget
 
     @staticmethod
     def _display_stream_text(raw):
