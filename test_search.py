@@ -401,6 +401,70 @@ def test_agent_search_failure(monkeypatch, tmp_path):
     assert "搜索没成功" in reply
 
 
+def test_selfcheck_search_retry_and_soft(monkeypatch):
+    """selfcheck 的 web 搜索：重试恢复则 PASS；持续全源故障降级（不误报 FAIL）。"""
+    import cli
+
+    calls = {"n": 0}
+
+    def fake_all(query, category, limit=6):
+        calls["n"] += 1
+        if calls["n"] >= 2:  # 首次失败，重试成功
+            return [{"title": "T", "url": "https://t.example", "snippet": "S"}]
+        return []
+
+    def fake_diag():
+        return {"errors": ["bing: HTTPError: 503"], "ts": 1}
+
+    monkeypatch.setattr(cli.search, "search_all", fake_all)
+    monkeypatch.setattr(cli.search, "web_search_diag", fake_diag)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    ok, detail = cli._web_search_selfcheck()
+    assert ok and detail == ""
+    assert calls["n"] == 2  # 确认重试了一次
+
+
+def test_selfcheck_search_no_results_fails(monkeypatch):
+    """真无结果（diag 无错误）→ 判定失败（不是降级）。"""
+    import cli
+
+    monkeypatch.setattr(cli.search, "search_all", lambda q, c, limit=6: [])
+    monkeypatch.setattr(cli.search, "web_search_diag", lambda: {"errors": [], "ts": 1})
+    ok, detail = cli._web_search_selfcheck()
+    assert not ok and "no search results" in detail
+
+
+def test_selfcheck_search_persistent_failure_detail(monkeypatch):
+    """持续全源故障 → 失败且 detail 含各源原因（供 WARN 输出）。"""
+    import cli
+
+    monkeypatch.setattr(cli.search, "search_all", lambda q, c, limit=6: [])
+    monkeypatch.setattr(
+        cli.search,
+        "web_search_diag",
+        lambda: {"errors": ["bing: HTTPError: 503", "ddg-lite: TimeoutError"], "ts": 1},
+    )
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    ok, detail = cli._web_search_selfcheck()
+    assert not ok and "全源失败" in detail
+    assert "bing" in detail and "ddg" in detail
+
+
+def test_selfcheck_search_first_try_ok(monkeypatch):
+    """首次即成功 → 不重试。"""
+    import cli
+
+    calls = {"n": 0}
+
+    def fake_all(query, category, limit=6):
+        calls["n"] += 1
+        return [{"title": "T", "url": "https://t.example", "snippet": "S"}]
+
+    monkeypatch.setattr(cli.search, "search_all", fake_all)
+    ok, detail = cli._web_search_selfcheck()
+    assert ok and calls["n"] == 1
+
+
 def _run_plain():
     failures = []
     patch = _Patch()

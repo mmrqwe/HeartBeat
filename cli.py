@@ -355,6 +355,26 @@ def _probe(config_path=None, clean=False):
     return 0 if report["loaded"] else 1
 
 
+def _web_search_selfcheck():
+    """selfcheck 的 web 搜索步骤（模块级以便单测）。
+
+    返回 (ok, detail)：全源故障时重试一次；持续故障 detail 含各源原因，
+    由调用方决定降级（WARN）而非 FAIL。
+    """
+    entries = search.search_all("AI", "web", 3)
+    if entries:
+        return True, ""
+    diag = search.web_search_diag()
+    if diag.get("errors"):
+        print(f"  (web search 全源失败: {'; '.join(diag['errors'])}，重试一次)")
+        time.sleep(1)
+        entries = search.search_all("AI", "web", 3)
+        if entries:
+            return True, ""
+        return False, "web search 全源失败: " + "; ".join(diag.get("errors", []))
+    return False, "no search results"
+
+
 def _selfcheck(config):
     results = []
     warnings = []
@@ -402,19 +422,8 @@ def _selfcheck(config):
     check("collect all plugins", collect_step)
 
     def search_step():
-        entries = search.search_all("AI", "web", 3)
-        if entries:
-            return
-        # 空结果：区分"全源故障"（重试一次后降级 WARN）与"确实无结果"（FAIL）
-        diag = search.web_search_diag()
-        if diag.get("errors"):
-            print(f"  (web search 全源失败: {'; '.join(diag['errors'])}，重试一次)")
-            time.sleep(1)
-            entries = search.search_all("AI", "web", 3)
-            if entries:
-                return
-            raise AssertionError("web search 全源失败: " + "; ".join(diag.get("errors", [])))
-        _require(len(entries) > 0, "no search results")
+        ok, detail = _web_search_selfcheck()
+        _require(ok, detail)
     check("web search", search_step, soft=True)
 
     def chat_step():
