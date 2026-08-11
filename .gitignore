@@ -23,3 +23,8 @@ config.json
 
 # macOS
 .DS_Store
+
+# 构建缓存（OneDrive 外构建产物，不入库）
+fastembed_models/
+fastembed_models_flat/
+build_release.log

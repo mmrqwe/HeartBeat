@@ -55,6 +55,7 @@ rm -rf "$DIST_DIR" "$OUT_ROOT/build"
   --name HeartBeat \
   --distpath "$DIST_DIR" \
   --workpath "$OUT_ROOT/build" \
+  --specpath "$OUT_ROOT/build" \
   --icon "$ROOT/assets/HeartBeat.icns" \
   --add-data "$ROOT/plugins:plugins" \
   --add-data "$ROOT/brain:brain" \
