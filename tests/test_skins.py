@@ -87,7 +87,7 @@ def test_ghost_has_no_ears():
 
 def test_girl_features():
     skin = skins.SKINS["girl"]
-    assert skin["label"] == "小美女"
+    assert skin["label"] == "女生"
     grid = skins.render_frame(skin, "idle", 0)
     flat = "".join(grid)
     assert "h" in flat      # 头发
@@ -105,7 +105,7 @@ def test_girl_animations_render():
 def test_every_skin_has_role():
     for name, skin in skins.SKINS.items():
         assert skin.get("role"), f"{name} 缺少角色设定"
-    assert skins.SKINS["girl"]["role"] == "小女生"
+    assert skins.SKINS["girl"]["role"] == "女生"
     assert skins.SKINS["orange_cat"]["role"] == "小橘猫"
 
 
@@ -121,8 +121,8 @@ def test_every_skin_has_persona():
 def test_boy_features():
     """男生皮肤：短发/衬衫/领带 + 阳光人设。"""
     skin = skins.SKINS["boy"]
-    assert skin["label"] == "小男生"
-    assert skin["persona"]["role"] == "小男生"
+    assert skin["label"] == "男生"
+    assert skin["persona"]["role"] == "男生"
     grid = skins.render_frame(skin, "idle", 0)
     flat = "".join(grid)
     assert "h" in flat  # 头发
@@ -136,10 +136,10 @@ def test_apply_persona_sync():
     """apply_persona：身份无条件覆盖；性格/说话方式/示例仅未自定义时跟随。"""
     cfg = {"role": "旧角色", "personality": "", "speaking_style": "", "example_lines": ""}
     skins.apply_persona(cfg, "boy")
-    assert cfg["role"] == "小男生"
+    assert cfg["role"] == "男生"
     assert "阳光" in cfg["personality"]
     assert "干脆利落" in cfg["speaking_style"]
-    assert "小男生" in cfg["example_lines"]
+    assert "男生" in cfg["example_lines"]
     # 用户自定义过的字段保留，身份仍跟随皮肤
     cfg2 = {
         "role": "旧角色",
@@ -148,7 +148,7 @@ def test_apply_persona_sync():
         "example_lines": "自定义示例",
     }
     skins.apply_persona(cfg2, "boy")
-    assert cfg2["role"] == "小男生"
+    assert cfg2["role"] == "男生"
     assert cfg2["personality"] == "我的自定义性格"
     assert cfg2["speaking_style"] == "我的风格"
     assert cfg2["example_lines"] == "自定义示例"
@@ -161,7 +161,7 @@ def test_persona_flows_to_build_persona():
     cfg = json.loads(json.dumps(core.DEFAULT_CONFIG))
     skins.apply_persona(cfg, "boy")
     prompt = core.build_persona(cfg)
-    assert "小男生" in prompt
+    assert "男生" in prompt
     assert "阳光" in prompt
 
 

@@ -289,9 +289,9 @@ def test_chat_rules_fallback():
 
 def test_chat_rules_uses_role():
     cfg = _cfg()
-    cfg["role"] = "小女生"
+    cfg["role"] = "女生"
     brain = core.Brain(cfg, _plugins())
-    assert "小女生" in brain.chat("你叫什么名字")
+    assert "女生" in brain.chat("你叫什么名字")
 
 
 # ---------- 工具 ----------

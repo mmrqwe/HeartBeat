@@ -235,10 +235,10 @@ def test_chat_rules_remembers(tmp_path):
 
 def test_chat_system_prompt_uses_role(tmp_path):
     cfg = _cfg()
-    cfg["role"] = "小女生"
+    cfg["role"] = "女生"
     a = _make_agent(tmp_path, cfg=cfg)
     system, _ = a._build_chat_messages("hi")
-    assert "小女生" in system
+    assert "女生" in system
     assert "小宠物" not in system
 
 
