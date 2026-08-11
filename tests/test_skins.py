@@ -1,8 +1,12 @@
 """皮肤系统测试：结构完整性、帧有效性、动画丰富度。"""
 
 import inspect
+import json
 
 from gui import skins
+
+
+PERSONA_KEYS = ("role", "personality", "speaking_style", "example_lines")
 
 
 def test_default_skin_exists():
@@ -103,6 +107,62 @@ def test_every_skin_has_role():
         assert skin.get("role"), f"{name} 缺少角色设定"
     assert skins.SKINS["girl"]["role"] == "小女生"
     assert skins.SKINS["orange_cat"]["role"] == "小橘猫"
+
+
+def test_every_skin_has_persona():
+    """每个皮肤都有完整人设（角色/性格/说话方式/示例台词），开箱即用。"""
+    for name, skin in skins.SKINS.items():
+        persona = skin.get("persona") or {}
+        for key in PERSONA_KEYS:
+            assert str(persona.get(key, "") or "").strip(), f"{name} 缺少 persona.{key}"
+        assert persona["role"] == skin["role"], f"{name} persona.role 与顶层 role 不一致"
+
+
+def test_boy_features():
+    """男生皮肤：短发/衬衫/领带 + 阳光人设。"""
+    skin = skins.SKINS["boy"]
+    assert skin["label"] == "小男生"
+    assert skin["persona"]["role"] == "小男生"
+    grid = skins.render_frame(skin, "idle", 0)
+    flat = "".join(grid)
+    assert "h" in flat  # 头发
+    assert "d" in flat  # 领带
+    assert "b" in flat  # 衬衫
+    assert "f" in flat  # 肤色
+    assert skin["body"] is skins.BOY_BODY
+
+
+def test_apply_persona_sync():
+    """apply_persona：身份无条件覆盖；性格/说话方式/示例仅未自定义时跟随。"""
+    cfg = {"role": "旧角色", "personality": "", "speaking_style": "", "example_lines": ""}
+    skins.apply_persona(cfg, "boy")
+    assert cfg["role"] == "小男生"
+    assert "阳光" in cfg["personality"]
+    assert "干脆利落" in cfg["speaking_style"]
+    assert "小男生" in cfg["example_lines"]
+    # 用户自定义过的字段保留，身份仍跟随皮肤
+    cfg2 = {
+        "role": "旧角色",
+        "personality": "我的自定义性格",
+        "speaking_style": "我的风格",
+        "example_lines": "自定义示例",
+    }
+    skins.apply_persona(cfg2, "boy")
+    assert cfg2["role"] == "小男生"
+    assert cfg2["personality"] == "我的自定义性格"
+    assert cfg2["speaking_style"] == "我的风格"
+    assert cfg2["example_lines"] == "自定义示例"
+
+
+def test_persona_flows_to_build_persona():
+    """人设进入 LLM prompt（开箱即用：切皮肤即换完整人设）。"""
+    import core
+
+    cfg = json.loads(json.dumps(core.DEFAULT_CONFIG))
+    skins.apply_persona(cfg, "boy")
+    prompt = core.build_persona(cfg)
+    assert "小男生" in prompt
+    assert "阳光" in prompt
 
 
 def _run_plain():

@@ -281,7 +281,7 @@ class SettingsWindow(QDialog):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(12, 12, 12, 12)
-        self.sync_role = QCheckBox("切换皮肤时同步角色设定（例如小美女 → 小女生）")
+        self.sync_role = QCheckBox("切换皮肤时同步人设（角色/性格/说话方式，开箱即用）")
         self.sync_role.setChecked(True)
         layout.addWidget(self.sync_role)
 
@@ -327,7 +327,10 @@ class SettingsWindow(QDialog):
     def _apply_skin(self, name):
         self.controller.apply_skin(name, sync_role=self.sync_role.isChecked())
         self.cfg = copy.deepcopy(self.controller.cfg)
-        self._basic["role"].setText(self.cfg.get("role", ""))
+        # 人设同步后刷新输入框（未自定义的字段跟随皮肤人设）
+        for key in ("role", "personality", "speaking_style"):
+            if key in self._basic:
+                self._basic[key].setText(str(self.cfg.get(key, "")))
         self._refresh_skin_tab()
         self._refresh_stats_tab()
 

@@ -492,12 +492,8 @@ class HeartBeatApp:
             name = skins.DEFAULT_SKIN
         self.cfg["skin"] = name
         if sync_role:
-            self.cfg["role"] = skins.SKINS[name].get(
-                "role", self.cfg.get("role", "小宠物")
-            )
-            # 说话方式未自定义时跟随皮肤默认风格
-            if not str(self.cfg.get("speaking_style", "") or "").strip():
-                self.cfg["speaking_style"] = skins.SKINS[name].get("style", "")
+            # 完整人设同步：身份无条件覆盖；性格/说话方式/示例台词仅未自定义时跟随
+            skins.apply_persona(self.cfg, name)
         self.kernel.save_settings(self.cfg)
         self.pet.apply_skin(name)
         self._set_status(f"已切换皮肤：{skins.SKINS[name]['label']}")

@@ -267,6 +267,8 @@ def build_persona(cfg, mood=None):
     """
     name = str(cfg.get("pet_name") or "小跳")
     role = str(cfg.get("role") or "小宠物")
+    # 人物类角色用"一个"，动物/精灵等用"一只"（如"小男生/小女生/小幽灵"→一个；"小橘猫/小兔"→一只）
+    unit = "一个" if any(k in role for k in ("男生", "女生", "人", "幽灵")) else "一只"
     personality = str(cfg.get("personality") or "").strip()
     style = str(cfg.get("speaking_style") or "").strip()
     examples = str(cfg.get("example_lines") or "").strip()
@@ -275,7 +277,7 @@ def build_persona(cfg, mood=None):
         "你在扮演一个真实存在的角色。以下设定是你的内在，用来指导言行，不是你会对人说的话。",
         "",
         "# 身份",
-        f"你是{name}，一只{role}，住在主人的电脑里。",
+        f"你是{name}，{unit}{role}，住在主人的电脑里。",
         "",
         "# 说话方式",
     ]
