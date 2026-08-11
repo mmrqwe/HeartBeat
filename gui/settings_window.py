@@ -56,6 +56,15 @@ class SettingsWindow(QDialog):
         self._build()
         self._refresh_stats_tab()
 
+    @staticmethod
+    def _wrap_scroll(widget):
+        """把 tab 内容包进滚动区（设置项多，窗口固定尺寸放不下时滚轮可达）。"""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(widget)
+        return scroll
+
     def _build(self):
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -174,7 +183,7 @@ class SettingsWindow(QDialog):
         )
         self._basic["shell_workdir"].setPlaceholderText("留空 = 用户主目录")
         form.addRow("Shell 工作目录", self._basic["shell_workdir"])
-        return tab
+        return self._wrap_scroll(tab)
 
     # ---------- 内容源 ----------
 
@@ -357,7 +366,7 @@ class SettingsWindow(QDialog):
         buttons.addStretch(1)
         layout.addLayout(buttons)
         self._refresh_memory_tab()
-        return tab
+        return self._wrap_scroll(tab)
 
     def _refresh_memory_tab(self):
         self.memory_list.clear()
@@ -430,7 +439,7 @@ class SettingsWindow(QDialog):
         )
         self.stats_days_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.stats_days_table, 1)
-        return tab
+        return self._wrap_scroll(tab)
 
     def _refresh_stats_tab(self):
         today = self.stats.today()

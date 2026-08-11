@@ -140,13 +140,13 @@ QToolTip {{
 
 
 def bubble_style(role):
-    """聊天气泡样式。"""
+    """聊天气泡样式（QTextBrowser 气泡，内边距由 documentMargin 提供）。"""
     if role == "user":
         return (
             f"background-color: {ACCENT}; color: white;"
-            "border-radius: 12px; padding: 8px 12px;"
+            "border-radius: 12px;"
         )
     return (
         f"background-color: {CARD}; color: {TEXT};"
-        f"border: 1px solid {BORDER}; border-radius: 12px; padding: 8px 12px;"
+        f"border: 1px solid {BORDER}; border-radius: 12px;"
     )

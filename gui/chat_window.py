@@ -3,7 +3,7 @@
 import time
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QKeyEvent
+from PySide6.QtGui import QKeyEvent, QTextOption
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -11,12 +11,31 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QTextBrowser,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from gui import theme
+
+
+BUBBLE_WIDTH = 300  # 气泡固定宽度（markdown 布局与高度计算都依赖它）
+
+
+def _make_bubble(role):
+    """Markdown 渲染气泡（QTextBrowser 原生支持）。"""
+    bubble = QTextBrowser()
+    bubble.setStyleSheet(theme.bubble_style(role))
+    bubble.setFrameShape(QFrame.NoFrame)
+    bubble.setOpenExternalLinks(True)
+    bubble.viewport().setAutoFillBackground(False)  # QSS 背景作用于 frame，viewport 需透明
+    bubble.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    bubble.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    bubble.setMaximumWidth(BUBBLE_WIDTH)
+    bubble.setFixedWidth(BUBBLE_WIDTH)
+    bubble.document().setDocumentMargin(10)  # 内边距（QSS padding 对 QTextEdit 无效）
+    return bubble
 
 
 class ChatInput(QTextEdit):
@@ -124,12 +143,8 @@ class ChatWindow(QWidget):
             return None
 
         align = Qt.AlignRight if role == "user" else Qt.AlignLeft
-        bubble = QLabel(text)
-        bubble.setStyleSheet(theme.bubble_style(role))
-        bubble.setWordWrap(True)
-        bubble.setMaximumWidth(300)
-        bubble.setFixedWidth(300)  # 固定宽度：wordWrap 换行宽度确定，避免布局按 sizeHint 缩窄
-        bubble.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        bubble = _make_bubble(role)
+        bubble.setMarkdown(text)
         self.content_layout.addWidget(bubble, 0, align)
         self._sync_bubble_height(bubble)
 
@@ -155,24 +170,32 @@ class ChatWindow(QWidget):
         self._scroll_to_bottom()
 
     def _sync_bubble_height(self, bubble):
-        """按换行后的实际需求高度固定气泡高度（QLabel wordWrap 在流式频繁
-        setText 下布局不会自动重算高度，会导致长文本底部被裁剪）。"""
+        """按文档实际布局高度固定气泡高度。
+
+        QTextBrowser 未显示时 document.size() 为 0，需 setTextWidth + adjustSize
+        手动触发 layout 后再取高度（流式高频更新同样依赖此机制）。
+        """
         if bubble is None:
             return
-        width = bubble.width() or 300
-        height = bubble.heightForWidth(width)
-        bubble.setFixedHeight(max(height, 16))
+        width = BUBBLE_WIDTH
+        bubble.setFixedWidth(width)
+        doc = bubble.document()
+        doc.setTextWidth(width - doc.documentMargin() * 2 - 4)  # 左右 margin + 边框缓冲
+        doc.adjustSize()
+        height = doc.size().height()
+        bubble.setFixedHeight(max(int(height) + 4, 24))
 
     def update_last_message(self, text):
         if self._last_bubble is not None:
-            self._last_bubble.setText(text)
+            # 流式中用纯文本：markdown 半成品（未闭合 **、``` 等）会闪烁/误渲染
+            self._last_bubble.setPlainText(text)
             self._sync_bubble_height(self._last_bubble)
             self._scroll_to_bottom()
 
     def finish_stream(self, text):
-        """流式结束：用最终完整文本收尾，并复位流式状态。"""
+        """流式结束：用最终完整文本收尾（Markdown 渲染），并复位流式状态。"""
         if self._last_bubble is not None:
-            self._last_bubble.setText(text)
+            self._last_bubble.setMarkdown(text)
             self._sync_bubble_height(self._last_bubble)
             self._scroll_to_bottom()
         self._streaming = False
