@@ -99,26 +99,28 @@ def _make_parser():
     )
     p_probe.add_argument("--clean", action="store_true", help="先清理旧探针文件")
 
-    p_updater = sub.add_parser("updater", help="自进化：brain 模块版本管理（memory/planner）")
+    p_updater = sub.add_parser("updater", help="自进化：模块/工具版本管理（memory/planner/tool）")
     upd_sub = p_updater.add_subparsers(dest="upd_cmd", required=True)
-    upd_sub.add_parser("status", help="查看各模块已安装版本与 active 指针")
-    p_upd_validate = upd_sub.add_parser("validate", help="验证候选版本（L0 语法 + L1 接口 + L2 冒烟）")
-    p_upd_validate.add_argument("module", choices=["memory", "planner"])
-    p_upd_validate.add_argument("candidate_dir", help="候选版本目录（内含 <module>.py）")
-    p_upd_install = upd_sub.add_parser("install", help="验证并安装候选版本（自动切换 active，下次启动生效）")
-    p_upd_install.add_argument("module", choices=["memory", "planner"])
+    upd_sub.add_parser("status", help="查看模块与工具已安装版本与 active 指针")
+    p_upd_validate = upd_sub.add_parser("validate", help="验证候选（L0 语法 + L1 接口/契约 + L2 冒烟/安全检查）")
+    p_upd_validate.add_argument("module", help="memory / planner / tool（tool 时候选目录含 tool.py）")
+    p_upd_validate.add_argument("candidate_dir", help="候选版本目录")
+    p_upd_validate.add_argument("--upgrade-of", default=None, help="工具升级：指定现有工具名（候选 TOOL_NAME 必须一致）")
+    p_upd_install = upd_sub.add_parser("install", help="验证并安装候选（自动切换 active，立即生效）")
+    p_upd_install.add_argument("module", help="memory / planner / tool（tool 时候选目录含 tool.py）")
     p_upd_install.add_argument("candidate_dir")
-    p_upd_switch = upd_sub.add_parser("switch", help="显式切换 active 版本")
-    p_upd_switch.add_argument("module", choices=["memory", "planner"])
+    p_upd_install.add_argument("--upgrade-of", default=None, help="工具升级：指定现有工具名（候选 TOOL_NAME 必须一致，装为 vN+1）")
+    p_upd_switch = upd_sub.add_parser("switch", help="显式切换 active 版本（memory/planner/工具名）")
+    p_upd_switch.add_argument("module", help="memory / planner / 工具名（如 ping_check）")
     p_upd_switch.add_argument("version")
-    p_upd_rollback = upd_sub.add_parser("rollback", help="回滚 active 到最近可用旧版本")
-    p_upd_rollback.add_argument("module", choices=["memory", "planner"])
+    p_upd_rollback = upd_sub.add_parser("rollback", help="回滚 active 到最近可用旧版本（memory/planner/工具名）")
+    p_upd_rollback.add_argument("module", help="memory / planner / 工具名（如 ping_check）")
 
     p_evolve = sub.add_parser(
-        "evolve", help="自我进化：LLM 生成新版本 → 安全/契约/冒烟验证 → 原子安装（memory/planner）"
+        "evolve", help="自我进化：LLM 生成新版本 → 安全/契约/冒烟验证 → 原子安装（memory/planner/tool）"
     )
-    p_evolve.add_argument("module", choices=["memory", "planner"])
-    p_evolve.add_argument("requirement", help="功能需求描述，如：每天上午9点提醒我喝水")
+    p_evolve.add_argument("module", choices=["memory", "planner", "tool"])
+    p_evolve.add_argument("requirement", help="功能需求描述，如：每天上午9点提醒我喝水 / 查快递物流 / 升级 ping_check：支持超时参数")
     return parser
 
 
@@ -260,7 +262,7 @@ def _run(argv, default_config=None):
 
 
 def _updater_cmd(args):
-    """自进化版本管理：status / validate / install / switch / rollback。"""
+    """自进化版本管理：status / validate / install / switch / rollback（模块与工具）。"""
     from brain.smoke import smoke_test_module
     from kernel.updater import BUILTIN_MODULES, Updater
 
@@ -273,25 +275,38 @@ def _updater_cmd(args):
             versions = upd.list_versions(name)
             active = upd.active_version(name)
             print(f"{name}: active={active or '-'} 已装版本={','.join(versions) or '-'}")
+        for name in upd.list_tools():
+            versions = upd.list_versions(name)
+            active = upd.active_version(name)
+            print(f"tool/{name}: active={active or '-'} 已装版本={','.join(versions) or '-'}")
         return 0
 
     if args.upd_cmd == "validate":
-        ok, errors = upd.validate_candidate(args.module, args.candidate_dir)
+        ok, errors = upd.validate_candidate(
+            args.module, args.candidate_dir, upgrade_of=args.upgrade_of
+        )
         if not ok:
             print(f"验证失败：{args.module} {args.candidate_dir}")
             for err in errors:
                 print("  -", err)
             return 1
-        print(f"验证通过：{args.module} {args.candidate_dir}（L0 语法 + L1 接口 + L2 冒烟）")
+        label = "L0 语法 + L1 接口 + L2 冒烟"
+        if args.module == "tool":
+            label = "L0 受限加载 + L1 契约 + L2 AST 安全 + 冒烟"
+        extra = f"（升级 {args.upgrade_of}）" if args.upgrade_of else ""
+        print(f"验证通过：{args.module} {args.candidate_dir} {extra}（{label}）")
         return 0
 
     if args.upd_cmd == "install":
         try:
-            version = upd.install_candidate(args.module, args.candidate_dir)
+            version = upd.install_candidate(
+                args.module, args.candidate_dir, upgrade_of=args.upgrade_of
+            )
         except ValueError as exc:
             print(f"安装失败：{exc}")
             return 1
-        print(f"已安装 {args.module} {version} 并激活（下次启动或 reload 生效）")
+        extra = f"（升级 {args.upgrade_of}）" if args.upgrade_of else ""
+        print(f"已安装 {args.module} {version} 并激活 {extra}（立即生效）")
         return 0
 
     if args.upd_cmd == "switch":
@@ -300,7 +315,7 @@ def _updater_cmd(args):
         except ValueError as exc:
             print(f"切换失败：{exc}")
             return 1
-        print(f"已切换 {args.module} -> {args.version}（下次启动或 reload 生效）")
+        print(f"已切换 {args.module} -> {args.version}（立即生效）")
         return 0
 
     if args.upd_cmd == "rollback":
@@ -332,6 +347,10 @@ def _evolve_cmd(args):
     except ValueError as exc:
         print(f"进化失败：{exc}")
         return 1
+    if args.module == "tool":
+        tool_name, _, ver = version.partition("@")
+        print(f"进化成功：工具「{tool_name}」{ver}（已安装，聊天里直接可用）")
+        return 0
     print(f"进化成功：{args.module} -> {version}（已热加载生效）")
     return 0
 

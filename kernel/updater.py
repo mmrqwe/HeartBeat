@@ -20,6 +20,9 @@ import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any
+
+from . import toolsafety
 
 # 可进化模块清单（brain 层，允许 AI 替换升级）
 BUILTIN_MODULES = ("memory", "planner")
@@ -55,10 +58,29 @@ class Updater:
     def __init__(self, data_dir):
         self.root = Path(data_dir) / "brain"
         # L2 冒烟 runner（宿主注入）：(module_name, module) -> bool
-        self.smoke_runner = None
+        self.smoke_runner: Any = None
         # 事件总线（Kernel 注入）：切换后广播 brain.switched(module_name, version)
         # —— 运行中的 Agent 可订阅热切换领域模块（准热 → 热）
         self.eventbus = None
+
+    # ---------- 审计 ----------
+
+    def _base(self, name):
+        """模块根目录：内置模块在 <data>/brain/<name>/，进化工具在 <data>/tools/<name>/。"""
+        if name in BUILTIN_MODULES:
+            return self.root / name
+        return self.root.parent / "tools" / name
+
+    def list_tools(self):
+        """已安装进化工具名（<data>/tools/<name>/active 存在）。"""
+        tools_root = self.root.parent / "tools"
+        if not tools_root.is_dir():
+            return []
+        return sorted(
+            d.name for d in tools_root.glob("*")
+            if d.is_dir() and (d / "active").is_file()
+            and toolsafety._TOOL_NAME_RE.fullmatch(d.name)
+        )
 
     # ---------- 审计 ----------
 
@@ -84,6 +106,9 @@ class Updater:
 
     def _notify_switched(self, name, version):
         """切换成功后广播事件（热切换接线点）。"""
+        # 进化工具由 execute 动态加载（每轮实时读 active），无需热切换广播
+        if name not in BUILTIN_MODULES:
+            return
         if self.eventbus is not None:
             self.eventbus.emit("brain.switched", (name, version))
 
@@ -132,14 +157,14 @@ class Updater:
     # ---------- 版本管理 ----------
 
     def active_version(self, name):
-        active_file = self.root / name / "active"
+        active_file = self._base(name) / "active"
         if not active_file.is_file():
             return None
         value = active_file.read_text(encoding="utf-8").strip()
         return value or None
 
     def list_versions(self, name):
-        base = self.root / name
+        base = self._base(name)
         if not base.is_dir():
             return []
         versions = [p.name for p in sorted(base.glob("v*")) if p.is_dir()]
@@ -159,7 +184,7 @@ class Updater:
 
     def _write_active(self, name, version):
         """原子写 active 指针（临时文件 + rename，避免半写状态）。"""
-        base = self.root / name
+        base = self._base(name)
         base.mkdir(parents=True, exist_ok=True)
         tmp = base / "active.tmp"
         tmp.write_text(version + "\n", encoding="utf-8")
@@ -200,9 +225,18 @@ class Updater:
     # ---------- 加载 ----------
 
     def _load_version(self, name, version):
-        src = self.root / name / version / f"{name}.py"
+        src = self._base(name) / version / f"{name}.py"
         if not src.is_file():
             raise FileNotFoundError(f"{name} {version} 缺少模块文件")
+        if name not in BUILTIN_MODULES:
+            # 进化工具：受限沙箱执行 + handler 契约校验
+            module = toolsafety.run_sandboxed(
+                src.read_text(encoding="utf-8"),
+                f"hb_tool_{name}_{version.replace('.', '_')}",
+            )
+            if not callable(getattr(module, "handler", None)):
+                raise ValueError(f"{name} {version} 缺少可调用的 handler")
+            return module
         spec = importlib.util.spec_from_file_location(
             f"hb_{name}_{version.replace('.', '_')}", src
         )
@@ -227,12 +261,15 @@ class Updater:
 
     # ---------- 候选验证与安装 ----------
 
-    def validate_candidate(self, name, candidate_dir, run_smoke=True):
+    def validate_candidate(self, name, candidate_dir, run_smoke=True, upgrade_of=None):
         """验证候选版本：L0 语法 + L1 接口（+L2 冒烟若注入 runner）。
 
+        upgrade_of：工具升级时传工具名（候选 TOOL_NAME 必须一致，跳过新增冲突检查）。
         返回 (ok, errors)。errors 非空时 ok=False。
         """
         candidate_dir = Path(candidate_dir)
+        if name == "tool":
+            return self._validate_tool_candidate(candidate_dir, upgrade_of=upgrade_of)
         src = candidate_dir / f"{name}.py"
         errors = []
         if not src.is_file():
@@ -267,11 +304,59 @@ class Updater:
                 return False, ["L2 冒烟未通过"]
         return True, []
 
-    def install_candidate(self, name, candidate_dir):
+    def _validate_tool_candidate(self, candidate_dir, upgrade_of=None):
+        """验证进化工具候选：L0 受限加载 / L1 契约 / L2 AST 安全 + fake-ctx 冒烟。
+
+        upgrade_of：升级时传现有工具名（候选 TOOL_NAME 必须一致，跳过新增冲突检查）。
+        """
+        candidate_dir = Path(candidate_dir)
+        src = candidate_dir / "tool.py"
+        if not src.is_file():
+            return False, ["候选目录缺少 tool.py"]
+        try:
+            code = src.read_text(encoding="utf-8")
+        except OSError as exc:
+            return False, [f"无法读取候选：{exc}"]
+        # L0：语法 + 受限沙箱执行
+        try:
+            module = toolsafety.run_sandboxed(code, "candidate_tool")
+        except Exception as exc:
+            return False, [f"L0 加载失败：{type(exc).__name__}: {exc}"]
+        # L1：契约
+        tool_name = str(getattr(module, "TOOL_NAME", "") or "")
+        if not toolsafety._TOOL_NAME_RE.fullmatch(tool_name):
+            return False, ["L1 TOOL_NAME 必须是合法标识符（英文小写+下划线）"]
+        if upgrade_of is not None:
+            if upgrade_of not in self.list_tools():
+                return False, [f"L1 要升级的工具不存在：{upgrade_of}"]
+            if tool_name != upgrade_of:
+                return False, [f"L1 升级不能改名：候选是 {tool_name}，应保持 {upgrade_of}"]
+        elif tool_name in self.list_tools():
+            return False, [f"L1 工具已存在：{tool_name}（新增冲突；升级请用“升级 <工具名>”语法）"]
+        if not str(getattr(module, "TOOL_DESCRIPTION", "") or "").strip():
+            return False, ["L1 缺少 TOOL_DESCRIPTION"]
+        params = getattr(module, "TOOL_PARAMETERS", None)
+        if not isinstance(params, dict) or params.get("type") != "object":
+            return False, ["L1 TOOL_PARAMETERS 必须是 type=object 的 JSON Schema dict"]
+        if not callable(getattr(module, "handler", None)):
+            return False, ["L1 缺少可调用的 handler(args, ctx)"]
+        # L2：AST 安全检查 + fake-ctx 冒烟（原语 no-op，不允许触达真实能力）
+        safety_errors = toolsafety.check_tool_safety(code)
+        if safety_errors:
+            return False, ["L2 安全检查：" + "；".join(safety_errors[:8])]
+        ok, err = toolsafety.smoke_tool(module)
+        if not ok:
+            return False, [f"L2 冒烟：{err}"]
+        return True, []
+
+    def install_candidate(self, name, candidate_dir, upgrade_of=None):
         """验证候选 → 装入下一个版本目录 → 原子切换 active。返回新版本号。
 
-        安装后立即重新加载验证；失败则删除新版本目录并抛错（不破坏现状）。
+        upgrade_of：工具升级时传现有工具名。安装后立即重新加载验证；
+        失败则删除新版本目录并抛错（不破坏现状）。
         """
+        if name == "tool":
+            return self._install_tool_candidate(candidate_dir, upgrade_of=upgrade_of)
         ok, errors = self.validate_candidate(name, candidate_dir)
         if not ok:
             raise ValueError("；".join(errors))
@@ -288,3 +373,40 @@ class Updater:
         self._audit("install", name, version, detail=str(Path(candidate_dir)))
         self._notify_switched(name, version)
         return version
+
+    def _install_tool_candidate(self, candidate_dir, upgrade_of=None):
+        """进化工具安装：验证 → <data>/tools/<TOOL_NAME>/vN/ → active 切换。
+
+        升级时（upgrade_of 给定）TOOL_NAME 必须等于 upgrade_of，版本自动递增 vN+1。
+        工具由 execute 动态加载，无需热切换广播。返回新版本号。
+        """
+        ok, errors = self._validate_tool_candidate(candidate_dir, upgrade_of=upgrade_of)
+        if not ok:
+            raise ValueError("；".join(errors))
+        candidate_dir = Path(candidate_dir)
+        src = candidate_dir / "tool.py"
+        code = src.read_text(encoding="utf-8")
+        module = toolsafety.run_sandboxed(code, "candidate_tool")
+        tool_name = str(module.TOOL_NAME)
+        version = self._next_version(tool_name)
+        version_dir = self._base(tool_name) / version
+        version_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, version_dir / f"{tool_name}.py")
+        try:
+            self._load_version(tool_name, version)  # 安装后完整性预检
+        except Exception as exc:
+            shutil.rmtree(version_dir, ignore_errors=True)
+            raise ValueError(f"安装后加载失败：{exc}")
+        self._write_active(tool_name, version)
+        self._audit("install", tool_name, version, detail=str(candidate_dir))
+        return version
+
+    def tool_source(self, name):
+        """读进化工具当前 active 版本的完整源码（升级进化基准）。"""
+        version = self.active_version(name)
+        if not version:
+            raise FileNotFoundError(f"工具 {name} 未安装")
+        src = self._base(name) / version / f"{name}.py"
+        if not src.is_file():
+            raise FileNotFoundError(f"工具 {name} active 版本源码缺失：{src}")
+        return src.read_text(encoding="utf-8")

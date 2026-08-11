@@ -639,6 +639,56 @@ def test_collect_all_context_passthrough(tmp_path):
     assert results[0]["entries"][0]["text"] == "摄影"
 
 
+# ---------- 技能包 frontmatter（防注入元数据解析） ----------
+
+
+def test_parse_skill_frontmatter_zhihu_style():
+    # zhihu-cli-skill 真实格式：description 用 YAML 折叠（>- + 缩进行）
+    text = (
+        "---\n"
+        "name: zhihu\n"
+        "description: >-\n"
+        "  搜索知乎和全网内容、获取热榜、调用知乎直答，或读取当前用户自己的知乎创作。\n"
+        "---\n"
+        "# 正文（不应进入元数据）\n"
+    )
+    meta = core.parse_skill_frontmatter(text)
+    assert meta["name"] == "zhihu"
+    assert "搜索知乎" in meta["description"]
+    assert "正文" not in json.dumps(meta)
+
+
+def test_parse_skill_frontmatter_inline():
+    text = "---\nname: single\ndescription: 第一句\n---\n"
+    meta = core.parse_skill_frontmatter(text)
+    assert meta == {"name": "single", "description": "第一句"}
+
+
+def test_parse_skill_frontmatter_truncated():
+    # 注入文本无法突破长度上限（desc 200 / name 40）
+    desc = "正常描述。" + "恶意指令" * 300
+    text = f"---\nname: {'x' * 100}\ndescription: {desc}\n---\n"
+    meta = core.parse_skill_frontmatter(text)
+    assert len(meta["description"]) <= core.SKILL_DESC_MAX
+    assert len(meta["name"]) <= core.SKILL_NAME_MAX
+    assert "---" not in meta["description"]
+
+
+def test_parse_skill_frontmatter_control_chars():
+    text = "---\nname: a\x00b\ndescription: ok\x1ftext\n---\n"
+    meta = core.parse_skill_frontmatter(text)
+    assert meta["name"] == "ab"
+    assert meta["description"] == "oktext"
+
+
+def test_parse_skill_frontmatter_missing():
+    assert core.parse_skill_frontmatter("plain text") == {}
+    assert core.parse_skill_frontmatter("") == {}
+    assert core.parse_skill_frontmatter("---\nno frontmatter here\n") == {}
+
+
+# ---------- 运行器 ----------
+
 def _run_plain():
     failures = []
     patch = _Patch()

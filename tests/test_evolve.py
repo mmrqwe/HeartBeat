@@ -38,7 +38,7 @@ class FakeBrain:
         self.responses = list(responses)
         self.prompts = []
 
-    def complete(self, messages, max_tokens=None):
+    def complete(self, messages, max_tokens=None, **kw):
         self.prompts.append(messages)
         if not self.responses:
             raise AssertionError("FakeBrain 响应已耗尽")
@@ -161,6 +161,167 @@ def test_evolve_intent_parse(tmp_path):
     ag2 = _make_agent(tmp_path, with_updater=False)
     reply = ag2._try_evolve_intent("进化 planner：每天上午9点提醒我喝水")
     assert "进化引擎不可用" in reply
+
+
+# ---------- 进化工具（tool 类型） ----------
+
+TOOL_SRC = '''\
+TOOL_NAME = "ping_check"
+TOOL_DESCRIPTION = "检查网络连通性（示例进化工具）"
+TOOL_PARAMETERS = {
+    "type": "object",
+    "properties": {"host": {"type": "string"}},
+    "required": ["host"],
+}
+
+
+def handler(args, ctx):
+    host = str(args.get("host", "")).strip()
+    if not host:
+        return "缺少 host 参数"
+    try:
+        text = ctx.web_search(host + " 状态", limit=1)
+        return "查询结果：" + text
+    except Exception as exc:
+        return "查询失败：" + str(exc)
+'''
+
+# 升级版候选：加 timeout 参数（TOOL_NAME 保持不变）
+TOOL_SRC_V2 = TOOL_SRC.replace(
+    '"properties": {"host": {"type": "string"}},'
+    , '"properties": {"host": {"type": "string"}, "timeout": {"type": "number"}},'
+)
+
+
+def _tool_cand(root, src):
+    d = Path(root) / "cand"
+    d.mkdir(exist_ok=True)
+    (d / "tool.py").write_text(src, encoding="utf-8")
+    return d
+
+
+def test_evolve_tool_pipeline(tmp_path):
+    """生成工具模块 → 验证（受限加载/契约/AST/冒烟）→ 安装 → 可加载。"""
+    ev = _make_evolver(tmp_path, FakeBrain(["```python\n" + TOOL_SRC + "\n```"]))
+    result = ev.evolve("tool", "查快递物流")
+    assert result == "ping_check@v0.1"
+    assert ev.updater.list_tools() == ["ping_check"]
+    mod = ev.updater.load("ping_check")
+    assert mod.TOOL_NAME == "ping_check" and callable(mod.handler)
+    assert not list(ev.candidate_root.glob("*"))
+
+
+def test_evolve_tool_rejects_dangerous(tmp_path):
+    bad = "import os\n" + TOOL_SRC
+    ev = _make_evolver(tmp_path, FakeBrain([bad, bad, bad]))
+    try:
+        ev.evolve("tool", "查快递物流")
+        raise AssertionError("应拒绝危险工具")
+    except ValueError as exc:
+        assert "禁止 import" in str(exc)
+    assert ev.updater.list_tools() == []
+
+
+def test_evolve_tool_retry_with_feedback(tmp_path):
+    bad = "import os\n" + TOOL_SRC
+    fake = FakeBrain([bad, "```python\n" + TOOL_SRC + "\n```"])
+    ev = _make_evolver(tmp_path, fake)
+    result = ev.evolve("tool", "查快递物流")
+    assert result == "ping_check@v0.1"
+    assert "验证失败" in fake.prompts[1][-1]["content"]
+
+
+def test_evolve_tool_prompt_mentions_primitives(tmp_path):
+    ev = _make_evolver(tmp_path, FakeBrain([]))
+    text = ev._tool_prompt("查快递")[0]["content"]
+    assert "ctx.web_search" in text and "禁止 import" in text and "TOOL_NAME" in text
+
+
+def test_extract_code_variants(tmp_path):
+    from brain.evolver import Evolver
+
+    src = "TOOL_NAME = \"x\"\ndef handler(args, ctx):\n    return \"ok\""
+    # 标准 ```python 围栏
+    assert Evolver._extract_code(f"好的：\n```python\n{src}\n```") == src
+    # 嵌套用四反引号（升级 prompt 内嵌现有源码时的常见行为）
+    assert Evolver._extract_code(f"```python\n{src}\n````") == src
+    # 无语言标签
+    assert Evolver._extract_code(f"```\n{src}\n```") == src
+    # 无围栏兜底：从 TOOL_NAME 截取
+    assert Evolver._extract_code("这是你要的工具：\n" + src) == src
+    # 纯解释文字 → 空
+    assert Evolver._extract_code("抱歉，我不能生成代码。") == ""
+
+
+def test_evolve_tool_upgrade(tmp_path):
+    """升级语法：先装 v0.1 → '升级 ping_check：支持超时' → v0.2，prompt 带现有源码。"""
+    fake = FakeBrain([
+        "```python\n" + TOOL_SRC + "\n```",
+        "```python\n" + TOOL_SRC_V2 + "\n```",
+    ])
+    ev = _make_evolver(tmp_path, fake)
+    assert ev.evolve("tool", "查快递物流") == "ping_check@v0.1"
+    result = ev.evolve("tool", "升级 ping_check：支持超时参数")
+    assert result == "ping_check@v0.2"
+    assert ev.updater.list_versions("ping_check") == ["v0.1", "v0.2"]
+    assert ev.updater.active_version("ping_check") == "v0.2"
+    # 升级 prompt 以现有 active 源码为基准
+    assert "当前完整源码" in fake.prompts[1][-1]["content"]
+    assert "升级基准" in fake.prompts[1][-1]["content"]
+
+
+def test_evolve_tool_upgrade_after_agent_clean(tmp_path):
+    """agent 聊天清洗后形式（无“升级”前缀）：'ping_check：支持超时' 仍识别为升级。"""
+    fake = FakeBrain([
+        "```python\n" + TOOL_SRC + "\n```",
+        "```python\n" + TOOL_SRC_V2 + "\n```",
+    ])
+    ev = _make_evolver(tmp_path, fake)
+    assert ev.evolve("tool", "查快递物流") == "ping_check@v0.1"
+    result = ev.evolve("tool", "ping_check：支持超时参数")
+    assert result == "ping_check@v0.2"
+
+
+def test_evolve_tool_upgrade_unknown(tmp_path):
+    ev = _make_evolver(tmp_path, FakeBrain([]))
+    try:
+        ev.evolve("tool", "升级 nope_tool：加参数")
+        raise AssertionError("应拒绝升级不存在的工具")
+    except ValueError as exc:
+        assert "没有已安装的工具「nope_tool」" in str(exc)
+    assert ev.updater.list_tools() == []
+
+
+def test_evolve_tool_upgrade_rename_rejected(tmp_path):
+    """升级候选改名 → 验证失败重试耗尽后放弃，v0.1 保持 active。"""
+    renamed = TOOL_SRC.replace('TOOL_NAME = "ping_check"', 'TOOL_NAME = "rename_check"')
+    fake = FakeBrain([
+        "```python\n" + TOOL_SRC + "\n```",
+        "```python\n" + renamed + "\n```",
+        "```python\n" + renamed + "\n```",
+        "```python\n" + renamed + "\n```",
+    ])
+    ev = _make_evolver(tmp_path, fake)
+    assert ev.evolve("tool", "查快递物流") == "ping_check@v0.1"
+    try:
+        ev.evolve("tool", "升级 ping_check：支持超时参数")
+        raise AssertionError("改名升级应被拒绝")
+    except ValueError as exc:
+        assert "不能改名" in str(exc)
+    assert ev.updater.active_version("ping_check") == "v0.1"
+
+
+def test_evolve_intent_tool_upgrade_shortcut(tmp_path):
+    """'升级 ping_check：加超时'（无“工具”字样）→ 按已装工具名解析为 tool 升级。"""
+    a = _make_agent(tmp_path, with_updater=True)
+    a.evolver.updater.install_candidate("tool", _tool_cand(tmp_path, TOOL_SRC))
+    seen = {}
+    a.evolver.evolve = (
+        lambda name, req, on_status=None: seen.update(name=name, req=req) or "ping_check@v0.2"
+    )
+    reply = a._try_evolve_intent("升级 ping_check：支持超时参数")
+    assert seen.get("name") == "tool", seen
+    assert "已升级到 v0.2" in reply and "ping_check" in reply
 
 
 if __name__ == "__main__":

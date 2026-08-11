@@ -251,21 +251,277 @@ def test_execute_unknown_tool():
     assert "未知工具" in result
 
 
+# ---------- 进化工具分发（<data>/tools/ 自进化能力层） ----------
+
+TOOL_SRC = '''\
+TOOL_NAME = "ping_check"
+TOOL_DESCRIPTION = "检查网络连通性（示例进化工具）"
+TOOL_PARAMETERS = {
+    "type": "object",
+    "properties": {"host": {"type": "string"}},
+    "required": ["host"],
+}
+
+
+def handler(args, ctx):
+    host = str(args.get("host", "")).strip()
+    if not host:
+        return "缺少 host 参数"
+    try:
+        text = ctx.web_search(host + " 状态", limit=1)
+        return "查询结果：" + text
+    except Exception as exc:
+        return "查询失败：" + str(exc)
+'''
+
+
+def _install_tool(tmp, src=TOOL_SRC):
+    """在临时目录手写安装一个进化工具（v0.1 + active 指针）。"""
+    base = Path(tmp) / "ping_check"
+    (base / "v0.1").mkdir(parents=True)
+    (base / "v0.1" / "ping_check.py").write_text(src, encoding="utf-8")
+    (base / "active").write_text("v0.1\n", encoding="utf-8")
+    return base
+
+
+def test_execute_evolved_tool_dispatch():
+    with TemporaryDirectory() as d:
+        _install_tool(d)
+        patch = _Patch()
+        try:
+            patch.setattr(tools, "_tools_dir", lambda: Path(d))
+            result = tools.execute("ping_check", "{}", mode="confirm",
+                                   source=tools.SOURCE_USER, confirm_cb=lambda desc: True)
+            assert "缺少 host 参数" in result
+        finally:
+            patch.restore()
+
+
+def test_execute_evolved_tool_ctx_primitive():
+    with TemporaryDirectory() as d:
+        _install_tool(d)
+        patch = _Patch()
+        try:
+            patch.setattr(tools, "_tools_dir", lambda: Path(d))
+            patch.setattr(search, "search_all",
+                          lambda q, kind, limit=6: [{"title": "结果X", "url": "https://x", "snippet": "S"}])
+            patch.setattr(search, "format_results",
+                          lambda entries, label: "格式化:" + entries[0]["title"])
+            result = tools.execute("ping_check", '{"host": "example.com"}',
+                                   mode="confirm", source=tools.SOURCE_USER,
+                                   confirm_cb=lambda desc: True)
+            assert "格式化:结果X" in result
+        finally:
+            patch.restore()
+
+
+def test_execute_evolved_tool_audit():
+    with TemporaryDirectory() as d:
+        _install_tool(d)
+        logs = []
+        patch = _Patch()
+        try:
+            patch.setattr(tools, "_tools_dir", lambda: Path(d))
+            tools.execute("ping_check", "{}", mode="confirm", source=tools.SOURCE_USER,
+                          confirm_cb=lambda desc: True, audit=lambda *a: logs.append(a))
+            assert logs and logs[0][1] == "ping_check" and logs[0][4] is True
+        finally:
+            patch.restore()
+
+
+def test_execute_evolved_tool_failure():
+    with TemporaryDirectory() as d:
+        _install_tool(d, TOOL_SRC.replace('return "缺少 host 参数"', 'raise RuntimeError("boom")'))
+        patch = _Patch()
+        try:
+            patch.setattr(tools, "_tools_dir", lambda: Path(d))
+            result = tools.execute("ping_check", "{}", mode="confirm",
+                                   source=tools.SOURCE_USER, confirm_cb=lambda desc: True)
+            assert "工具执行失败" in result and "boom" in result
+        finally:
+            patch.restore()
+
+
+def test_declarations_include_evolved_tool():
+    with TemporaryDirectory() as d:
+        _install_tool(d)
+        patch = _Patch()
+        try:
+            patch.setattr(tools, "_tools_dir", lambda: Path(d))
+            decls = tools.tool_declarations(_cfg("confirm"))
+            names = [x["function"]["name"] for x in decls]
+            assert "ping_check" in names
+            assert len(decls) == 10  # 9 内置 + 1 进化
+        finally:
+            patch.restore()
+
+
+# ---------- 下载/安装门控（download_file / install_skill） ----------
+
+
+def _audit_log():
+    logs = []
+    return logs, lambda *a: logs.append(a)
+
+
+def test_execute_download_auto_rejected():
+    logs, audit = _audit_log()
+    result = tools.execute("download_file", '{"url": "https://example.com/a.zip"}',
+                           mode="full", source=tools.SOURCE_AUTO, audit=audit)
+    assert "自主触发" in result
+    assert logs and logs[0][4] is False  # approved=False
+
+
+def test_execute_download_off_readonly_rejected():
+    for mode in ("off", "readonly"):
+        result = tools.execute("download_file", '{"url": "https://example.com/a.zip"}',
+                               mode=mode, source=tools.SOURCE_USER)
+        assert "不允许下载" in result
+
+
+def test_execute_download_full_tier_still_confirms():
+    # 下载绕过网络防火墙：full 档也弹确认（与 bash 写操作不同）
+    seen = []
+    patch = _Patch()
+    try:
+        with TemporaryDirectory() as d:
+            patch.setattr(tools, "_downloads_dir", lambda: Path(d))
+            patch.setattr(tools.kdownload, "download_file",
+                          lambda url, dest, filename=None: (Path(dest) / "a.zip", 1))
+            result = tools.execute(
+                "download_file", '{"url": "https://example.com/a.zip"}',
+                mode="full", source=tools.SOURCE_USER,
+                confirm_cb=lambda desc: seen.append(desc) or True)
+            assert "下载完成" in result
+        assert seen and "下载文件：https://example.com/a.zip" in seen[0]
+    finally:
+        patch.restore()
+
+
+def test_execute_download_confirm_denied_no_write():
+    patch = _Patch()
+    try:
+        with TemporaryDirectory() as d:
+            patch.setattr(tools, "_downloads_dir", lambda: Path(d))
+            patch.setattr(tools.kdownload, "download_file",
+                          lambda *a, **kw: (_ for _ in ()).throw(AssertionError("不应执行下载")))
+            result = tools.execute("download_file", '{"url": "https://example.com/a.zip"}',
+                                   mode="confirm", source=tools.SOURCE_USER,
+                                   confirm_cb=lambda desc: False)
+            assert "未确认" in result
+            assert list(Path(d).iterdir()) == []
+    finally:
+        patch.restore()
+
+
+def test_execute_download_success():
+    logs, audit = _audit_log()
+    patch = _Patch()
+    try:
+        with TemporaryDirectory() as d:
+            patch.setattr(tools, "_downloads_dir", lambda: Path(d))
+            patch.setattr(
+                tools.kdownload, "download_file",
+                lambda url, dest, filename=None: (Path(dest) / (filename or "a.zip"), 42))
+            result = tools.execute(
+                "download_file", '{"url": "https://example.com/a.zip", "filename": "s.bin"}',
+                mode="confirm", source=tools.SOURCE_USER,
+                confirm_cb=lambda desc: True, audit=audit)
+            assert "下载完成" in result and "42 字节" in result and "s.bin" in result
+        assert logs and logs[0][4] is True and logs[0][5] is True  # approved + ok
+    finally:
+        patch.restore()
+
+
+def test_execute_install_path_restriction():
+    # 只能安装下载目录里的 zip：任意路径直接拒绝
+    patch = _Patch()
+    try:
+        with TemporaryDirectory() as d:
+            patch.setattr(tools, "_downloads_dir", lambda: Path(d))
+            evil = Path(d).parent / "evil.zip"
+            evil.write_bytes(b"PK\x03\x04")
+            result = tools.execute("install_skill", f'{{"zip_path": "{evil}"}}',
+                                   mode="confirm", source=tools.SOURCE_USER,
+                                   confirm_cb=lambda desc: True)
+            assert "只能安装" in result
+            # 下载目录内的 zip 可以继续（走到确认/解压阶段）
+            ok = Path(d) / "ok.zip"
+            ok.write_bytes(b"PK\x03\x04")
+            result = tools.execute("install_skill", f'{{"zip_path": "{ok}"}}',
+                                   mode="confirm", source=tools.SOURCE_USER,
+                                   confirm_cb=lambda desc: True)
+            assert "只能安装" not in result
+    finally:
+        patch.restore()
+
+
+def test_execute_install_auto_rejected():
+    result = tools.execute("install_skill", '{"zip_path": "/tmp/x.zip"}',
+                           mode="confirm", source=tools.SOURCE_AUTO)
+    assert "自主触发" in result
+
+
+def test_execute_install_success_with_manifest():
+    logs, audit = _audit_log()
+    patch = _Patch()
+    try:
+        with TemporaryDirectory() as d:
+            downloads = Path(d) / "downloads"
+            skills = Path(d) / "skills"
+            downloads.mkdir()
+            z = downloads / "zhihu-cli-skill.zip"
+            z.write_bytes(b"PK\x03\x04")
+            patch.setattr(tools, "_downloads_dir", lambda: downloads)
+            patch.setattr(tools, "_skills_dir", lambda: skills)
+            patch.setattr(
+                tools.kdownload, "extract_skill_zip",
+                lambda zip_path, dest: (
+                    Path(dest) / "zhihu-cli-skill",
+                    ["zhihu/SKILL.md", "zhihu/manifest.json"]))
+            patch.setattr(tools.kdownload, "read_zip_text",
+                          lambda z, n, max_bytes=65536: '{"version": "9.9"}')
+            result = tools.execute("install_skill", f'{{"zip_path": "{z}"}}',
+                                   mode="confirm", source=tools.SOURCE_USER,
+                                   confirm_cb=lambda desc: True, audit=audit)
+            assert "安装完成" in result and "9.9" in result
+            assert "SKILL.md" in result
+        assert logs and logs[0][4] is True and logs[0][5] is True  # approved + ok
+    finally:
+        patch.restore()
+
+
 # ---------- 声明生成 ----------
 
 def test_declarations_default_has_bash():
     decls = tools.tool_declarations(_cfg("confirm"))
     names = [d["function"]["name"] for d in decls]
     assert "web_search" in names and "run_bash" in names
-    assert len(decls) == 7
+    assert "download_file" in names and "install_skill" in names
+    assert len(decls) == 9
 
 
 def test_declarations_off_no_bash():
     decls = tools.tool_declarations(_cfg("off"))
     names = [d["function"]["name"] for d in decls]
     assert "run_bash" not in names
+    assert "download_file" not in names and "install_skill" not in names
     assert len(decls) == 6
 
+
+def test_declarations_readonly_has_download():
+    # 声明与执行分离：readonly 档也声明，但执行时拒绝写操作
+    decls = tools.tool_declarations(_cfg("readonly"))
+    names = [d["function"]["name"] for d in decls]
+    assert "download_file" in names and "install_skill" in names
+
+
+def test_declarations_download_mentions_dest():
+    decls = tools.tool_declarations(_cfg("confirm"))
+    dl_decl = [d for d in decls if d["function"]["name"] == "download_file"][0]
+    assert "下载目录" in dl_decl["function"]["description"]
+    inst_decl = [d for d in decls if d["function"]["name"] == "install_skill"][0]
+    assert "zip_path" in inst_decl["function"]["parameters"]["required"]
 
 def test_declarations_workdir():
     decls = tools.tool_declarations(_cfg("confirm"))

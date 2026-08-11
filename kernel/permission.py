@@ -216,4 +216,8 @@ def human_brief(name, arguments):
         return ("执行命令：" + str(args.get("command", "")))[:80]
     if name == "web_search":
         return ("搜索：" + str(args.get("query", "")))[:80]
+    if name == "download_file":
+        return ("下载文件：" + str(args.get("url", "")))[:80]
+    if name == "install_skill":
+        return ("安装技能包：" + str(args.get("zip_path", "")))[:80]
     return f"调用工具 {name}"[:80]

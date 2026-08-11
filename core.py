@@ -51,6 +51,47 @@ def http_json(url, timeout=10):
     return json.loads(http_text(url, timeout))
 
 
+# ---------- 技能包元数据（SKILL.md frontmatter） ----------
+
+SKILL_NAME_MAX = 40    # 技能名截断
+SKILL_DESC_MAX = 200   # 技能描述截断（注入 system prompt 的最小元数据面）
+
+
+def parse_skill_frontmatter(text):
+    """从 SKILL.md 提取 frontmatter 的 name/description（仅元数据）。
+
+    安全设计（架构评审 2026-08-12）：技能包是外部不可信内容，注入宠物
+    system prompt 前只保留这两个字段，丢弃其余全部内容；去控制字符、
+    按长度截断，防止 description 内嵌指令文本进入上下文。
+    支持 YAML 折叠多行（description: >- 后跟缩进行）。解析失败返回 {}。
+    """
+    m = re.search(r"^---\s*\n(.*?)\n---", text, re.DOTALL)
+    if not m:
+        return {}
+    data = {}
+    desc_parts = []
+    in_desc = False
+    for line in m.group(1).splitlines():
+        if line.startswith((" ", "\t")):
+            if in_desc:
+                desc_parts.append(line.strip())
+            continue
+        in_desc = False
+        key, _, value = line.partition(":")
+        key = key.strip().lower()
+        if key == "name":
+            data["name"] = re.sub(r"[\x00-\x1f\x7f]", "", value.strip())[:SKILL_NAME_MAX]
+        elif key == "description":
+            in_desc = True
+            if value.strip():
+                desc_parts.append(value.strip())
+    if desc_parts:
+        desc = re.sub(r"[\x00-\x1f\x7f]", "", " ".join(desc_parts)).strip()
+        if desc:
+            data["description"] = desc[:SKILL_DESC_MAX]
+    return data
+
+
 def parse_rss(text):
     """同时支持 RSS 2.0 和 Atom。"""
     return [item["title"] for item in parse_rss_items(text)]
@@ -431,9 +472,9 @@ class Brain:
             return self._chat_llm(user_text)
         return self._chat_rules(user_text)
 
-    def complete(self, messages, max_tokens=None):
-        """公开的模型调用入口，供 Agent 使用。"""
-        return self._chat_completion(messages, max_tokens)
+    def complete(self, messages, max_tokens=None, timeout=60):
+        """公开的模型调用入口，供 Agent 使用。timeout 秒（默认 60）。"""
+        return self._chat_completion(messages, max_tokens, timeout=timeout)
 
     def complete_stream(self, messages, on_delta, max_tokens=None):
         """流式模型调用：SSE 逐块解析，每个增量文本回调 on_delta。"""
@@ -621,12 +662,12 @@ class Brain:
         return "\n".join(lines)
 
     @staticmethod
-    def _read_json(req):
+    def _read_json(req, timeout=60):
         """一次请求并解析 JSON（供重试层包裹）。"""
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def _post_chat(self, payload):
+    def _post_chat(self, payload, timeout=60):
         api = self.cfg["api"]
         url = api["base_url"].rstrip("/") + "/chat/completions"
         req = urllib.request.Request(
@@ -642,7 +683,7 @@ class Brain:
         try:
             rc = self._retry_cfg()
             data = _request_with_retry(
-                lambda: self._read_json(req),
+                lambda: self._read_json(req, timeout=timeout),
                 retries=rc["max_attempts"] - 1,
                 base_delay=rc["backoff_base"],
                 max_delay=rc["backoff_max"],
@@ -682,7 +723,7 @@ class Brain:
             "max_completion_tokens": max(max_tokens, 1000),
         }
 
-    def _chat_completion(self, messages, max_tokens=None):
+    def _chat_completion(self, messages, max_tokens=None, timeout=60):
         reasoning = self._reasoning_params(max_tokens or 300)
         payload = {
             "model": self.cfg["api"]["model"],
@@ -692,7 +733,7 @@ class Brain:
             payload.update(reasoning)
         else:
             payload.update({"temperature": 0.9, "max_tokens": max_tokens or 300})
-        data = self._post_chat(payload)
+        data = self._post_chat(payload, timeout=timeout)
         return data["choices"][0]["message"]["content"].strip()
 
     def complete_tools(self, messages, tools):

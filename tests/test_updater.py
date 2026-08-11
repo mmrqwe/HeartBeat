@@ -275,6 +275,130 @@ def test_end_to_end_evolve_cycle(tmp_path):
     assert not _has_evolved_fact(ag3)
 
 
+# ---------- 进化工具（tool 契约） ----------
+
+TOOL_SRC = '''\
+TOOL_NAME = "ping_check"
+TOOL_DESCRIPTION = "检查网络连通性（示例进化工具）"
+TOOL_PARAMETERS = {
+    "type": "object",
+    "properties": {"host": {"type": "string"}},
+    "required": ["host"],
+}
+
+
+def handler(args, ctx):
+    host = str(args.get("host", "")).strip()
+    if not host:
+        return "缺少 host 参数"
+    try:
+        text = ctx.web_search(host + " 状态", limit=1)
+        return "查询结果：" + text
+    except Exception as exc:
+        return "查询失败：" + str(exc)
+'''
+
+
+def test_updater_tool_validate_and_install(tmp_path):
+    upd = Updater(tmp_path)  # 工具独立于 brain 模块，无需 ensure_installed
+    cand = Path(tmp_path) / "cand"
+    cand.mkdir()
+    (cand / "tool.py").write_text(TOOL_SRC, encoding="utf-8")
+    ok, errors = upd.validate_candidate("tool", cand)
+    assert ok, errors
+    version = upd.install_candidate("tool", cand)
+    assert version == "v0.1"
+    assert upd.list_tools() == ["ping_check"]
+    assert upd.active_version("ping_check") == "v0.1"
+    mod = upd.load("ping_check")
+    assert mod.TOOL_NAME == "ping_check" and callable(mod.handler)
+    log = (tmp_path / "brain" / "updates.log").read_text(encoding="utf-8")
+    assert "ping_check" in log and "install" in log
+
+
+def test_updater_tool_rejects_dangerous(tmp_path):
+    upd = Updater(tmp_path)
+    cand = Path(tmp_path) / "cand"
+    cand.mkdir()
+    (cand / "tool.py").write_text("import os\n" + TOOL_SRC, encoding="utf-8")
+    ok, errors = upd.validate_candidate("tool", cand)
+    assert not ok
+    assert any("禁止 import" in e for e in errors)
+
+
+def test_updater_tool_rejects_duplicate(tmp_path):
+    upd = Updater(tmp_path)
+    cand = Path(tmp_path) / "cand"
+    cand.mkdir()
+    (cand / "tool.py").write_text(TOOL_SRC, encoding="utf-8")
+    upd.install_candidate("tool", cand)
+    ok, errors = upd.validate_candidate("tool", cand)
+    assert not ok and any("已存在" in e for e in errors)
+
+
+def test_updater_tool_upgrade_path(tmp_path):
+    """升级：已有 v0.1 → 候选 TOOL_NAME 一致 → 装为 v0.2 并激活，可回滚。"""
+    upd = Updater(tmp_path)
+    cand = Path(tmp_path) / "cand"
+    cand.mkdir()
+    (cand / "tool.py").write_text(TOOL_SRC, encoding="utf-8")
+    upd.install_candidate("tool", cand)
+    v2 = TOOL_SRC.replace(
+        '"properties": {"host": {"type": "string"}},'
+        , '"properties": {"host": {"type": "string"}, "timeout": {"type": "number"}},'
+    )
+    (cand / "tool.py").write_text(v2, encoding="utf-8")
+    ok, errors = upd.validate_candidate("tool", cand, upgrade_of="ping_check")
+    assert ok, errors
+    version = upd.install_candidate("tool", cand, upgrade_of="ping_check")
+    assert version == "v0.2"
+    assert upd.list_versions("ping_check") == ["v0.1", "v0.2"]
+    assert upd.active_version("ping_check") == "v0.2"
+    # 升级基准源码可读（active 版）
+    assert "timeout" in upd.tool_source("ping_check")
+    assert upd.rollback("ping_check") == "v0.1"
+    assert "timeout" not in upd.tool_source("ping_check")
+
+
+def test_updater_tool_upgrade_requires_existing(tmp_path):
+    """升级不存在的工具 → 拒绝（不是新增）。"""
+    upd = Updater(tmp_path)
+    cand = Path(tmp_path) / "cand"
+    cand.mkdir()
+    (cand / "tool.py").write_text(TOOL_SRC, encoding="utf-8")
+    ok, errors = upd.validate_candidate("tool", cand, upgrade_of="nope_tool")
+    assert not ok and any("不存在" in e for e in errors)
+
+
+def test_updater_tool_upgrade_cannot_rename(tmp_path):
+    """升级候选改 TOOL_NAME → 拒绝（升级不能改名），active 不受影响。"""
+    upd = Updater(tmp_path)
+    cand = Path(tmp_path) / "cand"
+    cand.mkdir()
+    (cand / "tool.py").write_text(TOOL_SRC, encoding="utf-8")
+    upd.install_candidate("tool", cand)
+    renamed = TOOL_SRC.replace('TOOL_NAME = "ping_check"', 'TOOL_NAME = "rename_check"')
+    (cand / "tool.py").write_text(renamed, encoding="utf-8")
+    ok, errors = upd.validate_candidate("tool", cand, upgrade_of="ping_check")
+    assert not ok and any("不能改名" in e for e in errors)
+    assert upd.active_version("ping_check") == "v0.1"
+
+
+def test_updater_tool_rejects_bad_contract(tmp_path):
+    upd = Updater(tmp_path)
+    for src, expect in (
+        (TOOL_SRC.replace('TOOL_NAME = "ping_check"', 'TOOL_NAME = "bad name!"'), "合法标识符"),
+        (TOOL_SRC.replace("TOOL_PARAMETERS = {", "TOOL_PARAMETERS = ["), "TOOL_PARAMETERS"),
+    ):
+        cand = Path(tmp_path) / "cand"
+        cand.mkdir(exist_ok=True)
+        (cand / "tool.py").write_text(src, encoding="utf-8")
+        ok, errors = upd.validate_candidate("tool", cand)
+        # 拒绝即可：可能是 L0 语法错误（替换破坏了语法）或 L1 契约错误
+        assert not ok, errors
+        assert any(expect in e or "L0 加载失败" in e for e in errors), errors
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in sorted(globals().items()):
