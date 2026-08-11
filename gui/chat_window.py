@@ -3,7 +3,7 @@
 import time
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QKeyEvent, QTextOption
+from PySide6.QtGui import QKeyEvent, QTextDocument, QTextOption
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -34,6 +34,9 @@ def _make_bubble(role):
     bubble.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
     bubble.setMaximumWidth(BUBBLE_WIDTH)
     bubble.setFixedWidth(BUBBLE_WIDTH)
+    # 超长无空格单词（URL/代码串）按任意位置断行，避免横向溢出被裁剪；
+    # 正常文本仍按词边界/中文逐字换行，不受影响。
+    bubble.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
     bubble.document().setDocumentMargin(10)  # 内边距（QSS padding 对 QTextEdit 无效）
     return bubble
 
@@ -146,7 +149,7 @@ class ChatWindow(QWidget):
         bubble = _make_bubble(role)
         bubble.setMarkdown(text)
         self.content_layout.addWidget(bubble, 0, align)
-        self._sync_bubble_height(bubble)
+        self._sync_bubble_height(bubble, text, markdown=True)
 
         time_label = QLabel(time_str)
         time_label.setObjectName("Hint")
@@ -169,34 +172,70 @@ class ChatWindow(QWidget):
         self._render_message("assistant", "", time.strftime("%H:%M"))
         self._scroll_to_bottom()
 
-    def _sync_bubble_height(self, bubble):
-        """按文档实际布局高度固定气泡高度。
+    def _estimate_height(self, bubble, text, markdown):
+        """用独立 QTextDocument 探针估算气泡高度。
 
-        QTextBrowser 未显示时 document.size() 为 0，需 setTextWidth + adjustSize
-        手动触发 layout 后再取高度（流式高频更新同样依赖此机制）。
+        不直接改真实 document 的 textWidth（会污染 QTextEdit 内部布局）。
+        探针与真实气泡同字体/同内边距/同换行模式；textWidth 用 276（300 - 左右
+        margin - 边框缓冲）保守偏窄，保证估算高度 ≥ 真实需要、内容不被裁剪。
+        """
+        probe = QTextDocument()
+        opt = QTextOption()
+        opt.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        probe.setDefaultTextOption(opt)
+        probe.setDefaultFont(bubble.font())
+        probe.setDocumentMargin(bubble.document().documentMargin())
+        if markdown:
+            probe.setMarkdown(text)
+        else:
+            probe.setPlainText(text)
+        probe.setTextWidth(BUBBLE_WIDTH - 2 * probe.documentMargin() - 4)
+        probe.adjustSize()
+        return max(int(probe.size().height()) + 8, 24)
+
+    def _sync_bubble_height(self, bubble, text, markdown=True):
+        """按内容估算高度固定气泡（流式高频更新同样依赖此机制）。
+
+        已显示且有真实布局高度时（document 已按真实字体/宽度 layout），
+        取两者较大值；再延迟一帧用真实布局修正，消除字体替换/宽度差异
+        导致的估算偏差（任何环境下都不裁剪内容）。
         """
         if bubble is None:
             return
-        width = BUBBLE_WIDTH
-        bubble.setFixedWidth(width)
-        doc = bubble.document()
-        doc.setTextWidth(width - doc.documentMargin() * 2 - 4)  # 左右 margin + 边框缓冲
-        doc.adjustSize()
-        height = doc.size().height()
-        bubble.setFixedHeight(max(int(height) + 4, 24))
+        bubble.setFixedWidth(BUBBLE_WIDTH)
+        est = self._estimate_height(bubble, text, markdown)
+        real = bubble.document().size().height()
+        bubble.setFixedHeight(max(int(real) if real > 0 else est, est, 24))
+        # 气泡自身的 isVisible 在 addWidget 后布局映射前为 False，须用顶层窗口判断
+        if bubble.window() is not None and bubble.window().isVisible():
+            QTimer.singleShot(0, lambda: self._fix_bubble_height(bubble))
+
+    def _fix_bubble_height(self, bubble):
+        """事件循环跑过后 document 已按真实字体/宽度 layout，修正为精确高度。
+
+        布局未就绪（real=0）时重试一帧——QTextEdit 的文档 relayout 与
+        singleShot 回调的调度顺序不保证，必须等到真实高度可用。
+        """
+        if bubble is None or not bubble.window() or not bubble.window().isVisible():
+            return
+        real = bubble.document().size().height()
+        if real > 0:
+            bubble.setFixedHeight(max(int(real) + 4, 24))
+        else:
+            QTimer.singleShot(0, lambda: self._fix_bubble_height(bubble))
 
     def update_last_message(self, text):
         if self._last_bubble is not None:
             # 流式中用纯文本：markdown 半成品（未闭合 **、``` 等）会闪烁/误渲染
             self._last_bubble.setPlainText(text)
-            self._sync_bubble_height(self._last_bubble)
+            self._sync_bubble_height(self._last_bubble, text, markdown=False)
             self._scroll_to_bottom()
 
     def finish_stream(self, text):
         """流式结束：用最终完整文本收尾（Markdown 渲染），并复位流式状态。"""
         if self._last_bubble is not None:
             self._last_bubble.setMarkdown(text)
-            self._sync_bubble_height(self._last_bubble)
+            self._sync_bubble_height(self._last_bubble, text, markdown=True)
             self._scroll_to_bottom()
         self._streaming = False
 
