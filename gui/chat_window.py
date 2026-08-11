@@ -267,6 +267,14 @@ class ChatWindow(QWidget):
     def is_streaming(self):
         return self._streaming
 
+    def cancel_stream(self):
+        """取消流式：移除当前占位气泡并复位状态（超时/中断等场景）。"""
+        if self._last_bubble is not None:
+            self.content_layout.removeWidget(self._last_bubble)
+            self._last_bubble.deleteLater()
+            self._last_bubble = None
+        self._streaming = False
+
     def clear(self):
         self.messages = []
         self._last_bubble = None

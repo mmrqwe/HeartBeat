@@ -448,6 +448,7 @@ class HeartBeatApp:
     def _chat_timeout(self):
         self._set_status("回复超时，已停止等待")
         if self.chat_win:
+            self.chat_win.cancel_stream()  # 清理流式占位气泡，避免影响下次回复
             self.chat_win.set_thinking(False)
             self.chat_win.add_message(
                 "system", f"{time.strftime('%H:%M')} 回复超时，网络可能卡住了，请重试"

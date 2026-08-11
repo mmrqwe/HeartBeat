@@ -269,6 +269,13 @@ class Agent:
 
         try:
             self.brain.complete_stream(messages, handle)
+        except core.StreamInterrupted as exc:
+            # 流式中途断连且已输出部分内容：接受部分，不再整体重发
+            # （LLM 生成非确定，重发会重复计费，且 UI 无法撤回已显示内容）
+            reply = self._parse_agent_reply(exc.partial)
+            if not reply:
+                reply = "嗯嗯，我在听。"
+            return reply
         except Exception:
             # 服务端不支持流式时退回一次性调用
             reply = self._chat_llm(user_text)

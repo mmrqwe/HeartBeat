@@ -9,8 +9,10 @@ import hashlib
 import http.client
 import inspect
 import json
+import logging
 import random
 import re
+import ssl
 import time
 import urllib.parse
 import urllib.error
@@ -143,32 +145,72 @@ def collect_all(plugins, config, stats=None, context=None):
     return results
 
 
+logger = logging.getLogger("heartbeat.core")
+
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
-RETRYABLE_EXC = (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException)
 
 
-def _request_with_retry(fn, retries=2, base_delay=0.5):
-    """指数退避重试：超时/连接失败/5xx/429 自动重试，其余错误直接抛。
+class StreamInterrupted(Exception):
+    """流式传输中途断连且已向 UI 推送过内容。
 
-    重试间隔 0.5s → 1s → 2s（最多 retries+1 次尝试）。
-    401/403/400 等参数/鉴权错误不重试（重试也没用）。
+    此时整体重发会重复计费/重复显示（LLM 生成非确定，重发内容不同），
+    由上层（agent._chat_llm_stream）接受已输出的部分内容直接收尾。
     """
-    delay = base_delay
+
+    def __init__(self, partial):
+        super().__init__(f"流式中断，已接收部分输出（{len(partial)} 字符）")
+        self.partial = partial
+
+
+def _is_retryable_error(exc):
+    """判断异常是否值得自动重试。
+
+    可重试：SSL 握手/传输被掐断（UNEXPECTED_EOF 等）、连接超时/重置、
+    响应不完整（IncompleteRead/RemoteDisconnected）、5xx/429。
+    不可重试：401/403/400 等参数鉴权错误、证书校验失败（重试无用）、
+    以及非网络类错误。
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in RETRYABLE_STATUS
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return False  # 证书问题重试无意义
+    if isinstance(exc, ssl.SSLError):
+        return True  # SSL EOF / 握手失败等（证书错误已在上方排除）
+    if isinstance(exc, urllib.error.URLError):
+        # reason 可能是嵌套异常（SSLError/TimeoutError/ConnectionError…）
+        reason = exc.reason
+        return _is_retryable_error(reason) if isinstance(reason, Exception) else True
+    if isinstance(exc, (TimeoutError, http.client.HTTPException, OSError)):
+        return True  # 超时 / IncompleteRead / RemoteDisconnected / ConnectionReset 等
+    return False
+
+
+def _retry_backoff(attempt, base=0.5, cap=8.0):
+    """指数退避 + full jitter：第 attempt 次重试前等待 0~min(cap, base*2^attempt) 秒。"""
+    return random.uniform(0, min(cap, base * (2 ** attempt)))
+
+
+def _request_with_retry(fn, retries=2, base_delay=0.5, max_delay=8.0, on_retry=None):
+    """指数退避重试：SSL 断连/超时/连接失败/5xx/429 自动重试，其余错误直接抛。
+
+    retries=重试次数（总尝试 = retries+1）；每次重试前等待 full jitter 退避；
+    on_retry(attempt, exc) 回调用于可观测（日志/UI 提示）。
+    401/403/400 等参数/鉴权错误、证书校验失败不重试（重试也没用）。
+    """
     for attempt in range(retries + 1):
         try:
             return fn()
-        except urllib.error.HTTPError as exc:
-            if exc.code in RETRYABLE_STATUS and attempt < retries:
-                time.sleep(delay)
-                delay *= 2
-                continue
-            raise
-        except RETRYABLE_EXC:
-            if attempt < retries:
-                time.sleep(delay)
-                delay *= 2
-                continue
-            raise
+        except Exception as exc:  # noqa: BLE001 统一走分类判断
+            if not _is_retryable_error(exc) or attempt >= retries:
+                raise
+            delay = _retry_backoff(attempt, base_delay, max_delay)
+            if on_retry:
+                on_retry(attempt, exc)
+            logger.warning(
+                "LLM 请求失败（第 %d/%d 次重试，%.1fs 后）: %s",
+                attempt + 1, retries, delay, exc,
+            )
+            time.sleep(delay)
     raise RuntimeError("unreachable")
 
 
@@ -323,6 +365,15 @@ class Brain:
         self.history = []
         self.state = {}
 
+    def _retry_cfg(self):
+        """LLM 重连配置：config.json 的 retry 块（带默认值兜底）。"""
+        cfg = self.cfg.get("retry") or {}
+        return {
+            "max_attempts": max(1, int(cfg.get("max_attempts", 3))),
+            "backoff_base": max(0.1, float(cfg.get("backoff_base", 0.5))),
+            "backoff_max": max(0.2, float(cfg.get("backoff_max", 8.0))),
+        }
+
     # ---------- 自主发言 ----------
 
     def think(self, ctx):
@@ -431,39 +482,66 @@ class Brain:
             )
 
     def _stream_read(self, url, headers, payload, on_delta):
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers=headers,
-        )
-        usage = None
-        # 连接阶段带重试（断网/抖动自动重连）；响应头收到后的流中断不重试，
-        # 由上层 fallback 到非流式完整重试
-        with _request_with_retry(lambda: urllib.request.urlopen(req, timeout=60)) as resp:
-            buffer = b""
-            for chunk in resp:
-                buffer += chunk
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    line = line.strip()
-                    if not line.startswith(b"data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == b"[DONE]":
-                        return usage
-                    try:
-                        obj = json.loads(data)
-                    except ValueError:
-                        continue
-                    if obj.get("usage"):
-                        usage = obj["usage"]
-                    choices = obj.get("choices") or []
-                    if choices:
-                        delta = choices[0].get("delta") or {}
-                        content = delta.get("content")
-                        if content:
-                            on_delta(content)
-        return usage
+        """SSE 流式读取，带自动重连。
+
+        连接建立失败（SSL 被掐断/超时等）时整体重发请求（此时 UI 尚未收到
+        任何内容，重发无副作用）；流传输中途断连且已推送过内容时抛
+        StreamInterrupted 接受部分输出——整体重发会重复计费且 UI 无法撤回
+        已显示内容（LLM 生成非确定，重发结果不同）。
+        """
+        attempts = self._retry_cfg()["max_attempts"]
+        for attempt in range(attempts):
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers=headers,
+            )
+            chunks = 0
+            texts = []
+            usage = None
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    buffer = b""
+                    for chunk in resp:
+                        buffer += chunk
+                        while b"\n" in buffer:
+                            line, buffer = buffer.split(b"\n", 1)
+                            line = line.strip()
+                            if not line.startswith(b"data:"):
+                                continue
+                            data = line[5:].strip()
+                            if data == b"[DONE]":
+                                return usage
+                            try:
+                                obj = json.loads(data)
+                            except ValueError:
+                                continue
+                            if obj.get("usage"):
+                                usage = obj["usage"]
+                            choices = obj.get("choices") or []
+                            if choices:
+                                delta = choices[0].get("delta") or {}
+                                content = delta.get("content")
+                                if content:
+                                    chunks += 1
+                                    texts.append(content)
+                                    on_delta(content)
+                return usage
+            except Exception as exc:  # noqa: BLE001
+                if not _is_retryable_error(exc):
+                    raise
+                if chunks > 0:
+                    # 已推送过内容：接受部分输出，由上层收尾
+                    raise StreamInterrupted("".join(texts)) from exc
+                if attempt >= attempts - 1:
+                    raise
+                rc = self._retry_cfg()
+                logger.warning(
+                    "LLM 流连接失败（第 %d/%d 次重连）: %s",
+                    attempt + 1, attempts - 1, exc,
+                )
+                time.sleep(_retry_backoff(attempt, rc["backoff_base"], rc["backoff_max"]))
+        raise RuntimeError("unreachable")
 
     def _chat_llm(self, user_text):
         system = (
@@ -555,7 +633,13 @@ class Brain:
         )
         started = time.time()
         try:
-            data = _request_with_retry(lambda: self._read_json(req))
+            rc = self._retry_cfg()
+            data = _request_with_retry(
+                lambda: self._read_json(req),
+                retries=rc["max_attempts"] - 1,
+                base_delay=rc["backoff_base"],
+                max_delay=rc["backoff_max"],
+            )
         except Exception:
             if self.stats:
                 self.stats.record_llm(ok=False)
@@ -672,55 +756,80 @@ class Brain:
         return content, tool_calls
 
     def _stream_read_tools(self, url, headers, payload, on_delta):
-        """解析流式工具响应：content 累积回调（完整文本），tool_calls 增量按 index 拼接。"""
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers=headers,
-        )
-        parts = []
-        tool_calls = []
-        usage = None
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            buffer = b""
-            for chunk in resp:
-                buffer += chunk
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    line = line.strip()
-                    if not line.startswith(b"data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == b"[DONE]":
-                        return "".join(parts), tool_calls, usage
-                    try:
-                        obj = json.loads(data)
-                    except ValueError:
-                        continue
-                    if obj.get("usage"):
-                        usage = obj["usage"]
-                    choices = obj.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta") or {}
-                    content = delta.get("content")
-                    if content:
-                        parts.append(content)
-                        on_delta("".join(parts))
-                    for tc in delta.get("tool_calls") or []:
-                        idx = tc.get("index", 0)
-                        while len(tool_calls) <= idx:
-                            tool_calls.append({
-                                "id": "",
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            })
-                        slot = tool_calls[idx]
-                        if tc.get("id"):
-                            slot["id"] = tc["id"]
-                        fn = tc.get("function") or {}
-                        if fn.get("name"):
-                            slot["function"]["name"] = fn["name"]
-                        if fn.get("arguments"):
-                            slot["function"]["arguments"] += fn["arguments"]
-        return "".join(parts), tool_calls, usage
+        """解析流式工具响应，带自动重连。
+
+        连接失败重发；传输中断且已推送过内容时保留已输出的 content、
+        丢弃半截 tool_calls（避免执行不完整参数）。
+        """
+        attempts = self._retry_cfg()["max_attempts"]
+        for attempt in range(attempts):
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers=headers,
+            )
+            parts = []
+            tool_calls = []
+            usage = None
+            chunks = 0
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    buffer = b""
+                    for chunk in resp:
+                        buffer += chunk
+                        while b"\n" in buffer:
+                            line, buffer = buffer.split(b"\n", 1)
+                            line = line.strip()
+                            if not line.startswith(b"data:"):
+                                continue
+                            data = line[5:].strip()
+                            if data == b"[DONE]":
+                                return "".join(parts), tool_calls, usage
+                            try:
+                                obj = json.loads(data)
+                            except ValueError:
+                                continue
+                            if obj.get("usage"):
+                                usage = obj["usage"]
+                            choices = obj.get("choices") or []
+                            if not choices:
+                                continue
+                            delta = choices[0].get("delta") or {}
+                            content = delta.get("content")
+                            if content:
+                                chunks += 1
+                                parts.append(content)
+                                on_delta("".join(parts))
+                            for tc in delta.get("tool_calls") or []:
+                                idx = tc.get("index", 0)
+                                while len(tool_calls) <= idx:
+                                    tool_calls.append({
+                                        "id": "",
+                                        "type": "function",
+                                        "function": {"name": "", "arguments": ""},
+                                    })
+                                slot = tool_calls[idx]
+                                if tc.get("id"):
+                                    slot["id"] = tc["id"]
+                                fn = tc.get("function") or {}
+                                if fn.get("name"):
+                                    slot["function"]["name"] = fn["name"]
+                                if fn.get("arguments"):
+                                    slot["function"]["arguments"] += fn["arguments"]
+                return "".join(parts), tool_calls, usage
+            except Exception as exc:  # noqa: BLE001
+                if not _is_retryable_error(exc):
+                    raise
+                if chunks > 0:
+                    # 已推送过内容：保留部分内容、丢弃半截工具调用
+                    logger.warning("工具流中断，保留已输出内容: %s", exc)
+                    return "".join(parts), [], usage
+                if attempt >= attempts - 1:
+                    raise
+                rc = self._retry_cfg()
+                logger.warning(
+                    "工具流连接失败（第 %d/%d 次重连）: %s",
+                    attempt + 1, attempts - 1, exc,
+                )
+                time.sleep(_retry_backoff(attempt, rc["backoff_base"], rc["backoff_max"]))
+        raise RuntimeError("unreachable")

@@ -42,6 +42,12 @@ DEFAULT_CONFIG = {
         "api_key": "",
         "model": "gpt-4o-mini",
     },
+    # LLM 网络重连：连接失败/SSL 被掐断/5xx/429 时指数退避重试
+    "retry": {
+        "max_attempts": 3,    # 总尝试次数（含首次）
+        "backoff_base": 0.5,  # 退避基数（秒），指数增长
+        "backoff_max": 8.0,   # 退避上限（秒）
+    },
 }
 
 
