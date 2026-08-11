@@ -4,7 +4,7 @@ import inspect
 import json
 import random
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -529,8 +529,10 @@ def test_parse_agent_reply_structured(tmp_path):
 def test_think_rules_schedule_reminder(tmp_path):
     """规则模式：临近日程自动提醒（每天最多一次）。"""
     a = _make_agent(tmp_path)
-    a.db.add_memory("fact", "明天开会", category="schedule", expires_at="2026-08-11 12:00")
     now = datetime(2026, 8, 10, 10, 0)
+    # 到期时间相对 now（消除对真实时钟的日期敏感）
+    expires_at = (now + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M")
+    a.db.add_memory("fact", "明天开会", category="schedule", expires_at=expires_at)
     ctx = {"collections": []}
     msg = a._think_rules(ctx, now)
     assert "明天开会" in msg and "别忘了" in msg

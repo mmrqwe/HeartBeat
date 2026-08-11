@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 import agent
 import core
 import db
+import kernel
 import skins
 import theme
 from chat_window import ChatWindow
@@ -25,26 +26,14 @@ TICK_TIMEOUT_MS = 180_000
 CHAT_TIMEOUT_MS = 120_000
 
 
-def default_config_path():
-    """frozen 与开发模式统一：数据放用户数据目录，重编译/升级不丢。"""
-    return core.user_data_dir() / "config.json"
-
-
-def legacy_data_dirs():
-    """旧版数据所在位置（app bundle 内 / 源码目录），用于首启自动迁移。"""
-    dirs = []
-    if getattr(sys, "frozen", False):
-        dirs.append(Path(sys.executable).parent)
-    dirs.append(Path(__file__).parent)
-    return dirs
-
-
 class Bridge(QObject):
-    """工作线程 → GUI 线程的信号桥。"""
+    """工作线程 → GUI 线程的信号桥。
+
+    reply/tick 结果已由 kernel.runtime 的任务信号回主线程（on_result 回调），
+    这里只保留子线程实时事件：流式增量、状态、工具确认。
+    """
 
     delta = Signal(object, str)
-    reply = Signal(object, str)
-    tick = Signal(object, object, str)
     status = Signal(str)
     # 工具确认：cmdline, event, result_holder（子线程 emit 后阻塞等 event）
     tool_confirm = Signal(str, object, object)
@@ -52,27 +41,24 @@ class Bridge(QObject):
 
 class HeartBeatApp:
     def __init__(self, config_path=None):
-        data_dir = core.migrate_legacy_data(legacy_data_dirs())
-        self.config_path = Path(config_path) if config_path else data_dir / "config.json"
-        self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.config_path.exists():
-            core.save_config(core.load_config(), self.config_path)
-        self.cfg = core.load_config(self.config_path)
-        # 补全缺失的默认键（迁移来的旧 config 可能缺新键），保证磁盘配置完整
-        core.save_config(self.cfg, self.config_path)
-        self.plugins = core.discover_plugins()
-        self.db = db.Database(self.config_path.parent / "heartbeat.db")
+        # 内核：迁移/配置/插件发现/运行时调度（Kernel 门面）
+        self.kernel = kernel.Kernel(config_path)
+        self.cfg = self.kernel.cfg
+        self.plugins = self.kernel.plugins
+        self.data_dir = self.kernel.data_dir
+        self.db = db.Database(self.data_dir / "heartbeat.db")
         self.stats = core.Stats(self.db)
         self.agent = agent.Agent(
-            self.cfg, self.plugins, self.config_path.parent, stats=self.stats, db=self.db
+            self.cfg, self.plugins, self.data_dir, stats=self.stats, db=self.db
         )
+        # 事件总线注入：agent 工具执行 → tool.executed 旁路通知（异步回主线程）
+        self.agent.eventbus = self.kernel.eventbus
 
         self.bridge = Bridge()
         self.bridge.delta.connect(self._apply_stream_delta)
-        self.bridge.reply.connect(self._show_reply)
-        self.bridge.tick.connect(self._show_tick_result)
         self.bridge.status.connect(self._set_status)
         self.bridge.tool_confirm.connect(self._on_tool_confirm)
+        self._setup_runtime()
         # 注入工具确认回调：confirm 档写命令由主线程弹窗决定（60s 超时拒绝）
         self.agent.tool_confirm_cb = self._confirm_tool
 
@@ -95,21 +81,8 @@ class HeartBeatApp:
         self.chat_win = None
         self.settings_win = None
         self.search_win = None
-        self._busy = False
-        self._tick_epoch = 0
-        self._tick_timer = QTimer()
-        self._tick_timer.setSingleShot(True)
-        self._tick_timer.timeout.connect(self._autonomy_tick)
-        self._tick_watchdog = QTimer()
-        self._tick_watchdog.setSingleShot(True)
-        self._tick_watchdog.timeout.connect(self._tick_timeout)
-        self._chat_epoch = 0
-        self._chat_watchdog = QTimer()
-        self._chat_watchdog.setSingleShot(True)
-        self._chat_watchdog.timeout.connect(self._chat_timeout)
 
         self.pet.show()
-        QTimer.singleShot(15_000, self._autonomy_tick)
 
         self._setup_tray()
 
@@ -280,27 +253,49 @@ class HeartBeatApp:
     def _quit(self):
         QApplication.instance().quit()
 
-    # ---------- 自主循环 ----------
+    # ---------- 自主循环（调度在 kernel.runtime） ----------
 
     def _interval_ms(self):
         return max(1, int(self.cfg["interval_minutes"])) * 60 * 1000
 
+    def _setup_runtime(self):
+        """注册内核任务：tick（自主巡视）与 chat（聊天）。
+
+        定时调度 / 看门狗超时 / 线程提交 / epoch 竞态保护全部由
+        kernel.runtime 管理，这里只提供任务体与结果回调。
+        """
+        self.kernel.runtime.add_task(
+            "tick",
+            interval_ms=self._interval_ms(),
+            timeout_ms=TICK_TIMEOUT_MS,
+            work=self._tick_work,
+            on_result=self._show_tick_result,
+            on_timeout=self._tick_timeout,
+            # 定时到点走 _autonomy_tick：重排 + busy 检查 + “巡视中…”状态提示
+            # （与原版 QTimer 直接连 _autonomy_tick 的语义逐行等价）
+            on_timer=self._autonomy_tick,
+        )
+        self.kernel.runtime.add_task(
+            "chat",
+            timeout_ms=CHAT_TIMEOUT_MS,
+            work=self._chat_work,
+            on_result=self._show_reply,
+            on_timeout=self._chat_timeout,
+        )
+        # 启动后 15 秒首次巡视
+        QTimer.singleShot(15_000, self._autonomy_tick)
+
     def _schedule_next(self):
-        self._tick_timer.start(self._interval_ms())
+        self.kernel.runtime.schedule_next("tick", self._interval_ms())
 
     def _autonomy_tick(self):
         self._schedule_next()
-        if self._busy:
+        if not self.kernel.runtime.trigger("tick"):
             return
-        self._busy = True
-        self._tick_epoch += 1
         self._set_status("巡视中…")
-        self._tick_watchdog.start(TICK_TIMEOUT_MS)
-        threading.Thread(
-            target=self._tick_worker, args=(self._tick_epoch,), daemon=True
-        ).start()
 
-    def _tick_worker(self, epoch):
+    def _tick_work(self, epoch):
+        """巡视任务体（子线程执行）：采集 + 思考。返回 (message, errors)。"""
         try:
             ctx = core.gather(
                 self.plugins,
@@ -312,13 +307,11 @@ class HeartBeatApp:
             errors = "，".join(ctx["errors"])
         except Exception as exc:
             message, errors = None, str(exc)
-        self.bridge.tick.emit(epoch, message, errors)
+        return message, errors
 
-    def _show_tick_result(self, epoch, message, errors):
-        if epoch != self._tick_epoch:
-            return
-        self._tick_watchdog.stop()
-        self._busy = False
+    def _show_tick_result(self, result):
+        """主线程回调（kernel.runtime 已过滤过期 epoch）。"""
+        message, errors = result
         stamp = time.strftime("%H:%M")
         if message:
             preview = message if len(message) <= 14 else message[:13] + "…"
@@ -337,9 +330,6 @@ class HeartBeatApp:
         self._update_chat_stats()
 
     def _tick_timeout(self):
-        if not self._busy:
-            return
-        self._busy = False
         self._set_status("巡视超时，已重置，稍后自动重试")
 
     def _set_status(self, text):
@@ -394,29 +384,26 @@ class HeartBeatApp:
 
     def _send_chat(self, text):
         self.pet.play("think")
-        self._chat_epoch += 1
-        self._chat_watchdog.start(CHAT_TIMEOUT_MS)
-        threading.Thread(
-            target=self._chat_worker, args=(self._chat_epoch, text), daemon=True
-        ).start()
+        self.kernel.runtime.trigger("chat", text)
 
-    def _chat_worker(self, epoch, text):
+    def _chat_work(self, epoch, text):
+        """聊天任务体（子线程执行）：带工具循环的 LLM 回复。"""
         try:
-            reply = self.agent.chat(
+            return self.agent.chat(
                 text, on_delta=lambda t, e=epoch: self._stream_delta(e, t)
             )
         except Exception as exc:
             reply = f"我卡壳了：{exc}"
             self.agent.append_chat("assistant", reply)
-        self.bridge.reply.emit(epoch, reply)
+            return reply
 
     def _stream_delta(self, epoch, text):
-        if epoch != self._chat_epoch:
+        if epoch != self.kernel.runtime.current_epoch("chat"):
             return
         self.bridge.delta.emit(epoch, text)
 
     def _apply_stream_delta(self, epoch, text):
-        if epoch != self._chat_epoch:
+        if epoch != self.kernel.runtime.current_epoch("chat"):
             return
         if self.chat_win:
             self.chat_win.begin_stream()
@@ -424,10 +411,8 @@ class HeartBeatApp:
             if self.pet._mode != "talk":
                 self.pet.play("talk")
 
-    def _show_reply(self, epoch, reply):
-        if epoch != self._chat_epoch:
-            return
-        self._chat_watchdog.stop()
+    def _show_reply(self, reply):
+        """主线程回调（kernel.runtime 已过滤过期 epoch）。"""
         self.pet.play("talk", 1600)
         if self.chat_win:
             if self.chat_win.is_streaming():
@@ -441,7 +426,6 @@ class HeartBeatApp:
         self._set_status("陪我聊天中")
 
     def _chat_timeout(self):
-        self._chat_epoch += 1
         self._set_status("回复超时，已停止等待")
         if self.chat_win:
             self.chat_win.set_thinking(False)
@@ -473,7 +457,7 @@ class HeartBeatApp:
 
     def save_settings(self, cfg):
         self.cfg = cfg
-        core.save_config(cfg, self.config_path)
+        self.kernel.save_settings(cfg)
         self.agent.reload(cfg, self.plugins)
         # 向量补索引放后台线程，避免保存设置卡顿十几秒
         threading.Thread(target=self.agent.reindex_async, daemon=True).start()
@@ -494,7 +478,7 @@ class HeartBeatApp:
             # 说话方式未自定义时跟随皮肤默认风格
             if not str(self.cfg.get("speaking_style", "") or "").strip():
                 self.cfg["speaking_style"] = skins.SKINS[name].get("style", "")
-        core.save_config(self.cfg, self.config_path)
+        self.kernel.save_settings(self.cfg)
         self.pet.apply_skin(name)
         self._set_status(f"已切换皮肤：{skins.SKINS[name]['label']}")
 
@@ -518,7 +502,7 @@ class HeartBeatApp:
 
 def main():
     parser = argparse.ArgumentParser(description="HeartBeat 像素桌宠（PySide6）")
-    parser.add_argument("--config", default=str(default_config_path()))
+    parser.add_argument("--config", default=str(kernel.boot.default_config_path()))
     parser.add_argument("--smoke", action="store_true", help="启动 3 秒后自动退出")
     parser.add_argument(
         "--cli",

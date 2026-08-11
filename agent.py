@@ -37,6 +37,7 @@ class Agent:
         self._reindex_pending = False
         self.brain = core.Brain(cfg, self.plugins, stats)
         self.tool_confirm_cb: Optional[Callable[[str], bool]] = None  # GUI 注入：confirm 档写命令的用户确认回调
+        self.eventbus = None  # GUI 注入：kernel.eventbus（工具执行旁路通知）
         self.memory = Memory(self.db)
         self.chat_history = self.db.chat_items(100)
         self.state = self._load_state()
@@ -601,6 +602,22 @@ class Agent:
             self.db.log_tool(source, tool, detail, mode, approved, ok, summary)
         except Exception:
             pass
+        # 旁路事件通知（不阻塞工具循环）：审计日志 / 统计 / UI 各自订阅。
+        # eventbus 由宿主注入（HeartBeatApp），测试/CLI 可为 None。
+        bus = getattr(self, "eventbus", None)
+        if bus is not None:
+            bus.emit(
+                "tool.executed",
+                {
+                    "source": source,
+                    "tool": tool,
+                    "detail": detail,
+                    "mode": mode,
+                    "approved": approved,
+                    "ok": ok,
+                    "summary": summary,
+                },
+            )
 
     def _think_rules(self, ctx, now):
         # 1) 天气类紧急提醒：不受冷却限制
@@ -610,7 +627,9 @@ class Agent:
                 return message
 
         # 2) 日程提醒：主人提过的日程临近（每天最多一次，不受冷却限制）
-        schedule = self.db.memory_schedule_due(within_hours=12)
+        schedule = self.db.memory_schedule_due(
+            within_hours=12, now=now.strftime("%Y-%m-%d %H:%M")
+        )
         if (
             schedule
             and self.state.get("last_schedule_remind_date") != now.strftime("%Y-%m-%d")

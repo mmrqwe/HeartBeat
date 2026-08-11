@@ -9,6 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import core
+import kernel.boot
 import db as dbmod
 import plugins.quote as quote
 import plugins.rss_news as rss_news
@@ -324,8 +325,9 @@ def test_context_text():
 def test_user_data_dir_darwin():
     patch = _Patch()
     try:
-        patch.setattr(core.sys, "platform", "darwin")
-        patch.setattr(Path, "home", lambda: Path("/Users/test"))
+        # user_data_dir 实现在 kernel.boot（core 仅 re-export），mock 目标必须是 boot 命名空间
+        patch.setattr(kernel.boot.sys, "platform", "darwin")
+        patch.setattr(kernel.boot.Path, "home", lambda: Path("/Users/test"))
         assert core.user_data_dir() == Path("/Users/test/Library/Application Support/HeartBeat")
     finally:
         patch.restore()
@@ -339,10 +341,10 @@ def test_user_data_dir_windows():
 
     patch = _Patch()
     try:
-        patch.setattr(core.sys, "platform", "win32")
-        patch.setattr(core.os, "name", "nt")
-        patch.setattr(core.os, "environ", {"APPDATA": r"C:\Users\test\AppData\Roaming"})
-        patch.setattr(core, "Path", _FakePath)
+        patch.setattr(kernel.boot.sys, "platform", "win32")
+        patch.setattr(kernel.boot.os, "name", "nt")
+        patch.setattr(kernel.boot.os, "environ", {"APPDATA": r"C:\Users\test\AppData\Roaming"})
+        patch.setattr(kernel.boot, "Path", _FakePath)
         path = str(core.user_data_dir())
         assert "AppData" in path and path.endswith("HeartBeat")
     finally:
@@ -352,11 +354,11 @@ def test_user_data_dir_windows():
 def test_user_data_dir_linux():
     patch = _Patch()
     try:
-        patch.setattr(core.sys, "platform", "linux")
-        patch.setattr(core.os, "name", "posix")
-        patch.setattr(core.os, "environ", {"XDG_DATA_HOME": "/tmp/xdg"})
+        patch.setattr(kernel.boot.sys, "platform", "linux")
+        patch.setattr(kernel.boot.os, "name", "posix")
+        patch.setattr(kernel.boot.os, "environ", {"XDG_DATA_HOME": "/tmp/xdg"})
         assert core.user_data_dir() == Path("/tmp/xdg/HeartBeat")
-        patch.setattr(core.os, "environ", {})
+        patch.setattr(kernel.boot.os, "environ", {})
         assert core.user_data_dir() == Path.home() / ".local" / "share" / "HeartBeat"
     finally:
         patch.restore()

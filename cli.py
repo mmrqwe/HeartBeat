@@ -81,6 +81,11 @@ def _make_parser():
     p_embed.add_argument("text")
 
     sub.add_parser("selfcheck", help="逐项测试全部核心功能")
+
+    p_probe = sub.add_parser(
+        "probe", help="frozen 环境自检：外部 .py 动态加载（updater 技术前提）"
+    )
+    p_probe.add_argument("--clean", action="store_true", help="先清理旧探针文件")
     return parser
 
 
@@ -205,8 +210,60 @@ def _run(argv, default_config=None):
     if cmd == "selfcheck":
         return _selfcheck(config)
 
+    if cmd == "probe":
+        return _probe(config, clean=args.clean)
+
     print(f"unknown command: {cmd}")
     return 2
+
+
+def _probe(config_path=None, clean=False):
+    """frozen 环境自检：验证外部 .py 动态加载（updater 的技术前提）。
+
+    updater（自进化）需要在打包后的 .app 里从用户数据目录加载外部模块，
+    本命令验证 spec_from_file_location 在 frozen 解释器下可用：
+    在 user_data_dir/.probe 写入探针模块 → 动态加载 → 调用函数 → 输出 JSON。
+    """
+    import importlib.util
+    import json
+
+    report = {
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "executable": sys.executable,
+        "probe_dir": "",
+        "loaded": False,
+        "answer": None,
+        "error": None,
+    }
+    try:
+        probe_dir = core.user_data_dir() / ".probe"
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        report["probe_dir"] = str(probe_dir)
+        if clean:
+            for old in probe_dir.glob("*.py"):
+                old.unlink(missing_ok=True)
+        probe_file = probe_dir / "probe_mod.py"
+        probe_file.write_text(
+            "import core\n"
+            "def answer():\n"
+            "    return 'probe-ok:' + __file__\n"
+            "def uses_packed():\n"
+            "    # 外部模块 import 打包内模块（updater 生成模块的核心约束）\n"
+            "    return bool(core.user_data_dir())\n",
+            encoding="utf-8",
+        )
+        spec = importlib.util.spec_from_file_location("heartbeat_probe", probe_file)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("spec_from_file_location returned None")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        report["answer"] = mod.answer()
+        report["uses_packed"] = bool(mod.uses_packed())
+        report["loaded"] = True
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report["loaded"] else 1
 
 
 def _check(name, fn):
