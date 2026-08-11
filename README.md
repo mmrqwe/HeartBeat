@@ -288,3 +288,9 @@ py -3.12 -m tests.test_db   # 带 sqlite-vec 环境，会执行向量检索测�
 - 心情/睡眠系统：晚上打盹、连续下雨低落
 - 像素动画扩展：走路、跳跃、自定义精灵
 - 声音和系统托盘
+
+## 许可证
+
+- 本项目源码以 **MIT License** 发布，详见 [LICENSE](LICENSE)。
+- 项目使用了 PySide6（LGPL-3.0）、fastembed（Apache-2.0）、sqlite-vec（MIT）、onnxruntime（MIT）、PyObjC（MIT）等第三方组件，完整声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。其中 PySide6 按 LGPL-3.0 动态链接方式使用，打包产物保留 Qt 库文件可替换重链接。
+- fastembed 首次启动会从 HuggingFace 下载 embedding 模型，模型文件受各自模型卡许可约束（多为 Apache-2.0/MIT），与本项目 MIT 许可相互独立。
