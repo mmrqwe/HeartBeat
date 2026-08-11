@@ -11,6 +11,7 @@
 
 import random
 import re
+import threading
 from pathlib import Path
 
 import core
@@ -62,6 +63,9 @@ class ChatMixin:
         ("tool", ("工具", "加个功能", "新功能")),
         ("brain", ("控制流", "agent", "聊天逻辑", "回复风格", "整体")),
     )
+    # 异步进化的整体等待上限（秒）：LLM 完整重写 + 多轮工具调用可能很久，
+    # 超过后只放弃等待结果（不杀线程），避免永久阻塞通知通道。
+    _EVOLVE_DEADLINE_SEC = 1800
 
     def _try_evolve_intent(self, user_text):
         """识别自我进化意图：显式指令 + 用户确认 → 调用 Evolver 流水线。
@@ -115,10 +119,36 @@ class ChatMixin:
             )
         if self.tool_confirm_cb is not None and not self.tool_confirm_cb(description):
             return "已取消自我进化。"
-        try:
-            version = self.evolver.evolve(module, requirement)
-        except ValueError as exc:
-            return f"自我进化失败：{exc}"
+        # GUI 注入 evolve_status_cb 时异步执行：chat 立即返回 ack，进化在后台
+        # daemon 线程跑——不占聊天看门狗（120s），也不会被 monitor 误判为
+        # chat 失速而触发自动回滚；未注入（CLI chat / 测试直连）保持同步。
+        if getattr(self, "evolve_status_cb", None) is None:
+            try:
+                version = self.evolver.evolve(module, requirement)
+            except ValueError as exc:
+                return f"自我进化失败：{exc}"
+            return self._evolve_success_text(module, version, requirement)
+        lock = getattr(self, "_evolve_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._evolve_lock = lock
+        if not lock.acquire(blocking=False):
+            return "上一次自我进化还在进行中，请稍后再试～"
+        self._evolve_aborted = False
+        worker = threading.Thread(
+            target=self._run_evolve_safe, args=(module, requirement), daemon=True
+        )
+        worker.start()
+        threading.Thread(
+            target=self._watch_evolve, args=(worker,), daemon=True
+        ).start()
+        return (
+            f"🔧 收到，开始自我进化（{module}）！我先在后台生成新版本，"
+            "依次通过安全扫描 → 契约/冒烟验证 → 原子切换，完成后告诉你结果～"
+        )
+
+    def _evolve_success_text(self, module, version, requirement):
+        """进化成功文案（同步/异步共用）。"""
         if module == "tool":
             tool_name, _, ver = version.partition("@")
             # 升级判定与 evolver 同规则：requirement 以已装工具名开头
@@ -140,6 +170,46 @@ class ChatMixin:
                 "聊天里直接说需求就能用了～"
             )
         return f"进化成功！{module} 模块已升级到 {version}：{requirement}。新功能已生效～"
+
+    def _run_evolve_safe(self, module, requirement):
+        """后台进化流水线（daemon 线程）：结果/异常统一转文本回传。"""
+        try:
+            version = self.evolver.evolve(module, requirement)
+        except ValueError as exc:
+            text = f"自我进化失败：{exc}"
+        except Exception as exc:  # noqa: BLE001 兜底：后台线程绝不静默炸掉
+            text = f"自我进化异常：{type(exc).__name__}: {exc}"
+        else:
+            text = self._evolve_success_text(module, version, requirement)
+        finally:
+            lock = getattr(self, "_evolve_lock", None)
+            if lock is not None:
+                lock.release()
+        if not getattr(self, "_evolve_aborted", False):
+            self._emit_evolve_status(text)
+
+    def _watch_evolve(self, worker):
+        """整体超时看门狗：超过 _EVOLVE_DEADLINE_SEC 放弃等待结果（不杀线程）。"""
+        worker.join(timeout=self._EVOLVE_DEADLINE_SEC)
+        if worker.is_alive():
+            self._evolve_aborted = True
+            self._emit_evolve_status(
+                "⏰ 进化运行超过 30 分钟仍未完成，已停止等待结果"
+                "（后台任务会自行结束，不会影响聊天）。"
+            )
+
+    def _emit_evolve_status(self, text):
+        """进化结果回传：写入聊天历史 + 通知宿主（GUI 经信号桥回主线程）。"""
+        try:
+            self.append_chat("assistant", text)
+        except Exception:
+            pass
+        cb = getattr(self, "evolve_status_cb", None)
+        if cb is not None:
+            try:
+                cb(text)
+            except Exception:
+                pass
 
     def _chat_llm(self, user_text):
         system, messages, budget = self._build_chat_messages(user_text)

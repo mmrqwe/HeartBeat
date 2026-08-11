@@ -265,7 +265,7 @@ py -3.12 -m PyInstaller --noconfirm --clean --onefile --windowed --name HeartBea
 
 ### 自我进化（除最小核心外都可自升级）
 
-桌宠可以在对话里主动升级自己，除最小核心（内核安全边界 kernel/、进化器自身 brain/evolver.py、LLM 封装 core.py、工具分发 tools.py）锁定外，**策略层与控制流全部可进化**：
+桌宠可以在对话里主动升级自己，除最小核心（内核安全边界 kernel/、进化器自身 brain/evolver.py、LLM 封装 core.py、工具分发 tools.py）锁定外，**策略层与控制流全部可进化**。进化在后台异步执行：说“进化 planner：每天上午9点提醒我喝水”后立即收到确认，完成后结果追加到聊天窗口——不占用聊天看门狗（120s），也不会被运行期监控误判失速。单次 LLM 请求超时 10 分钟（完整重写 8000 token 慢模型可达 5-10 分钟）、整体等待上限 30 分钟，超时只放弃等待结果、不中断任务；同一时刻只允许一个进化任务。
 
 - **策略层**：说“进化 planner：每天上午9点提醒我喝水”“升级记忆：多记住一些日程”——LLM 生成新版本模块 → 安全扫描 → 语法/接口契约/冒烟验证 → 原子切换 → 热加载，失败自动回滚。
 - **控制流（brain 包）**：说“进化 brain：agent_chat.py 的 _chat_rules 里……”“升级记忆：多记住一些日程”——整个 brain 以包形式版本化（`<用户数据目录>/brain/brain/vN/`，含 agent.py 主类 / agent_chat.py 聊天链路 / agent_think.py 自主思考 / memory.py / planner.py），LLM 可选择一个子模块整文件重写（TARGET 声明或需求里直接写文件名），其余文件从 active 包拷贝组装成新包版本。升级候选必须通过：

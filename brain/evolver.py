@@ -25,6 +25,9 @@ ALLOWED_IMPORTS = {
     "json", "re", "datetime", "time", "typing", "dataclasses", "pathlib",
     "collections", "math", "random", "calendar", "logging", "functools",
     "itertools", "enum", "string", "statistics", "bisect", "heapq",
+    # 纯线程库：无网络/文件/进程/反射逃逸面；brain 包异步进化场景需要
+    # （候选另有 L0 语法 + L1 契约 + L2 冒烟三重验证兜底）
+    "threading",
     # 项目内模块（现有 brain 模块的既有依赖）
     "search", "core", "db", "brain", "gui", "kernel", "plugins", "rag", "tools",
 }
@@ -38,6 +41,10 @@ FORBIDDEN_CALLS = {
 MAX_GEN_TOKENS = 8000
 # 验证失败后的重试次数（总计最多 MAX_ATTEMPTS+1 次生成，带错误反馈）
 MAX_ATTEMPTS = 2
+# 单次 LLM 请求超时（秒）。用户反馈 180s 太短：完整重写 8000 token 时
+# 慢模型生成可达 5-10 分钟（且 LLM 会不断调用工具，每轮请求独立计时）；
+# 不设 None 是防止半开连接永久挂死线程（10 分钟单请求上限已足够宽裕）。
+EVOLVE_REQUEST_TIMEOUT = 600
 
 _CODE_FENCE = re.compile(r"`{3,}(?:python|py|python3)?\s*(.*?)`{3,}", re.DOTALL)
 _REQUIREMENT_RE = re.compile(r"[：:，,。！!？?\s]+$")
@@ -205,7 +212,7 @@ class Evolver:
                 "content": "上次生成的代码验证失败：\n" + feedback +
                            "\n请修正后重新输出完整源码（保持契约方法与安全要求不变）。",
             })
-        raw = self.brain.complete(messages, max_tokens=MAX_GEN_TOKENS, timeout=180) or ""
+        raw = self.brain.complete(messages, max_tokens=MAX_GEN_TOKENS, timeout=EVOLVE_REQUEST_TIMEOUT) or ""
         target, code = self._extract_target_code(raw, name, requirement)
         if not code:
             raise ValueError("模型未返回代码")
@@ -457,7 +464,7 @@ class Evolver:
                     "content": "上次生成的代码验证失败：\n" + feedback +
                                "\n请修正后重新输出完整源码（保持契约与安全要求不变）。",
                 })
-            raw = self.brain.complete(messages, max_tokens=MAX_GEN_TOKENS, timeout=180) or ""
+            raw = self.brain.complete(messages, max_tokens=MAX_GEN_TOKENS, timeout=EVOLVE_REQUEST_TIMEOUT) or ""
             code = self._extract_code(raw)
             if not code:
                 preview = raw.strip()[:120].replace("\n", " ")

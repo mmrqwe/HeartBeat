@@ -4,6 +4,8 @@ import inspect
 import json
 import random
 import sqlite3
+import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -918,6 +920,57 @@ def test_evolve_intent_tool_confirm_description(tmp_path):
     a.tool_confirm_cb = lambda desc: seen.append(desc) or True
     a._try_evolve_intent("进化工具：查快递物流")
     assert seen and "新增一个工具" in seen[0]
+
+
+def test_evolve_intent_async_ack_and_callback(tmp_path):
+    """GUI 模式（注入 status_cb）：进化异步执行——chat 立即返回 ack，结果经回调送达。"""
+    a = _make_agent(tmp_path)
+    a.evolver = _fake_evolver()
+    a.evolver.evolve = lambda name, req, on_status=None: "my_tool@v0.1"
+    a.tool_confirm_cb = lambda desc: True
+    results = []
+    a.evolve_status_cb = results.append
+    reply = a._try_evolve_intent("进化工具：帮我查快递物流")
+    assert "开始自我进化" in reply
+    deadline = time.time() + 5
+    while not results and time.time() < deadline:
+        time.sleep(0.02)
+    assert results, "异步回调应收到进化结果"
+    assert "新工具「my_tool」已安装" in results[0] and "v0.1" in results[0]
+    # 结果同时写入聊天历史
+    assert any("进化成功" in m["text"] for m in a.chat_history[-3:])
+
+
+def test_evolve_intent_async_busy_guard(tmp_path):
+    """并发保护：进化进行中再次触发 → 提示稍后再试，不启动第二个任务。"""
+    a = _make_agent(tmp_path)
+    release = threading.Event()
+    calls = []
+
+    def slow_evolve(name, req, on_status=None):
+        calls.append(name)
+        release.wait(5)
+        return "x@v0.1"
+
+    a.evolver = _fake_evolver()
+    a.evolver.evolve = slow_evolve
+    a.tool_confirm_cb = lambda desc: True
+    a.evolve_status_cb = lambda text: None
+    reply1 = a._try_evolve_intent("进化工具：查快递物流")
+    assert "开始自我进化" in reply1
+    reply2 = a._try_evolve_intent("进化工具：再查一次")
+    assert "进行中" in reply2
+    assert len(calls) == 1  # 只启动了一个后台任务
+    release.set()
+    deadline = time.time() + 5
+    while time.time() < deadline and getattr(a, "_evolve_lock", None) is not None \
+            and a._evolve_lock.locked():
+        time.sleep(0.02)
+    # 结束后可再次触发
+    a.evolver.evolve = lambda name, req, on_status=None: "x@v0.2"
+    reply3 = a._try_evolve_intent("进化工具：第三次")
+    assert "开始自我进化" in reply3
+    time.sleep(0.1)  # 等后台线程收尾释放锁
 
 
 # ---------- 运行器 ----------

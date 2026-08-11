@@ -35,6 +35,8 @@ class Bridge(QObject):
 
     delta = Signal(object, str)
     status = Signal(str)
+    # 自我进化进度/结果（agent 后台线程 → 主线程，自动 QueuedConnection）
+    evolve_status = Signal(str)
     # 工具确认：cmdline, event, result_holder（子线程 emit 后阻塞等 event）
     tool_confirm = Signal(str, object, object)
 
@@ -70,10 +72,13 @@ class HeartBeatApp:
         self.bridge = Bridge()
         self.bridge.delta.connect(self._apply_stream_delta)
         self.bridge.status.connect(self._set_status)
+        self.bridge.evolve_status.connect(self._on_evolve_status)
         self.bridge.tool_confirm.connect(self._on_tool_confirm)
         self._setup_runtime()
         # 注入工具确认回调：confirm 档写命令由主线程弹窗决定（60s 超时拒绝）
         self.agent.tool_confirm_cb = self._confirm_tool
+        # 注入自我进化状态回调：后台线程 emit → 信号桥回主线程（跨线程安全）
+        self.agent.evolve_status_cb = self.bridge.evolve_status.emit
 
         self.pet = PetWindow(self.cfg)
         self.pet.open_chat_requested.connect(self._open_chat)
@@ -446,6 +451,14 @@ class HeartBeatApp:
             self.chat_win.set_mood(self.agent.state.get("mood", "平静"))
             self.chat_win.set_daily_stats(self._daily_stats_text())
         self._set_status("陪我聊天中")
+
+    def _on_evolve_status(self, text):
+        """自我进化进度/结果（agent 后台线程 → 信号桥 → 主线程）。"""
+        if self.chat_win:
+            self.chat_win.add_message("assistant", text)
+        self.pet.play("talk", 1600)
+        preview = text if len(text) <= 16 else text[:15] + "…"
+        self._set_status(preview)
 
     def _chat_timeout(self):
         self._set_status("回复超时，已停止等待")
