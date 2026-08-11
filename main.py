@@ -58,6 +58,8 @@ class HeartBeatApp:
         )
         # 事件总线注入：agent 工具执行 → tool.executed 旁路通知（异步回主线程）
         self.agent.eventbus = self.kernel.eventbus
+        # 运行期健康监控（kernel.monitor）：tick/chat 心跳 + 超阈值自动回滚
+        self.monitor = self.kernel.monitor
         # 自进化注入：updater 的 L2 冒烟 runner（候选模块真实 Agent 实测）
         self.kernel.updater.smoke_runner = smoke_test_module
         # 热切换订阅：updater 切换 brain 版本 → 主线程重载领域模块。
@@ -447,6 +449,7 @@ class HeartBeatApp:
 
     def _chat_timeout(self):
         self._set_status("回复超时，已停止等待")
+        self.monitor.record_chat(False)  # 超时计入窗口失败（与异常同权）
         if self.chat_win:
             self.chat_win.cancel_stream()  # 清理流式占位气泡，避免影响下次回复
             self.chat_win.set_thinking(False)

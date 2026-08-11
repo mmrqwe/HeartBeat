@@ -46,6 +46,11 @@ class Kernel:
         self.updater = Updater(self.data_dir)
         self.updater.eventbus = self.eventbus  # 切换广播 → 运行中 Agent 热切换
         self.updater.ensure_installed()
+        # 运行期健康监控（阶段4）：tick/chat 指标 + 超阈值自动回滚。
+        # 依赖 updater（回滚执行器），自身零业务依赖。
+        from .monitor import Monitor
+
+        self.monitor = Monitor(self.data_dir, updater=self.updater)
 
     def save_settings(self, cfg):
         """保存配置并更新内存副本（由 UI / CLI 调用）。发布 config.saved 事件。"""
