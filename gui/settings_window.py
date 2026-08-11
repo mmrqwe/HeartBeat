@@ -29,8 +29,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-import skins
-from pet_window import draw_grid
+from gui import skins
+from gui.pet_window import draw_grid
 
 
 def grid_to_pixmap(grid, palette, scale=4):

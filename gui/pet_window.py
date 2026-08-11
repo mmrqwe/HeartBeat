@@ -13,7 +13,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QMenu, QWidget
 
-import skins
+from gui import skins
 
 PIXEL = 5
 W, H = 250, 215

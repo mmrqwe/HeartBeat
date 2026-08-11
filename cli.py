@@ -16,7 +16,7 @@ import core
 import db
 import rag
 import search
-import skins
+from gui import skins
 
 
 def _default_config_path():

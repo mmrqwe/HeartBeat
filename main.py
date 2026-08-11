@@ -15,13 +15,12 @@ import agent
 import core
 import db
 import kernel
-import skins
-import theme
 from brain.smoke import smoke_test_module
-from chat_window import ChatWindow
-from pet_window import PetWindow
-from search_window import SearchWindow
-from settings_window import SettingsWindow
+from gui import skins, theme
+from gui.chat_window import ChatWindow
+from gui.pet_window import PetWindow
+from gui.search_window import SearchWindow
+from gui.settings_window import SettingsWindow
 
 TICK_TIMEOUT_MS = 180_000
 CHAT_TIMEOUT_MS = 120_000

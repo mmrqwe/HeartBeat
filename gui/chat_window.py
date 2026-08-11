@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-import theme
+from gui import theme
 
 
 class ChatInput(QTextEdit):

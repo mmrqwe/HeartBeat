@@ -2,7 +2,7 @@
 
 import inspect
 
-import skins
+from gui import skins
 
 
 def test_default_skin_exists():

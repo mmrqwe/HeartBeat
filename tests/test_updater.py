@@ -20,7 +20,7 @@ import core
 from brain.smoke import smoke_test_module
 from kernel.updater import Updater
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).parent.parent  # 项目根（tests/ 的上一级）
 
 
 def _make_updater(data_dir):

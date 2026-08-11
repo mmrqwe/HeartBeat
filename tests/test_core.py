@@ -96,7 +96,7 @@ def test_discover_plugins(tmp_path):
 
 
 def test_discover_real_plugins():
-    plugins = core.discover_plugins([Path(__file__).parent / "plugins"])
+    plugins = core.discover_plugins([Path(__file__).parent.parent / "plugins"])
     assert {"weather", "rss_news", "quote"} <= set(plugins)
 
 

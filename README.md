@@ -22,6 +22,18 @@
 - 自主调用搜索：LLM 模式支持工具调用，规则模式也会自己选话题主动搜索
 - 可打包 exe：`build.bat` 一键构建，双击即用
 
+## 项目结构
+
+- `main.py` / `cli.py` —— 入口（GUI / 命令行）
+- `core.py` `db.py` `rag.py` `search.py` `tools.py` `agent.py` —— 核心逻辑（配置/HTTP/数据库/向量/搜索/工具/Agent）
+- `kernel/` —— 引导、插件管理、运行时、事件总线、权限与 Shell 工具、自进化更新器
+- `brain/` —— Agent 拆分包（memory / planner / agent）
+- `gui/` —— 皮肤、主题与桌宠/聊天/设置/搜索窗口
+- `plugins/` —— 内容源插件（天气/RSS/行情/百科等）
+- `tests/` —— 单元测试（`python -m tests.test_xxx`）
+- `assets/` —— 图标与界面截图
+- `build_mac.sh` / `build.bat` / `build-release.command` —— 打包脚本
+
 ## 运行
 
 源码方式（Python 3.10+，需要 PySide6）：
@@ -257,15 +269,15 @@ py -3.12 -m PyInstaller --noconfirm --clean --onefile --windowed --name HeartBea
 ## 测试
 
 ```powershell
-python -m py_compile main.py core.py agent.py tools.py chat_ui.py test_core.py test_agent.py plugins\weather.py plugins\rss_news.py plugins\quote.py
-python test_core.py
-python test_agent.py
-python test_tools.py
-python test_stats.py
-python test_db.py
-python test_skins.py
-python test_search.py
-py -3.12 test_db.py   # 带 sqlite-vec 环境，会执行向量检索测试
+python -m py_compile main.py core.py agent.py tools.py gui\*.py tests\test_*.py plugins\weather.py plugins\rss_news.py plugins\quote.py
+python -m tests.test_core
+python -m tests.test_agent
+python -m tests.test_tools
+python -m tests.test_stats
+python -m tests.test_db
+python -m tests.test_skins
+python -m tests.test_search
+py -3.12 -m tests.test_db   # 带 sqlite-vec 环境，会执行向量检索测试
 ```
 
 ## 下一步可以加

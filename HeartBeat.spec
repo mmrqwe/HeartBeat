@@ -43,7 +43,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['/HeartBeat.icns'],
+    icon=['/assets/HeartBeat.icns'],
 )
 coll = COLLECT(
     exe,
@@ -57,6 +57,6 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='HeartBeat.app',
-    icon='/HeartBeat.icns',
+    icon='/assets/HeartBeat.icns',
     bundle_identifier=None,
 )
