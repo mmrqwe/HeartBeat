@@ -80,12 +80,12 @@ def test_chat_llm_parses_fact_and_think(monkeypatch, tmp_path):
     monkeypatch.setattr(
         core.Brain,
         "complete",
-        lambda self, msgs: "好的记住了。\n[FACT] 主人喜欢喝咖啡\n[THINK] 以后可以聊咖啡",
+        lambda self, msgs, **kw: "好的记住了。\n[FACT] 主人喜欢喝咖啡\n[THINK] 以后可以聊咖啡",
     )
     monkeypatch.setattr(
         core.Brain,
         "complete_tools",
-        lambda self, msgs, tools: ("好的记住了。\n[FACT] 主人喜欢喝咖啡\n[THINK] 以后可以聊咖啡", []),
+        lambda self, msgs, tools, **kw: ("好的记住了。\n[FACT] 主人喜欢喝咖啡\n[THINK] 以后可以聊咖啡", []),
     )
     cfg = _cfg()
     cfg["api"]["api_key"] = "test-key"
@@ -98,9 +98,9 @@ def test_chat_llm_parses_fact_and_think(monkeypatch, tmp_path):
 
 
 def test_chat_llm_empty_body_fallback(monkeypatch, tmp_path):
-    monkeypatch.setattr(core.Brain, "complete", lambda self, msgs: "[THINK] 今天很安静")
+    monkeypatch.setattr(core.Brain, "complete", lambda self, msgs, **kw: "[THINK] 今天很安静")
     monkeypatch.setattr(
-        core.Brain, "complete_tools", lambda self, msgs, tools: ("[THINK] 今天很安静", [])
+        core.Brain, "complete_tools", lambda self, msgs, tools, **kw: ("[THINK] 今天很安静", [])
     )
     cfg = _cfg()
     cfg["api"]["api_key"] = "test-key"
@@ -110,9 +110,9 @@ def test_chat_llm_empty_body_fallback(monkeypatch, tmp_path):
 
 
 def test_think_llm_message(monkeypatch, tmp_path):
-    monkeypatch.setattr(core.Brain, "complete", lambda self, msgs: "今晚可能有流星雨！")
+    monkeypatch.setattr(core.Brain, "complete", lambda self, msgs, **kw: "今晚可能有流星雨！")
     monkeypatch.setattr(
-        core.Brain, "complete_tools", lambda self, msgs, tools: ("今晚可能有流星雨！", [])
+        core.Brain, "complete_tools", lambda self, msgs, tools, **kw: ("今晚可能有流星雨！", [])
     )
     cfg = _cfg()
     cfg["api"]["api_key"] = "test-key"
@@ -122,11 +122,11 @@ def test_think_llm_message(monkeypatch, tmp_path):
 
 def test_think_llm_silent_saves_thought(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        core.Brain, "complete", lambda self, msgs: "SILENT\n[THINK] 今天没什么特别的"
+        core.Brain, "complete", lambda self, msgs, **kw: "SILENT\n[THINK] 今天没什么特别的"
     )
     monkeypatch.setattr(
         core.Brain, "complete_tools",
-        lambda self, msgs, tools: ("SILENT\n[THINK] 今天没什么特别的", []),
+        lambda self, msgs, tools, **kw: ("SILENT\n[THINK] 今天没什么特别的", []),
     )
     cfg = _cfg()
     cfg["api"]["api_key"] = "test-key"
@@ -243,7 +243,7 @@ def test_chat_system_prompt_uses_role(tmp_path):
 
 
 def test_chat_stream_collects_deltas(monkeypatch, tmp_path):
-    def fake_stream(self, messages, on_delta):
+    def fake_stream(self, messages, on_delta, max_tokens=None):
         on_delta("你")
         on_delta("好")
 
@@ -263,14 +263,14 @@ def test_chat_stream_fallback_to_non_stream(monkeypatch, tmp_path):
     monkeypatch.setattr(
         core.Brain,
         "complete_tools",
-        lambda self, messages, tools: (_ for _ in ()).throw(RuntimeError("no tools")),
+        lambda self, messages, tools, **kw: (_ for _ in ()).throw(RuntimeError("no tools")),
     )
     monkeypatch.setattr(
         core.Brain,
         "complete_stream",
-        lambda self, messages, on_delta: (_ for _ in ()).throw(RuntimeError("no stream")),
+        lambda self, messages, on_delta, **kw: (_ for _ in ()).throw(RuntimeError("no stream")),
     )
-    monkeypatch.setattr(core.Brain, "complete", lambda self, messages: "回退回复")
+    monkeypatch.setattr(core.Brain, "complete", lambda self, messages, **kw: "回退回复")
     cfg = _cfg()
     cfg["api"]["api_key"] = "test-key"
     a = _make_agent(tmp_path, cfg=cfg)
@@ -331,14 +331,14 @@ def test_chat_llm_tools_fallback(monkeypatch, tmp_path):
     monkeypatch.setattr(
         core.Brain,
         "complete_tools",
-        lambda self, messages, tools: (_ for _ in ()).throw(RuntimeError("no tools")),
+        lambda self, messages, tools, **kw: (_ for _ in ()).throw(RuntimeError("no tools")),
     )
     monkeypatch.setattr(
         core.Brain,
         "complete_stream",
         lambda self, messages, cb: (_ for _ in ()).throw(RuntimeError("no stream")),
     )
-    monkeypatch.setattr(core.Brain, "complete", lambda self, messages: "回退成功")
+    monkeypatch.setattr(core.Brain, "complete", lambda self, messages, **kw: "回退成功")
     cfg = _cfg()
     cfg["api"]["api_key"] = "test-key"
     a = _make_agent(tmp_path, cfg=cfg)
@@ -386,9 +386,9 @@ def test_think_llm_tools_fallback(monkeypatch, tmp_path):
     monkeypatch.setattr(
         core.Brain,
         "complete_tools",
-        lambda self, messages, tools: (_ for _ in ()).throw(RuntimeError("no tools")),
+        lambda self, messages, tools, **kw: (_ for _ in ()).throw(RuntimeError("no tools")),
     )
-    monkeypatch.setattr(core.Brain, "complete", lambda self, messages: "SILENT")
+    monkeypatch.setattr(core.Brain, "complete", lambda self, messages, **kw: "SILENT")
     cfg = _cfg()
     cfg["api"]["api_key"] = "test-key"
     a = _make_agent(tmp_path, cfg=cfg)
@@ -697,7 +697,7 @@ def test_chat_llm_extracts_facts(monkeypatch, tmp_path):
     cfg["api"]["api_key"] = "test-key"
     a = _make_agent(tmp_path, cfg=cfg)
     monkeypatch.setattr(
-        core.Brain, "complete_tools", lambda self, msgs, tools: ("好的～", [])
+        core.Brain, "complete_tools", lambda self, msgs, tools, **kw: ("好的～", [])
     )
     a.chat("我喜欢看科幻电影，最近在学吉他")
     texts = [i["text"] for i in a.memory.facts()]
@@ -766,7 +766,7 @@ def test_patrol_topics_llm_extract(monkeypatch, tmp_path):
     a.db.add_memory("fact", "主人喜欢摄影和户外", category="preference", importance=3)
     monkeypatch.setattr(
         core.Brain, "complete",
-        lambda self, msgs: '["摄影", "户外", "露营"]',
+        lambda self, msgs, **kw: '["摄影", "户外", "露营"]',
     )
     topics = a.patrol_topics()
     assert topics == ["摄影", "户外", "露营"]

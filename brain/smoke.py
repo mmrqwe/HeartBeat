@@ -31,10 +31,14 @@ def smoke_test_module(module_name, module):
         if module_name == "memory":
             inst.extract_facts("我叫测试员，明天开会")
             assert any("测试员" in i["text"] for i in ag.memory.facts()), "事实提取失败"
+            inst.remember("fact", "测试员喜欢摄影", category="preference")
+            rel = inst.relevant("测试员")
+            assert isinstance(rel, list) and rel, "记忆检索为空"
             assert inst.profile(), "画像为空"
             inst.parse_schedule_expiry("明天10点开会")
             inst.followup_candidate(ag.clock())
         else:
+            assert inst.build_time_context(), "时间上下文为空"
             inst.is_quiet(ag.clock())
             inst.cooldown_ok(ag.clock())
             inst.update_mood({"collections": []})

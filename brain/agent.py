@@ -13,6 +13,7 @@ import search
 import tools
 from db import Database, Memory
 
+from brain.evolver import Evolver
 from brain.memory import FOLLOW_KEYWORDS, MemoryModule
 from brain.planner import CURIOSITY_QUESTIONS, Planner, PROACTIVE_DAILY_BUDGET
 
@@ -46,6 +47,10 @@ class Agent:
         else:
             self.memory_module = MemoryModule(self)
             self.planner = Planner(self)
+        # 自我进化引擎（LLM 生成 → updater 验证安装）：无 brain_loader 时不可用
+        self.evolver = (
+            Evolver(self.brain, self.brain_loader) if self.brain_loader is not None else None
+        )
 
     # ---------- 状态 ----------
 
@@ -152,6 +157,8 @@ class Agent:
         self.state["fact_scan_id"] = entry["id"]
         self._save_state()
         reply = self._try_search_intent(user_text)
+        if reply is None:
+            reply = self._try_evolve_intent(user_text)
         if reply is not None:
             if on_delta:
                 on_delta(reply)
@@ -196,6 +203,58 @@ class Agent:
                 return search.format_results(entries, "搜索")
             except Exception as exc:
                 return f"搜索没成功：{exc}"
+
+    # ---------- 自我进化（显式指令 + 用户确认 → Evolver 流水线） ----------
+
+    _EVOLVE_RE = re.compile(
+        r"(进化|升级|自我进化|给自己加|加个(?:新)?功能|更新你的(?:功能|代码)|改一下你的(?:功能|代码))"
+    )
+    _EVOLVE_MODULE_HINTS = (
+        ("memory", ("记忆", "memory")),
+        ("planner", ("规划", "planner", "主动", "思考", "巡视")),
+    )
+
+    def _try_evolve_intent(self, user_text):
+        """识别自我进化意图：显式指令 + 用户确认 → 调用 Evolver 流水线。
+
+        返回回复文本；非进化意图返回 None（继续正常聊天）。
+        无 brain_loader（测试直连）或未指定需求时给出引导，不执行。
+        """
+        if not self._EVOLVE_RE.search(user_text):
+            return None
+        if self.evolver is None:
+            return "进化引擎不可用（未连接版本管理，CLI/GUI 环境下可用）。"
+        module = None
+        for mod, hints in self._EVOLVE_MODULE_HINTS:
+            if any(h in user_text for h in hints):
+                module = mod
+                break
+        if module is None:
+            module = "planner"  # 未指定时默认规划模块，确认弹窗会明示
+        requirement = self._EVOLVE_RE.sub("", user_text)
+        for mod, hints in self._EVOLVE_MODULE_HINTS:
+            for hint in hints:
+                requirement = requirement.replace(hint, "")
+        requirement = re.sub(r"[：:，,。！!？?\s]+$", "", requirement).strip()
+        if len(requirement) < 4:
+            return (
+                f"想让我给自己加什么功能？请说具体一点，例如：\n"
+                f"进化 {module}：每天上午9点提醒我喝水"
+            )
+        current = self.evolver.updater.active_version(module) or "?"
+        description = (
+            f"【自我进化确认】将修改 {module} 模块（当前 {current}），升级后自动热加载生效。\n"
+            f"需求：{requirement}\n"
+            "AI 将生成新版本代码，依次通过安全扫描 → 语法/接口契约/冒烟验证 → 原子切换；"
+            "任何一步失败会自动回滚，不影响现有功能。"
+        )
+        if self.tool_confirm_cb is not None and not self.tool_confirm_cb(description):
+            return "已取消自我进化。"
+        try:
+            version = self.evolver.evolve(module, requirement)
+        except ValueError as exc:
+            return f"自我进化失败：{exc}"
+        return f"进化成功！{module} 模块已升级到 {version}：{requirement}。新功能已生效～"
         return None
 
     def _chat_llm(self, user_text):

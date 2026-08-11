@@ -113,6 +113,12 @@ def _make_parser():
     p_upd_switch.add_argument("version")
     p_upd_rollback = upd_sub.add_parser("rollback", help="回滚 active 到最近可用旧版本")
     p_upd_rollback.add_argument("module", choices=["memory", "planner"])
+
+    p_evolve = sub.add_parser(
+        "evolve", help="自我进化：LLM 生成新版本 → 安全/契约/冒烟验证 → 原子安装（memory/planner）"
+    )
+    p_evolve.add_argument("module", choices=["memory", "planner"])
+    p_evolve.add_argument("requirement", help="功能需求描述，如：每天上午9点提醒我喝水")
     return parser
 
 
@@ -246,6 +252,9 @@ def _run(argv, default_config=None):
     if cmd == "updater":
         return _updater_cmd(args)
 
+    if cmd == "evolve":
+        return _evolve_cmd(args)
+
     print(f"unknown command: {cmd}")
     return 2
 
@@ -304,6 +313,27 @@ def _updater_cmd(args):
 
     print(f"unknown updater cmd: {args.upd_cmd}")
     return 2
+
+
+def _evolve_cmd(args):
+    """自我进化：LLM 生成新版本 → 安全/契约/冒烟验证 → 原子安装。
+
+    CLI 直跑（跳过确认弹窗）：调用方（运维/测试）已显式下达命令。
+    进度经 on_status 打印，便于观察生成/验证/安装各阶段。
+    """
+    _, _, _, _, _, ag = _load(args.config)
+    if ag.evolver is None:
+        print("进化引擎不可用（brain_loader 未注入）")
+        return 1
+    try:
+        version = ag.evolver.evolve(
+            args.module, args.requirement, on_status=lambda m: print(f"  • {m}")
+        )
+    except ValueError as exc:
+        print(f"进化失败：{exc}")
+        return 1
+    print(f"进化成功：{args.module} -> {version}（已热加载生效）")
+    return 0
 
 
 def _probe(config_path=None, clean=False):

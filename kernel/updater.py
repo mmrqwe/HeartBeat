@@ -46,6 +46,12 @@ REQUIRED_METHODS = {
 class Updater:
     """brain 模块版本管理：安装 / 验证 / 切换 / 回滚 / 加载。"""
 
+    # 类属性别名：brain 层模块不 import kernel（依赖方向红线），
+    # Evolver 等调用方经 updater 实例访问契约常量。
+    BUILTIN_MODULES = BUILTIN_MODULES
+    CLASSES = CLASSES
+    REQUIRED_METHODS = REQUIRED_METHODS
+
     def __init__(self, data_dir):
         self.root = Path(data_dir) / "brain"
         # L2 冒烟 runner（宿主注入）：(module_name, module) -> bool
