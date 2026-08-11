@@ -12,7 +12,34 @@ import json
 
 import search
 
-from kernel.permission import *  # noqa: F401,F403  安全分级/常量/classify/run_bash/execute 依赖
+# 安全分级/常量/classify/run_bash/execute 依赖（显式 re-export，
+# 保持 agent / test_tools 的 `tools.X` 引用兼容，同时让静态检查可解析）
+from kernel.permission import (  # noqa: F401
+    AUTO,
+    BASH_MAX_OUTPUT,
+    BASH_TIMEOUT,
+    CONFIRM,
+    FIND_DANGEROUS_ARGS,
+    HARD_BLOCK_COMMANDS,
+    READONLY_COMMANDS,
+    READONLY_GIT_SUBCOMMANDS,
+    REJECT,
+    SENSITIVE_ENV_MARKERS,
+    SENSITIVE_PATH_MARKERS,
+    SHELL_MODE_CONFIRM,
+    SHELL_MODE_FULL,
+    SHELL_MODE_OFF,
+    SHELL_MODE_READONLY,
+    SHELL_MODES,
+    SOURCE_AUTO,
+    SOURCE_USER,
+    WRITE_COMMANDS,
+    WRITE_GIT_SUBCOMMANDS,
+    classify,
+    human_brief,
+    resolve_workdir,
+    run_bash,
+)
 from kernel.permission import _filter_env  # noqa: F401  （test_tools 直接引用）
 
 # ---------- 搜索工具（只读） ----------

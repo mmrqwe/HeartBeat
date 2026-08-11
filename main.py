@@ -61,6 +61,10 @@ class HeartBeatApp:
         self.agent.eventbus = self.kernel.eventbus
         # 自进化注入：updater 的 L2 冒烟 runner（候选模块真实 Agent 实测）
         self.kernel.updater.smoke_runner = smoke_test_module
+        # 热切换订阅：updater 切换 brain 版本 → 主线程重载领域模块。
+        # async_=True 保证 handler 经 Qt QueuedConnection 回主线程执行——
+        # 未来 agent 在子线程触发升级时不会与 chat/think 线程竞态。
+        self.kernel.eventbus.subscribe("brain.switched", self._on_brain_switched, async_=True)
 
         self.bridge = Bridge()
         self.bridge.delta.connect(self._apply_stream_delta)
@@ -342,6 +346,15 @@ class HeartBeatApp:
 
     def _set_status(self, text):
         self.pet.set_status(text)
+
+    def _on_brain_switched(self, payload):
+        """updater 热切换回调：重载领域模块（失败保持旧模块，不中断会话）。"""
+        module_name, version = payload
+        ok = self.agent.reload_brain_modules()
+        self._set_status(
+            f"大脑模块 {module_name} 已切换到 {version}"
+            + ("" if ok else "（重载失败，保持旧模块）")
+        )
 
     # ---------- 聊天 ----------
 

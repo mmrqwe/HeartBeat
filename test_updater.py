@@ -184,6 +184,45 @@ def test_switch_and_missing(tmp_path):
 # ---------- 启动级回滚 ----------
 
 
+def test_switch_emits_event(tmp_path):
+    """热切换接线：install/switch/rollback 后广播 brain.switched 事件。"""
+    from kernel.eventbus import EventBus
+
+    upd = _make_updater(tmp_path)
+    bus = EventBus()
+    upd.eventbus = bus
+    received = []
+    bus.subscribe("brain.switched", lambda payload: received.append(payload))
+
+    cand = _write_candidate(tmp_path, "memory", _evolved_memory_source())
+    upd.install_candidate("memory", cand)
+    assert received == [("memory", "v1.1")], received
+
+    upd.switch("memory", "v1.0")
+    assert received[-1] == ("memory", "v1.0")
+
+    upd.rollback("memory")  # 已是 v1.0，无更旧版本 → 不切换不广播
+    assert len(received) == 2, received
+
+
+def test_audit_log_written(tmp_path):
+    """升级审计：install/switch/rollback 写入 updates.log（可追溯）。"""
+    upd = _make_updater(tmp_path)
+    cand = _write_candidate(tmp_path, "memory", _evolved_memory_source())
+    upd.install_candidate("memory", cand)
+    upd.rollback("memory")
+
+    log_path = tmp_path / "brain" / "updates.log"
+    assert log_path.is_file()
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    actions = [json.loads(ln) for ln in lines]
+    assert [a["action"] for a in actions] == ["install", "rollback"]
+    assert actions[0]["module"] == "memory"
+    assert actions[0]["version"] == "v1.1"
+    assert actions[0]["detail"]  # 记录候选来源路径
+    assert all(a.get("ts") for a in actions)
+
+
 def test_startup_rollback_corrupt_active(tmp_path):
     upd = _make_updater(tmp_path)
     cand = _write_candidate(tmp_path, "memory", _evolved_memory_source())
@@ -195,6 +234,18 @@ def test_startup_rollback_corrupt_active(tmp_path):
     upd.ensure_installed()  # 启动预检 → 自动回滚 v1.0
     assert upd.active_version("memory") == "v1.0"
     upd.load("memory")  # 不抛错
+
+
+def test_startup_rebuild_when_no_older(tmp_path):
+    """兜底重建：active=v1.0 损坏且无更旧版本 → ensure_installed 重建 v1.0。"""
+    upd = _make_updater(tmp_path)
+    # 只有 v1.0，把它写坏（模拟半写/同步中断）
+    (tmp_path / "brain" / "memory" / "v1.0" / "memory.py").write_text(
+        "def broken(:\n", encoding="utf-8"
+    )
+    upd.ensure_installed()  # rollback 无旧版本 → 兜底重建
+    assert upd.active_version("memory") == "v1.0"
+    upd.load("memory")  # 源码已恢复，可加载
 
 
 # ---------- 端到端：自进化闭环 ----------

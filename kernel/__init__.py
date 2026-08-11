@@ -44,6 +44,7 @@ class Kernel:
         from .updater import Updater
 
         self.updater = Updater(self.data_dir)
+        self.updater.eventbus = self.eventbus  # 切换广播 → 运行中 Agent 热切换
         self.updater.ensure_installed()
 
     def save_settings(self, cfg):

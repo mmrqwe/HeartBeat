@@ -20,9 +20,9 @@ import skins
 
 
 def _default_config_path():
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent / "config.json"
-    return Path(__file__).with_name("config.json")
+    # 统一数据目录（与 GUI/kernel.boot 一致）：配置、数据库、brain 版本全在
+    # user_data_dir。frozen 与开发模式同一位置，重编译/升级不丢数据。
+    return core.user_data_dir() / "config.json"
 
 
 def _load(config_path=None):
@@ -31,10 +31,22 @@ def _load(config_path=None):
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         core.save_config(core.load_config(), cfg_path)
     cfg = core.load_config(cfg_path)
-    database = db.Database(cfg_path.parent / "heartbeat.db")
+    # 数据目录统一 user_data_dir（GUI Kernel 同源）；config 路径可 --config 自定义
+    data_dir = core.user_data_dir()
+    database = db.Database(data_dir / "heartbeat.db")
     stats = core.Stats(database)
     plugins = core.discover_plugins()
-    ag = agent.Agent(cfg, plugins, cfg_path.parent, stats=stats, db=database)
+    # 注入 updater 作 brain_loader：CLI 与 GUI 一致，updater 切换的 brain
+    # 版本在 chat/tick 中同样生效（未注入时 Agent 用内置实现）
+    from brain.smoke import smoke_test_module
+    from kernel.updater import Updater
+
+    updater = Updater(data_dir)
+    updater.smoke_runner = smoke_test_module
+    updater.ensure_installed()
+    ag = agent.Agent(
+        cfg, plugins, data_dir, stats=stats, db=database, brain_loader=updater
+    )
     return cfg_path, cfg, database, stats, plugins, ag
 
 
@@ -143,19 +155,19 @@ def _run(argv, default_config=None):
     if cmd == "chat":
         _, _, _, _, _, ag = _load(config)
         t0 = time.time()
-        if args.no_stream:
-            reply = ag.chat(args.text)
-            deltas = 0
-        else:
-            deltas = []
+        stream_count = 0
+        if not args.no_stream:
+            deltas: list = []
 
             def on_delta(text):
                 deltas.append(text)
 
             reply = ag.chat(args.text, on_delta=on_delta)
-            deltas = len(deltas)
+            stream_count = len(deltas)
+        else:
+            reply = ag.chat(args.text)
         print("reply:", reply)
-        print("stream_deltas:", deltas)
+        print("stream_deltas:", stream_count)
         print(f"elapsed: {time.time() - t0:.2f}s")
         return 0
 

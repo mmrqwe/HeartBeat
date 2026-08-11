@@ -99,6 +99,17 @@ class Agent:
             except Exception:
                 pass
 
+    def reload_brain_modules(self):
+        """重载领域模块（updater 热切换后调用）。失败保持旧模块，返回是否成功。"""
+        if self.brain_loader is None:
+            return False
+        try:
+            self.memory_module = self.brain_loader.create("memory", self)
+            self.planner = self.brain_loader.create("planner", self)
+            return True
+        except Exception:
+            return False
+
     def reindex_async(self):
         """后台补向量索引（保存设置后调用，不阻塞 UI）。"""
         if not getattr(self, "_reindex_pending", False):

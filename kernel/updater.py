@@ -14,15 +14,20 @@
 """
 
 import importlib.util
+import json
 import re
 import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # 可进化模块清单（brain 层，允许 AI 替换升级）
 BUILTIN_MODULES = ("memory", "planner")
 
 # 每个模块的公开契约：类名 + 必需方法（升级候选必须完整实现）
+# 维护约定：brain 层模块的公开方法即升级契约——方法签名/语义变更必须同步
+# 更新本清单（升级候选缺少任一方法会被 L1 拒绝）；新增契约方法属破坏性
+# 变更，需要连带发布"内置新版本 + 契约新清单"，旧版本候选会被拒绝。
 CLASSES = {"memory": "MemoryModule", "planner": "Planner"}
 REQUIRED_METHODS = {
     "memory": {
@@ -45,6 +50,36 @@ class Updater:
         self.root = Path(data_dir) / "brain"
         # L2 冒烟 runner（宿主注入）：(module_name, module) -> bool
         self.smoke_runner = None
+        # 事件总线（Kernel 注入）：切换后广播 brain.switched(module_name, version)
+        # —— 运行中的 Agent 可订阅热切换领域模块（准热 → 热）
+        self.eventbus = None
+
+    # ---------- 审计 ----------
+
+    def _audit(self, action, name, version, detail=""):
+        """记录升级操作到 <data>/brain/updates.log（JSON 行，可追溯）。"""
+        try:
+            log_path = self.root / "updates.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            record = json.dumps(
+                {
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "action": action,
+                    "module": name,
+                    "version": version,
+                    "detail": detail,
+                },
+                ensure_ascii=False,
+            )
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(record + "\n")
+        except OSError:
+            pass  # 审计失败不阻断升级流程
+
+    def _notify_switched(self, name, version):
+        """切换成功后广播事件（热切换接线点）。"""
+        if self.eventbus is not None:
+            self.eventbus.emit("brain.switched", (name, version))
 
     # ---------- 首启安装与启动级回滚 ----------
 
@@ -62,7 +97,11 @@ class Updater:
             try:
                 self.load(name)
             except Exception:
-                self.rollback(name)
+                # 启动级回滚：优先退回最近可用版本；无旧版本可回退时
+                # 兜底重建 v1.0（覆盖损坏版本，保证应用可启动）
+                if self.rollback(name) is None:
+                    self._install_builtin(name)
+                    self._audit("rebuild", name, "v1.0", detail="active 损坏且无旧版本可回退")
 
     def _install_builtin(self, name):
         src = self._builtin_source(name)
@@ -126,21 +165,29 @@ class Updater:
             raise ValueError(f"版本不存在：{name} {version}")
         self._load_version(name, version)  # 预检，失败不切换
         self._write_active(name, version)
+        self._audit("switch", name, version)
+        self._notify_switched(name, version)
 
     def rollback(self, name):
-        """回滚 active 到最近一个可加载的旧版本。返回新版本号或 None。"""
-        versions = self.list_versions(name)
+        """回滚 active 到版本序列中 current 之前的最近可用版本（更旧才回退）。
+
+        例如 v1.1 → v1.0；从 v1.0 回退返回 None（没有更旧版本）。
+        """
+        versions = self.list_versions(name)  # 升序
         current = self.active_version(name)
         if not versions or current is None:
             return None
-        for version in reversed(versions):
-            if version == current:
-                continue
+        if current not in versions:
+            return None
+        older = versions[: versions.index(current)]
+        for version in reversed(older):
             try:
                 self._load_version(name, version)
             except Exception:
                 continue
             self._write_active(name, version)
+            self._audit("rollback", name, version)
+            self._notify_switched(name, version)
             return version
         return None
 
@@ -232,4 +279,6 @@ class Updater:
             shutil.rmtree(version_dir, ignore_errors=True)
             raise ValueError(f"安装后加载失败：{exc}")
         self._write_active(name, version)
+        self._audit("install", name, version, detail=str(Path(candidate_dir)))
+        self._notify_switched(name, version)
         return version
