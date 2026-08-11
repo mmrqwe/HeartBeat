@@ -20,7 +20,9 @@ from PySide6.QtWidgets import (
 from gui import theme
 
 
-BUBBLE_WIDTH = 300  # 气泡固定宽度（markdown 布局与高度计算都依赖它）
+BUBBLE_MIN_W = 120   # 气泡最小宽度（短消息也不会太窄）
+BUBBLE_MAX_W = 380   # 气泡最大宽度（超过后换行，受窗口宽度约束）
+BUBBLE_MARGIN = 10   # 气泡内边距（与 documentMargin 一致）
 
 
 def _make_bubble(role):
@@ -32,12 +34,13 @@ def _make_bubble(role):
     bubble.viewport().setAutoFillBackground(False)  # QSS 背景作用于 frame，viewport 需透明
     bubble.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
     bubble.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-    bubble.setMaximumWidth(BUBBLE_WIDTH)
-    bubble.setFixedWidth(BUBBLE_WIDTH)
+    # 宽度不固定：由 _sync_bubble_height 按内容自然宽度自适应（短消息窄气泡），
+    # 超长内容最多撑到 BUBBLE_MAX_W 后换行，避免超宽单词横向溢出。
+    bubble.setMaximumWidth(BUBBLE_MAX_W)
     # 超长无空格单词（URL/代码串）按任意位置断行，避免横向溢出被裁剪；
     # 正常文本仍按词边界/中文逐字换行，不受影响。
     bubble.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
-    bubble.document().setDocumentMargin(10)  # 内边距（QSS padding 对 QTextEdit 无效）
+    bubble.document().setDocumentMargin(BUBBLE_MARGIN)  # 内边距（QSS padding 对 QTextEdit 无效）
     return bubble
 
 
@@ -172,12 +175,33 @@ class ChatWindow(QWidget):
         self._render_message("assistant", "", time.strftime("%H:%M"))
         self._scroll_to_bottom()
 
-    def _estimate_height(self, bubble, text, markdown):
+    def _natural_bubble_width(self, bubble, text, markdown):
+        """按内容自然宽度（不换行渲染）计算气泡宽度，clamp 到 [MIN, MAX]。
+
+        短消息（“你好”/“在吗”）只占一小段，长消息撑到上限后换行，
+        避免固定宽度气泡在界面里显得生硬。流式半成品用纯文本估算会
+        略偏宽（md 符号计入宽度），finish_stream 用 markdown 重算自愈。
+        """
+        probe = QTextDocument()
+        opt = QTextOption()
+        opt.setWrapMode(QTextOption.NoWrap)
+        probe.setDefaultTextOption(opt)
+        probe.setDefaultFont(bubble.font())
+        probe.setDocumentMargin(bubble.document().documentMargin())
+        if markdown:
+            probe.setMarkdown(text)
+        else:
+            probe.setPlainText(text)
+        probe.adjustSize()
+        natural = int(probe.size().width()) + 2  # 边框缓冲
+        return max(BUBBLE_MIN_W, min(natural, BUBBLE_MAX_W))
+
+    def _estimate_height(self, bubble, text, markdown, width):
         """用独立 QTextDocument 探针估算气泡高度。
 
         不直接改真实 document 的 textWidth（会污染 QTextEdit 内部布局）。
-        探针与真实气泡同字体/同内边距/同换行模式；textWidth 用 276（300 - 左右
-        margin - 边框缓冲）保守偏窄，保证估算高度 ≥ 真实需要、内容不被裁剪。
+        探针与真实气泡同字体/同内边距/同换行模式；textWidth 按当前气泡
+        宽度保守偏窄，保证估算高度 ≥ 真实需要、内容不被裁剪。
         """
         probe = QTextDocument()
         opt = QTextOption()
@@ -189,21 +213,22 @@ class ChatWindow(QWidget):
             probe.setMarkdown(text)
         else:
             probe.setPlainText(text)
-        probe.setTextWidth(BUBBLE_WIDTH - 2 * probe.documentMargin() - 4)
+        probe.setTextWidth(width - 2 * probe.documentMargin() - 4)
         probe.adjustSize()
         return max(int(probe.size().height()) + 8, 24)
 
     def _sync_bubble_height(self, bubble, text, markdown=True):
-        """按内容估算高度固定气泡（流式高频更新同样依赖此机制）。
+        """按内容自适应宽度 + 估算高度固定气泡（流式高频更新同样依赖此机制）。
 
-        已显示且有真实布局高度时（document 已按真实字体/宽度 layout），
-        取两者较大值；再延迟一帧用真实布局修正，消除字体替换/宽度差异
-        导致的估算偏差（任何环境下都不裁剪内容）。
+        宽度 = 内容自然宽度（上限 BUBBLE_MAX_W），高度用独立探针估算；
+        已显示且有真实布局高度时取两者较大值，再延迟一帧用真实布局修正，
+        消除字体替换/宽度差异导致的估算偏差（任何环境下都不裁剪内容）。
         """
         if bubble is None:
             return
-        bubble.setFixedWidth(BUBBLE_WIDTH)
-        est = self._estimate_height(bubble, text, markdown)
+        width = self._natural_bubble_width(bubble, text, markdown)
+        bubble.setFixedWidth(width)
+        est = self._estimate_height(bubble, text, markdown, width)
         real = bubble.document().size().height()
         bubble.setFixedHeight(max(int(real) if real > 0 else est, est, 24))
         # 气泡自身的 isVisible 在 addWidget 后布局映射前为 False，须用顶层窗口判断
