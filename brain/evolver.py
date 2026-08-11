@@ -55,11 +55,26 @@ class Evolver:
 
     # ---------- 当前源码 ----------
 
+    def _package_active(self):
+        """brain 包 active？包模式下 memory/planner 的进化单元是包：
+        LLM 只生成目标单文件，其余文件从 active 包拷贝组装成新包版本。"""
+        upd = self.updater
+        if "brain" not in upd.BUILTIN_MODULES:
+            return False
+        return bool(upd.active_version("brain"))
+
     def current_source(self, name):
-        """读当前 active 版本的完整源码（进化基准 = 正在运行的实现）。"""
+        """读当前 active 版本的完整源码（进化基准 = 正在运行的实现）。
+        包模式下 memory/planner 读 brain 包内对应文件。"""
         version = self.updater.active_version(name)
         if not version:
             raise ValueError(f"{name} 尚未安装（先 ensure_installed）")
+        if self._package_active():
+            files = self.updater.source_files("brain")
+            key = f"{name}.py"
+            if key not in files:
+                raise FileNotFoundError(f"brain 包内缺少 {key}")
+            return files[key]
         src = self.updater.root / name / version / f"{name}.py"
         if not src.is_file():
             raise FileNotFoundError(f"active 版本源码缺失：{src}")
@@ -138,6 +153,11 @@ class Evolver:
         candidate_dir = self.candidate_root / f"{name}_{stamp}"
         candidate_dir.mkdir(parents=True, exist_ok=True)
         (candidate_dir / f"{name}.py").write_text(code, encoding="utf-8")
+        if self._package_active():
+            # 包模式：从 active 包拷贝其余文件，组装成完整候选包
+            for file_name, content in self.updater.source_files("brain").items():
+                (candidate_dir / file_name).write_text(content, encoding="utf-8")
+            (candidate_dir / f"{name}.py").write_text(code, encoding="utf-8")
         return candidate_dir
 
     # ---------- 安全检查（L0 前） ----------
@@ -202,10 +222,11 @@ class Evolver:
                     feedback = "；".join(errors)
                     continue
                 status("运行验证（语法/接口契约/冒烟）…")
-                ok, v_errors = self.updater.validate_candidate(name, candidate_dir)
+                install_name = "brain" if self._package_active() else name
+                ok, v_errors = self.updater.validate_candidate(install_name, candidate_dir)
                 if ok:
                     status("验证通过，安装中…")
-                    version = self.updater.install_candidate(name, candidate_dir)
+                    version = self.updater.install_candidate(install_name, candidate_dir)
                     return version
                 feedback = "；".join(v_errors)
             finally:

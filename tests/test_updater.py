@@ -252,19 +252,26 @@ def test_startup_rebuild_when_no_older(tmp_path):
 
 
 def test_end_to_end_evolve_cycle(tmp_path):
-    """安装增强版 memory → Agent 实测新规则生效 → 回滚 → 新 Agent 恢复旧行为。"""
+    """安装增强版 memory（brain 包内，阶段2 包模式）→ Agent 实测新规则生效
+    → 回滚 → 新 Agent 恢复内置行为。"""
     upd = _make_updater(tmp_path)
-    cand = _write_candidate(tmp_path, "memory", _evolved_memory_source())
-    upd.install_candidate("memory", cand)
+    # 组装候选包：active brain 包全部文件 + 增强版 memory.py
+    files = upd.source_files("brain")
+    cand = Path(tmp_path) / "cand_pkg"
+    cand.mkdir()
+    for fname, content in files.items():
+        (cand / fname).write_text(content, encoding="utf-8")
+    (cand / "memory.py").write_text(_evolved_memory_source(), encoding="utf-8")
+    upd.install_candidate("brain", cand)
 
-    # 进化后：Agent 走 updater 加载 → 新规则生效（独立数据目录，隔离历史）
+    # 进化后：Agent 走 updater 加载 brain 包 → 新规则生效（独立数据目录，隔离历史）
     ag = _make_agent(Path(tempfile.mkdtemp()), brain_loader=upd)
     assert type(ag.memory_module).__name__ == "MemoryModule"
     ag.memory_module.extract_facts("进化验证")
     assert _has_evolved_fact(ag), "增强版规则未生效"
 
     # 回滚后：新 Agent 恢复内置行为（不再识别进化标记）
-    upd.rollback("memory")
+    upd.rollback("brain")
     ag2 = _make_agent(Path(tempfile.mkdtemp()), brain_loader=upd)
     ag2.memory_module.extract_facts("进化验证")
     assert not _has_evolved_fact(ag2), "回滚后增强规则应消失"
@@ -405,6 +412,12 @@ _PACKAGE_FILES = {
         "    def chat(self, text):\n        return 'pkg:' + str(text)\n"
         "    def think(self, *a, **k):\n        return None\n"
         "    def tick(self, *a, **k):\n        return None\n"
+        "    def reload(self, *a, **k):\n        return None\n"
+        "    def reload_brain_modules(self, *a, **k):\n        return True\n"
+        "    def append_chat(self, *a, **k):\n        return 1\n"
+        "    def clear_chat_history(self, *a, **k):\n        return None\n"
+        "    def reindex_async(self, *a, **k):\n        return None\n"
+        "    def patrol_topics(self, *a, **k):\n        return []\n"
     ),
     "memory.py": (
         "class MemoryModule:\n"
@@ -500,7 +513,8 @@ def test_package_rejects_missing_submodule(tmp_path):
 
 
 def test_package_install_load_and_source(tmp_path):
-    upd = _make_updater(tmp_path)
+    upd = Updater(tmp_path)
+    upd.smoke_runner = smoke_test_module
     cand = _write_package_candidate(tmp_path)
     version = upd.install_candidate("brain", cand)
     assert version == "v0.1"
@@ -523,7 +537,8 @@ def test_package_install_load_and_source(tmp_path):
 
 
 def test_package_install_bad_no_change(tmp_path):
-    upd = _make_updater(tmp_path)
+    upd = Updater(tmp_path)
+    upd.smoke_runner = smoke_test_module
     good = _write_package_candidate(tmp_path)
     upd.install_candidate("brain", good)
     # 坏候选（agent.py 语法错误）安装必须失败且不破坏现有 active
@@ -541,15 +556,13 @@ def test_package_install_bad_no_change(tmp_path):
 
 
 def test_package_rollback(tmp_path):
-    upd = _make_updater(tmp_path)
+    upd = Updater(tmp_path)
+    upd.smoke_runner = smoke_test_module
     v1 = _write_package_candidate(tmp_path)
     upd.install_candidate("brain", v1)
     files = dict(_PACKAGE_FILES)
-    files["agent.py"] = (
-        "class Agent:\n"
-        "    def chat(self, text):\n        return 'v2:' + str(text)\n"
-        "    def think(self, *a, **k):\n        return None\n"
-        "    def tick(self, *a, **k):\n        return None\n"
+    files["agent.py"] = files["agent.py"].replace(
+        "'pkg:' + str(text)", "'v2:' + str(text)"
     )
     v2 = _write_package_candidate(tmp_path, files)
     assert upd.install_candidate("brain", v2) == "v0.2"

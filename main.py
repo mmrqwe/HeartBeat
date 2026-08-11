@@ -48,7 +48,7 @@ class HeartBeatApp:
         self.data_dir = self.kernel.data_dir
         self.db = db.Database(self.data_dir / "heartbeat.db")
         self.stats = core.Stats(self.db)
-        self.agent = agent.Agent(
+        self.agent = agent.create_agent(
             self.cfg,
             self.plugins,
             self.data_dir,

@@ -25,7 +25,7 @@ from typing import Any
 from . import toolsafety
 
 # 可进化模块清单（brain 层，允许 AI 替换升级）
-BUILTIN_MODULES = ("memory", "planner")
+BUILTIN_MODULES = ("memory", "planner", "brain")
 
 # 包模块：版本单元是目录（多文件 + __init__.py + _contract.py），
 # 整体版本化（active 指向整个包版本，禁止包内混版本）。
@@ -57,8 +57,12 @@ REQUIRED_METHODS = {
         "pick_search_topic", "patrol_topics", "maybe_save_thought",
         "build_time_context", "build_recent_thread",
     },
-    # brain 包内 agent.py 的 Agent 类（控制流契约，阶段3 冒烟再扩展）
-    "Agent": {"chat", "think", "tick"},
+    # brain 包内 agent.py 的 Agent 类（控制流契约 = 宿主调用面：
+    # main.py/runtime/UI 直接调用的公开方法；阶段3 冒烟再扩展）
+    "Agent": {
+        "chat", "think", "reload", "reload_brain_modules",
+        "append_chat", "clear_chat_history", "reindex_async", "patrol_topics",
+    },
     "MemoryModule": {
         "remember", "relevant", "profile", "extract_facts",
         "followup_candidate", "parse_schedule_expiry", "format_memories",
@@ -163,11 +167,57 @@ class Updater:
                     self._audit("rebuild", name, "v1.0", detail="active 损坏且无旧版本可回退")
 
     def _install_builtin(self, name):
+        if name in PACKAGE_MODULES:
+            self._install_builtin_package(name)
+            return
         src = self._builtin_source(name)
         version_dir = self.root / name / "v1.0"
         version_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, version_dir / f"{name}.py")
         self._write_active(name, "v1.0")
+
+    # 包模块内置文件清单：PACKAGE_LAYOUT 三件套 + Agent 运行依赖
+    # （evolver 被 agent 直接引用；__init__/_contract 为包入口与契约声明）
+    _PACKAGE_BUNDLE = ("agent.py", "agent_chat.py", "agent_think.py",
+                       "memory.py", "planner.py", "evolver.py")
+    _PACKAGE_INIT = (
+        "from .agent import Agent\n"
+        "from .memory import MemoryModule\n"
+        "from .planner import Planner\n"
+    )
+    _PACKAGE_CONTRACT = (
+        "# 候选包契约声明：必须与内核 PACKAGE_LAYOUT 完全一致\n"
+        "EXPORTS = {'agent.py': 'Agent', 'memory.py': 'MemoryModule', "
+        "'planner.py': 'Planner'}\n"
+    )
+
+    def _install_builtin_package(self, name):
+        """包模块首启安装：从内置源（开发=项目 brain/，frozen=_MEIPASS/brain）
+        拷 PACKAGE_BUNDLE 文件 + 生成 __init__.py/_contract.py → v1.0。"""
+        version_dir = self.root / name / "v1.0"
+        version_dir.mkdir(parents=True, exist_ok=True)
+        src_dir = self._builtin_package_dir(name)
+        for file_name in self._PACKAGE_BUNDLE:
+            src = src_dir / file_name
+            if not src.is_file():
+                raise FileNotFoundError(f"内置包源码缺失：{src}")
+            shutil.copy2(src, version_dir / file_name)
+        (version_dir / "__init__.py").write_text(self._PACKAGE_INIT, encoding="utf-8")
+        (version_dir / "_contract.py").write_text(self._PACKAGE_CONTRACT, encoding="utf-8")
+        self._write_active(name, "v1.0")
+
+    def _builtin_package_dir(self, name):
+        """内置包源目录：开发模式=项目 brain/；frozen=_MEIPASS/brain。"""
+        candidates = [
+            Path(__file__).resolve().parent.parent / "brain",
+            Path(getattr(sys, "_MEIPASS", "/nonexistent")) / "brain",
+        ]
+        for path in candidates:
+            if (path / "agent.py").is_file():
+                return path
+        raise FileNotFoundError(
+            f"内置包 {name} 源码不可用（frozen 打包需 --add-data brain:brain）"
+        )
 
     def _builtin_source(self, name):
         """内置源码路径：开发模式=项目源码；frozen=_MEIPASS/brain（打包 add-data）。"""

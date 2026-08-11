@@ -44,7 +44,7 @@ def _load(config_path=None):
     updater = Updater(data_dir)
     updater.smoke_runner = smoke_test_module
     updater.ensure_installed()
-    ag = agent.Agent(
+    ag = agent.create_agent(
         cfg, plugins, data_dir, stats=stats, db=database, brain_loader=updater
     )
     return cfg_path, cfg, database, stats, plugins, ag

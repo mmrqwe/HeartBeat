@@ -75,13 +75,19 @@ def _make_evolver(tmp_path, fake_brain):
 
 
 def test_evolve_pipeline_success(tmp_path):
-    """全链路：生成候选 → 安全/契约/冒烟验证 → v1.1 安装 → 新方法生效。"""
+    """全链路：生成候选 → 安全/契约/冒烟验证 → 安装 → 新方法生效。
+
+    阶段2 包模式：brain 包 active 时 evolve('planner') = 升级包内 planner.py，
+    整体安装为新包版本（v1.0 → v1.1）。
+    """
     ev = _make_evolver(tmp_path, FakeBrain([PLANNER_EVOLVED]))
     version = ev.evolve("planner", "每天上午9点提醒我喝水")
     assert version == "v1.1"
-    # active 已切换且可加载，新方法真实存在
-    module = ev.updater.load("planner")
-    assert hasattr(getattr(module, "Planner"), "drink_reminder")
+    assert ev.updater.active_version("brain") == "v1.1"
+    # active 包已切换且可加载，新方法真实存在
+    module = ev.updater.load("brain")
+    sub = sys.modules[f"{module.__name__}.planner"]
+    assert hasattr(getattr(sub, "Planner"), "drink_reminder")
     # 候选目录已清理
     assert not list(ev.candidate_root.glob("*"))
     # 审计有 install 记录
