@@ -135,23 +135,65 @@ def test_gather(monkeypatch):
 # ---------- 插件：天气 ----------
 
 def test_weather_collect(monkeypatch):
-    monkeypatch.setattr(
-        core,
-        "http_json",
-        lambda url, timeout=10: {
-            "current_condition": [{
-                "temp_C": "18",
-                "FeelsLikeC": "17",
-                "weatherDesc": [{"value": "Cloudy"}],
-                "humidity": "66",
-                "windspeedKmph": "12",
-            }]
-        },
-    )
-    monkeypatch.setattr(core, "http_text", lambda url, timeout=10: "多云")
+    def fake_http(url, timeout=12):
+        if "format=j1" in url:
+            return json.dumps({
+                "current_condition": [{
+                    "temp_C": "18",
+                    "FeelsLikeC": "17",
+                    "weatherDesc": [{"value": "Cloudy"}],
+                    "humidity": "66",
+                    "windspeedKmph": "12",
+                }]
+            })
+        return "多云"
+
+    monkeypatch.setattr(core, "http_text", fake_http)
     entries = weather.collect({"city": "shanghai"})
     assert "多云" in entries[0]["text"]
     assert entries[0]["data"]["temp"] == 18
+
+
+def test_weather_collect_retries_ssl_eof(monkeypatch):
+    """wttr.in 偶发 SSL 断连：前两次失败第三次成功，应自愈。"""
+    calls = {"n": 0}
+
+    def flaky(url, timeout=12):
+        calls["n"] += 1
+        if "format=j1" in url and calls["n"] <= 2:
+            raise OSError(
+                "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol"
+            )
+        if "format=j1" in url:
+            return json.dumps({
+                "current_condition": [{
+                    "temp_C": "18",
+                    "FeelsLikeC": "17",
+                    "weatherDesc": [{"value": "Cloudy"}],
+                    "humidity": "66",
+                    "windspeedKmph": "12",
+                }]
+            })
+        return "多云"
+
+    monkeypatch.setattr(core, "http_text", flaky)
+    monkeypatch.setattr(weather, "_RETRY_DELAY", 0)  # 测试不等真实退避
+    entries = weather.collect({"city": "shanghai"})
+    assert entries[0]["data"]["temp"] == 18
+    assert calls["n"] >= 3  # j1 第三次才成功
+
+
+def test_weather_collect_retry_exhausted(monkeypatch):
+    def broken(url, timeout=12):
+        raise OSError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred")
+
+    monkeypatch.setattr(core, "http_text", broken)
+    monkeypatch.setattr(weather, "_RETRY_DELAY", 0)
+    try:
+        weather.collect({"city": "shanghai"})
+        assert False, "should raise after retries exhausted"
+    except OSError:
+        pass
 
 
 def test_weather_suggest():
