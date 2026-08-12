@@ -23,6 +23,7 @@ TOOL_RESULT_LIMIT = 4000  # 单次工具结果注入上下文的上限（字符�
 HISTORY_STEP_LIMIT = 24   # 上下文里保留的最近消息条数（truncate keep_recent）
 BUDGET_TOKENS = 24000     # 每轮 LLM 调用的消息 token 预算
 SUMMARY_MAX_TOKENS = 600  # 最终总结的输出预算
+TOOL_OUTPUT_TOKENS = 8192  # 每轮工具调用的输出上限（写文件等长参数需要大值）
 
 CODING_SYSTEM = """你是{owner}的编码伙伴，住在桌面宠物里。你要在主人的真实代码项目里完成编程任务：阅读代码、修改文件、运行构建与测试。
 
@@ -113,7 +114,9 @@ def run_coding_task(brain, cfg, user_request, run_tool,
             list(messages), BUDGET_TOKENS, keep_recent=HISTORY_STEP_LIMIT
         )
         try:
-            content, tool_calls = brain.complete_tools(messages, decls)
+            content, tool_calls = brain.complete_tools(
+                messages, decls, max_tokens=TOOL_OUTPUT_TOKENS
+            )
         except Exception as exc:
             if on_status:
                 on_status("⚠️ 模型调用失败，任务中断")

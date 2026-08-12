@@ -478,7 +478,7 @@ class _FakeBrain:
         self.raise_on_call = raise_on_call
         self.calls = []
 
-    def complete_tools(self, messages, decls):
+    def complete_tools(self, messages, decls, max_tokens=None):
         self.calls.append(("tools", len(messages)))
         if self.raise_on_call and len(self.calls) >= self.raise_on_call:
             raise RuntimeError("boom")

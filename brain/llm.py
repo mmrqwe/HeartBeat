@@ -568,9 +568,13 @@ class Brain:
         self._consume_energy()
         return data["choices"][0]["message"]["content"].strip()
 
-    def complete_tools(self, messages, tools):
-        """带工具声明的一次模型调用，返回 (content, tool_calls)。"""
-        reasoning = self._reasoning_params(500)
+    def complete_tools(self, messages, tools, max_tokens=None):
+        """带工具声明的一次模型调用，返回 (content, tool_calls)。
+
+        max_tokens：输出 token 上限（默认 500 适合对话；长产物场景如编码
+        写文件需要传大值，否则大参数 JSON 被截断后网关会丢 tool_calls）。
+        """
+        reasoning = self._reasoning_params(max_tokens or 500)
         payload = {
             "model": self.cfg["api"]["model"],
             "messages": messages,
@@ -580,7 +584,7 @@ class Brain:
         if reasoning:
             payload.update(reasoning)
         else:
-            payload.update({"temperature": 0.7, "max_tokens": 500})
+            payload.update({"temperature": 0.7, "max_tokens": max_tokens or 500})
         data = self._post_chat(payload)
         self._consume_energy()
         message = data["choices"][0]["message"]
