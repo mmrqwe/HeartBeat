@@ -462,6 +462,9 @@ class Agent(ChatMixin, ThinkMixin):
         安全基座在 kernel（pathguard/processpool/权限判定），控制循环在
         brain.coding_agent（策略层）。工具以 SOURCE_USER 执行——写操作
         走 confirm 档用户确认，与聊天路径的 confirm_cb 共用同一弹窗。
+
+        宿主委托层：本方法不在 REQUIRED_METHODS 契约内；旧包快照无此
+        方法时由宿主工厂 agent._inject_host_delegates 注入等价实现。
         """
         # 绝对导入（与 Evolver 同理）：brain 包化安装时包内只有控制流
         # 四件套，coding_agent 始终来自宿主源码——宿主缺失时会直接报错。

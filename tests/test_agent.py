@@ -6,6 +6,7 @@ import random
 import sqlite3
 import threading
 import time
+import types
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -1472,6 +1473,122 @@ def test_live_sleep_and_energy_exhausted(tmp_path):
     b._consume_energy(1000)
     assert b.live({"collections": []}) is None
     assert any(i["kind"] == "rest" for i in b.state["activity_log"])
+
+
+# ---------- 宿主委托注入（coding_task 契约分层） ----------
+
+def _install_stale_brain_package(tmp_path):
+    """构造旧 brain 包快照：v1.0 的 Agent 类无 coding_task（真实用户现状）。"""
+    import kernel.updater as updater_mod
+
+    pkg_base = tmp_path / "brain" / "brain"
+    pkg_dir = pkg_base / "v1.0"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "__init__.py").write_text("from .agent import Agent\n", encoding="utf-8")
+    (pkg_dir / "_contract.py").write_text("EXPORTS = {'agent.py': 'Agent'}\n", encoding="utf-8")
+    (pkg_dir / "agent.py").write_text(
+        "class Agent:\n"
+        "    def __init__(self, cfg, plugins, data_dir, stats=None, db=None,\n"
+        "                 brain_loader=None, clock=None, embed_queue=None):\n"
+        "        self.cfg = cfg\n"
+        "        self.plugins = plugins\n"
+        "        self.data_dir = data_dir\n"
+        "        self.stats = stats\n"
+        "        self.db = db\n"
+        "        self.brain_loader = brain_loader\n"
+        "        self.clock = clock\n"
+        "        self.embed_queue = embed_queue\n",
+        encoding="utf-8",
+    )
+    (pkg_base / "active").write_text("v1.0\n", encoding="utf-8")
+    return updater_mod.Updater(tmp_path)
+
+
+def test_create_agent_injects_coding_task_for_stale_package(tmp_path):
+    """旧 brain 包快照（Agent 类无 coding_task）→ 工厂注入宿主等价实现。"""
+    loader = _install_stale_brain_package(tmp_path)
+    ag = agent.create_agent(_cfg(), data_dir=tmp_path, brain_loader=loader)
+    assert ag.__class__.__name__ == "Agent"
+    assert callable(ag.coding_task)
+    assert getattr(ag.coding_task, "__func__", None) is agent._host_coding_task
+
+
+def test_inject_respects_existing_coding_task(tmp_path):
+    """实例已有 coding_task（内置类方法/用户自定义）→ 不覆盖，幂等。"""
+    a = _make_agent(tmp_path)  # 内置 Agent 类自带类方法
+    own = getattr(a.coding_task, "__func__", None)
+    agent._inject_host_delegates(a)
+    agent._inject_host_delegates(a)  # 幂等
+    assert getattr(a.coding_task, "__func__", None) is own
+    assert own is agent.Agent.coding_task  # 仍是类方法，未被实例属性遮蔽
+    fake = types.SimpleNamespace()
+    fake.coding_task = "user-custom"
+    agent._inject_host_delegates(fake)
+    assert fake.coding_task == "user-custom"
+
+
+def test_host_coding_task_adapts_stale_run_tool(monkeypatch):
+    """旧包 _run_tool 无 project_dir → 直连宿主 tools.execute（含 project_dir）。"""
+    from brain import coding_agent
+
+    fake = types.SimpleNamespace()
+    fake.cfg = _cfg()
+    fake.cfg["project_dir"] = "/tmp/proj"
+    fake.brain = object()
+    fake.tool_confirm_cb = None
+    fake._audit_tool = lambda *a, **k: None
+    seen = {}
+
+    def stale_run_tool(name, arguments, source=None):
+        raise AssertionError("旧 _run_tool 无法透传 project_dir，不应被编码路径调用")
+
+    fake._run_tool = stale_run_tool
+    monkeypatch.setattr(
+        tools, "execute",
+        lambda name, args, **kw: seen.update(name=name, args=args, **kw) or "exec-ok",
+    )
+
+    captured = {}
+
+    def fake_loop(brain, cfg, text, run, **kw):
+        captured["result"] = run("write_file", {"path": "a.txt"})
+        return "done"
+
+    monkeypatch.setattr(coding_agent, "run_coding_task", fake_loop)
+    assert agent._host_coding_task(fake, "task") == "done"
+    assert captured["result"] == "exec-ok"
+    assert seen["name"] == "write_file"
+    assert seen["source"] == tools.SOURCE_USER
+    assert seen["project_dir"] == "/tmp/proj"
+    assert seen["mode"] == _cfg()["shell_tools_mode"]
+
+
+def test_host_coding_task_passes_project_dir_when_supported(monkeypatch):
+    """新版 _run_tool 支持 project_dir → 注入闭包正常透传。"""
+    from brain import coding_agent
+
+    fake = types.SimpleNamespace()
+    fake.cfg = {"project_dir": "/tmp/proj"}
+    fake.brain = object()
+    seen = {}
+
+    def new_run_tool(name, arguments, source=None, project_dir=""):
+        seen.update(name=name, args=arguments, source=source,
+                    project_dir=project_dir)
+        return "new-ok"
+
+    fake._run_tool = new_run_tool
+
+    captured = {}
+
+    def fake_loop(brain, cfg, text, run, **kw):
+        captured["result"] = run("write_file", {"path": "a.txt"})
+        return "done"
+
+    monkeypatch.setattr(coding_agent, "run_coding_task", fake_loop)
+    agent._host_coding_task(fake, "task")
+    assert captured["result"] == "new-ok"
+    assert seen["project_dir"] == "/tmp/proj"
 
 
 if __name__ == "__main__":
