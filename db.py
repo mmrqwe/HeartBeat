@@ -11,6 +11,32 @@ VEC_DIM = 512  # BAAI/bge-small-zh-v1.5 的向量维度
 DEFAULT_MEMORY_CAP = 500  # 记忆条数上限（可被配置 memory_cap 覆盖）
 
 
+def _merge_replace(text, old, new):
+    """替换 text 中所有 old，并修复与相邻字的重复：
+
+    old 前一字 == new 首字 → 把前一字并入替换范围（“喝咖啡”→“喝茶”，
+    不产生“喝喝茶”）；old 后一字 == new 尾字 → 后一字并入（“咖啡豆”→
+    “咖啡”，不产生“咖啡咖啡”）。返回替换后的文本。
+    """
+    out = []
+    i = 0
+    n = len(old)
+    while True:
+        j = text.find(old, i)
+        if j < 0:
+            out.append(text[i:])
+            break
+        start, end = j, j + n
+        if start > 0 and new and text[start - 1] == new[0]:
+            start -= 1
+        if end < len(text) and new and text[end] == new[-1]:
+            end += 1
+        out.append(text[i:start])
+        out.append(new)
+        i = end
+    return "".join(out)
+
+
 class EventType:
     """事件时间线类型常量（P1 Event Store）：集中管理防拼写错误。
 
@@ -140,6 +166,7 @@ class Database:
                 ("source", "TEXT NOT NULL DEFAULT 'chat'"),
                 ("expires_at", "TEXT"),
                 ("last_used_at", "TEXT"),
+                ("updated_at", "TEXT"),
             ):
                 if col not in mem_columns:
                     self._conn.execute(f"ALTER TABLE memory ADD COLUMN {col} {ddl}")
@@ -216,6 +243,90 @@ class Database:
                 (str(text or "").strip(),),
             ).fetchone()
         return row["id"] if row else None
+
+    def find_fact_like(self, keyword):
+        """模糊定位第一条包含关键词的事实（纠错路径找旧记忆）。
+
+        LLM 引用的旧记忆原文可能与库内文本有细微差异（空格/标点），
+        精确匹配失败后用 LIKE 兜底；% 与 _ 从关键词中剔除防通配注入。
+        """
+        escaped = str(keyword or "").replace("%", "").replace("_", "").strip()
+        if not escaped:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM memory WHERE role='fact' AND text LIKE ? "
+                "ORDER BY id DESC LIMIT 1",
+                (f"%{escaped}%",),
+            ).fetchone()
+        return row["id"] if row else None
+
+    def memory_item(self, item_id):
+        """按 id 取单条记忆（纠错后重嵌向量用）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, role, text, created_at AS time, category, importance, "
+                "source, expires_at, last_used_at, updated_at FROM memory "
+                "WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_memory_text(self, item_id, text):
+        """原地更正记忆文本：保留 id/created_at/category，记录 updated_at。
+
+        返回受影响行数（0/1）。向量由调用方重嵌（update 后旧向量与新文本
+        不一致，检索层按 rowid 回查 base 表取新文本，仅排序语义略旧）。
+        """
+        text = str(text or "").strip()
+        if not text:
+            return 0
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE memory SET text = ?, updated_at = ? WHERE id = ?",
+                (text, time.strftime("%Y-%m-%d %H:%M"), item_id),
+            )
+            self._conn.commit()
+            return cur.rowcount
+
+    def replace_fact_term(self, old_term, new_term, min_len=2, max_rows=2):
+        """把事实文本中的旧词原地替换为新词（“不是X，是Y”纠错）。
+
+        护栏：① 词长下限防短词误伤；② 已含新词的行跳过（防“长电”→“长电科技”
+        导致“长电科技科技”式增长）；③ 受影响行数上限——超过视为旧词太泛，
+        返回空列表（调用方降级 LLM 精确处理）；④ 相邻字重叠修复——旧词前一字
+        与新词首字相同（“喝咖啡”→“喝茶”）时把前一字并入替换范围，防“喝喝茶”
+        式残片；旧词后一字与新词尾字相同同理。
+        返回受影响的事实 id 列表（供调用方重嵌向量）。
+        """
+        old_term = str(old_term or "").strip()
+        new_term = str(new_term or "").strip()
+        if len(old_term) < min_len or not new_term or old_term == new_term:
+            return []
+        old_esc = old_term.replace("%", "").replace("_", "")
+        new_esc = new_term.replace("%", "").replace("_", "")
+        if not old_esc or not new_esc:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, text FROM memory WHERE role='fact' AND text LIKE ? "
+                "AND text NOT LIKE ?",
+                (f"%{old_esc}%", f"%{new_esc}%"),
+            ).fetchall()
+            if not rows or len(rows) > max_rows:
+                return []
+            ids = []
+            for row in rows:
+                new_text = _merge_replace(row["text"], old_term, new_term)
+                if not new_text or new_text == row["text"]:
+                    continue
+                self._conn.execute(
+                    "UPDATE memory SET text = ?, updated_at = ? WHERE id = ?",
+                    (new_text, time.strftime("%Y-%m-%d %H:%M"), row["id"]),
+                )
+                ids.append(row["id"])
+            self._conn.commit()
+            return ids
 
     def memory_profile(self, limit_per=3, roles=None, now=None):
         """按类别分组的记忆画像：每类取 importance 最高的 limit_per 条。
@@ -620,6 +731,19 @@ class Database:
             self._conn.commit()
         return True
 
+    def remove_embedding(self, table, row_id):
+        """删除单条向量行（纠错重嵌失败时保底，让 reindex 按新文本补嵌）。"""
+        if not self.vec_ready:
+            return False
+        if table not in ("memory", "chat"):
+            raise ValueError("table must be memory or chat")
+        with self._lock:
+            self._conn.execute(
+                f"DELETE FROM {table}_vec WHERE rowid = ?", (row_id,)
+            )
+            self._conn.commit()
+        return True
+
     def search_embeddings(self, table, vector, k=5, now=None, min_distance=None,
                           roles=None):
         """向量召回：过滤过期记忆，可选距离阈值与角色过滤。"""
@@ -739,19 +863,33 @@ class Database:
         return len(ids)
 
     def retire_memory_like(self, keyword, category=None, now=None):
-        """矛盾事实更新：把“主人喜欢 X”类旧事实标记为过期。"""
+        """矛盾事实更新：把“主人喜欢 X”类旧事实标记为过期，并同步清理
+        其向量行（此前只改 expires_at，旧向量残留靠检索层过滤是隐式耦合）。"""
         now = now or time.strftime("%Y-%m-%d %H:%M")
-        params = [now, f"%{keyword}%"]
+        params = [f"%{keyword}%"]
         cat_sql = ""
         if category:
             cat_sql = " AND category = ?"
             params.append(category)
         with self._lock:
+            ids = [
+                r["id"]
+                for r in self._conn.execute(
+                    "SELECT id FROM memory WHERE role='fact' AND text LIKE ?" + cat_sql,
+                    params,
+                ).fetchall()
+            ]
+            if not ids:
+                return 0
+            marks = ",".join("?" for _ in ids)
             cur = self._conn.execute(
-                "UPDATE memory SET expires_at = ? "
-                "WHERE role='fact' AND text LIKE ?" + cat_sql,
-                params,
+                f"UPDATE memory SET expires_at = ? WHERE id IN ({marks})",
+                [now] + ids,
             )
+            if self.vec_ready:
+                self._conn.execute(
+                    f"DELETE FROM memory_vec WHERE rowid IN ({marks})", ids
+                )
             self._conn.commit()
             return cur.rowcount
 
