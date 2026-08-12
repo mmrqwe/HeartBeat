@@ -1,12 +1,14 @@
 """SQLite 存储层：记忆、聊天、状态、统计、向量检索（sqlite-vec）。"""
 
 import json
+import re
 import sqlite3
 import threading
 import time
 from pathlib import Path
 
 VEC_DIM = 512  # BAAI/bge-small-zh-v1.5 的向量维度
+DEFAULT_MEMORY_CAP = 500  # 记忆条数上限（可被配置 memory_cap 覆盖）
 
 
 class Database:
@@ -165,8 +167,10 @@ class Database:
             placeholders = ",".join("?" for _ in roles)
             query += f" WHERE role IN ({placeholders})"
             params = list(roles)
-        query += " ORDER BY id DESC LIMIT ?"
-        params.append(limit)
+        query += " ORDER BY id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return [dict(row) for row in reversed(rows)]
@@ -528,13 +532,16 @@ class Database:
             self._conn.commit()
         return True
 
-    def search_embeddings(self, table, vector, k=5):
+    def search_embeddings(self, table, vector, k=5, now=None, min_distance=None,
+                          roles=None):
+        """向量召回：过滤过期记忆，可选距离阈值与角色过滤。"""
         if not self.vec_ready:
             return []
         if table not in ("memory", "chat"):
             raise ValueError("table must be memory or chat")
         base = "memory" if table == "memory" else "chat_messages"
         blob = json.dumps([float(x) for x in vector])
+        now = now or time.strftime("%Y-%m-%d %H:%M")
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT rowid, distance FROM {table}_vec "
@@ -543,15 +550,171 @@ class Database:
             ).fetchall()
             results = []
             for rowid, distance in rows:
+                if min_distance is not None and distance > min_distance:
+                    continue
                 row = self._conn.execute(
                     f"SELECT id, role, text, created_at AS time FROM {base} WHERE id = ?",
                     (rowid,),
                 ).fetchone()
-                if row:
-                    item = dict(row)
-                    item["distance"] = distance
-                    results.append(item)
+                if not row:
+                    continue
+                if roles and row["role"] not in roles:
+                    continue
+                item = dict(row)
+                item["distance"] = distance
+                if table == "memory":
+                    meta = self._conn.execute(
+                        "SELECT expires_at, importance, last_used_at, category "
+                        "FROM memory WHERE id = ?",
+                        (rowid,),
+                    ).fetchone()
+                    if not meta:
+                        continue
+                    if meta["expires_at"] and meta["expires_at"] < now:
+                        continue
+                    item["importance"] = meta["importance"]
+                    item["last_used_at"] = meta["last_used_at"]
+                    item["category"] = meta["category"]
+                results.append(item)
         return results
+
+    def search_memory_keywords(self, query, k=5, roles=("fact", "thought"), now=None):
+        """关键词兜底：向量不可用/零结果时用 LIKE（含中文二元组）检索。"""
+        now = now or time.strftime("%Y-%m-%d %H:%M")
+        text = (query or "").strip()
+        if not text:
+            return []
+        terms = set()
+        for tok in re.findall(r"[A-Za-z0-9]+", text):
+            if len(tok) >= 2:
+                terms.add(tok.lower())
+        for i in range(len(text) - 1):
+            bigram = text[i:i + 2]
+            if re.search(r"[\u4e00-\u9fff]", bigram):
+                terms.add(bigram)
+        terms = list(terms)[:8]
+        if not terms:
+            return []
+        role_sql = ""
+        params = []
+        if roles:
+            role_sql = " AND role IN ({})".format(",".join("?" for _ in roles))
+            params.extend(roles)
+        like_sql = " OR ".join("text LIKE ?" for _ in terms)
+        params.extend(f"%{t}%" for t in terms)
+        full_term = text[:30]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, role, text, created_at AS time, category, importance, "
+                "source, expires_at, last_used_at FROM memory "
+                f"WHERE (expires_at IS NULL OR expires_at >= ?){role_sql} "
+                f"AND ({like_sql}) "
+                "ORDER BY CASE WHEN text LIKE ? THEN 0 ELSE 1 END, "
+                "importance DESC, id DESC LIMIT ?",
+                [now] + params + [f"%{full_term}%", k],
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def fact_texts(self):
+        """全部事实文本（去重范围不再限于最近 20 条）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT text FROM memory WHERE role='fact'"
+            ).fetchall()
+        return {r["text"] for r in rows}
+
+    def delete_memory_like(self, keyword, category=None):
+        """显式“忘记/删除”时删除相关事实（含向量行）。"""
+        params = [f"%{keyword}%"]
+        cat_sql = ""
+        if category:
+            cat_sql = " AND category = ?"
+            params.append(category)
+        with self._lock:
+            ids = [
+                r["id"]
+                for r in self._conn.execute(
+                    "SELECT id FROM memory WHERE role='fact' AND text LIKE ?" + cat_sql,
+                    params,
+                ).fetchall()
+            ]
+            if ids:
+                marks = ",".join("?" for _ in ids)
+                self._conn.execute(
+                    f"DELETE FROM memory WHERE id IN ({marks})", ids
+                )
+                if self.vec_ready:
+                    self._conn.execute(
+                        f"DELETE FROM memory_vec WHERE rowid IN ({marks})", ids
+                    )
+                self._conn.commit()
+        return len(ids)
+
+    def retire_memory_like(self, keyword, category=None, now=None):
+        """矛盾事实更新：把“主人喜欢 X”类旧事实标记为过期。"""
+        now = now or time.strftime("%Y-%m-%d %H:%M")
+        params = [now, f"%{keyword}%"]
+        cat_sql = ""
+        if category:
+            cat_sql = " AND category = ?"
+            params.append(category)
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE memory SET expires_at = ? "
+                "WHERE role='fact' AND text LIKE ?" + cat_sql,
+                params,
+            )
+            self._conn.commit()
+            return cur.rowcount
+
+    def cleanup_memory(self, now=None, cap=DEFAULT_MEMORY_CAP):
+        """生命周期清理：删除过期项；超上限时按 importance/最近使用/新旧淘汰。
+        返回 (expired_deleted, cap_deleted)。"""
+        now = now or time.strftime("%Y-%m-%d %H:%M")
+        expired = []
+        excess = []
+        with self._lock:
+            expired = [
+                r["id"]
+                for r in self._conn.execute(
+                    "SELECT id FROM memory WHERE expires_at IS NOT NULL AND expires_at < ?",
+                    (now,),
+                ).fetchall()
+            ]
+            if expired:
+                marks = ",".join("?" for _ in expired)
+                self._conn.execute(f"DELETE FROM memory WHERE id IN ({marks})", expired)
+                if self.vec_ready:
+                    self._conn.execute(
+                        f"DELETE FROM memory_vec WHERE rowid IN ({marks})", expired
+                    )
+            rows = self._conn.execute(
+                "SELECT id, importance, last_used_at, created_at FROM memory "
+                "ORDER BY importance DESC, "
+                "(last_used_at IS NULL) ASC, last_used_at DESC, id DESC"
+            ).fetchall()
+            cap = max(0, int(cap or DEFAULT_MEMORY_CAP))
+            excess = [r["id"] for r in rows[cap:]]
+            if excess:
+                marks = ",".join("?" for _ in excess)
+                self._conn.execute(f"DELETE FROM memory WHERE id IN ({marks})", excess)
+                if self.vec_ready:
+                    self._conn.execute(
+                        f"DELETE FROM memory_vec WHERE rowid IN ({marks})", excess
+                    )
+            self._conn.commit()
+        return len(expired), len(excess)
+
+    def clear_embeddings(self, table):
+        """清空单个向量表（模型切换后重建用）。"""
+        if not self.vec_ready:
+            return False
+        if table not in ("memory", "chat"):
+            raise ValueError("table must be memory or chat")
+        with self._lock:
+            self._conn.execute(f"DELETE FROM {table}_vec")
+            self._conn.commit()
+        return True
 
     def ids_without_embedding(self, table):
         if not self.vec_ready:
@@ -617,6 +780,9 @@ class Memory:
 
     def facts(self, n=20):
         return self.db.memory_items(roles=("fact",), limit=n)
+
+    def all_facts(self):
+        return self.db.memory_items(roles=("fact",), limit=None)
 
     def thoughts(self, n=20):
         return self.db.memory_items(roles=("thought",), limit=n)

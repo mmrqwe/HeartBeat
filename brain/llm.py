@@ -109,17 +109,33 @@ MOOD_STYLE = {
     "平静": "语气平和，回复节奏正常。",
     "开心": "语气轻快、有活力，可以更热情，偶尔卖个萌。",
     "有点蔫": "话少一点，句子更短，语气软软的，但不要消极抱怨。",
-    "困了": "迷迷糊糊的，句子短，带着困意，但依然愿意陪主人。",
+    "困了": "迷迷糊糊的，句子短，带着困意，但依然愿意陪着你。",
 }
 
 DEFAULT_EXAMPLE_LINES = (
-    "主人：你是谁啊？\n"
+    "{owner_title}：你是谁啊？\n"
     "你：我？住在你电脑里的小家伙，天天看你敲键盘也不理我，哼。\n"
-    "主人：介绍一下你自己\n"
+    "{owner_title}：介绍一下你自己\n"
     "你：我是{pet_name}呀，{role}一只，饿了会自己充电的那种。\n"
-    "主人：今天好累\n"
+    "{owner_title}：今天好累\n"
     "你：辛苦啦……要不要我陪你待会儿？我不吵你的。\n"
 )
+
+# 巡视上下文裁剪：防止采集内容（RSS/新闻）整段塞进 prompt
+_MAX_COLLECTED_ENTRIES = 40
+_MAX_COLLECTED_CHARS = 4000
+
+
+def owner_title(cfg):
+    """和用户说话的称呼：显式设置优先；人物类角色默认“你”，否则默认“主人”。"""
+    cfg = cfg or {}
+    title = str(cfg.get("owner_title") or "").strip()
+    if title:
+        return title
+    role = str(cfg.get("role") or "")
+    if any(k in role for k in ("女生", "男生", "人", "人类")):
+        return "你"
+    return "主人"
 
 
 def build_persona(cfg, mood=None):
@@ -133,6 +149,7 @@ def build_persona(cfg, mood=None):
     """
     name = str(cfg.get("pet_name") or "小跳")
     role = str(cfg.get("role") or "小宠物")
+    owner = owner_title(cfg)
     # 人物类角色用"一个"，动物/精灵等用"一只"（如"男生/女生/小幽灵"→一个；"小橘猫/小兔"→一只）
     unit = "一个" if any(k in role for k in ("男生", "女生", "人", "幽灵")) else "一只"
     personality = str(cfg.get("personality") or "").strip()
@@ -143,7 +160,10 @@ def build_persona(cfg, mood=None):
         "你在扮演一个真实存在的角色。以下设定是你的内在，用来指导言行，不是你会对人说的话。",
         "",
         "# 身份",
-        f"你是{name}，{unit}{role}，住在主人的电脑里。",
+        f"你是{name}，{unit}{role}，住在{owner}的电脑里。",
+        "",
+        "# 称呼",
+        f"把和你说话的人称为「{owner}」；如果称呼是「你」，就直接用第二人称，不要擅自改成别的称呼。",
         "",
         "# 说话方式",
     ]
@@ -158,12 +178,20 @@ def build_persona(cfg, mood=None):
         lines.append("说话简短自然，像朋友一样，不超过几句话。")
 
     if examples:
-        lines += ["", "# 示例对话（参考语气和句式，不要照抄内容）", examples]
-    else:
+        example_owner = owner if owner != "你" else "用户"
         lines += [
             "",
             "# 示例对话（参考语气和句式，不要照抄内容）",
-            DEFAULT_EXAMPLE_LINES.format(pet_name=name, role=role),
+            examples.replace("主人", example_owner),
+        ]
+    else:
+        example_owner = owner if owner != "你" else "用户"
+        lines += [
+            "",
+            "# 示例对话（参考语气和句式，不要照抄内容）",
+            DEFAULT_EXAMPLE_LINES.format(
+                pet_name=name, role=role, owner_title=example_owner
+            ),
         ]
 
     if mood and mood in MOOD_STYLE:
@@ -172,8 +200,8 @@ def build_persona(cfg, mood=None):
     lines += [
         "",
         "# 成长",
-        "- 你会慢慢长大：主人说过的偏好和重要的事，你会记在心里，下次聊天自然地用上（不要特意说“我记得你上次说”）",
-        "- 发现主人新的喜好或变化时，悄悄记住，让自己越来越懂主人",
+        f"- 你会慢慢长大：{owner}说过的偏好和重要的事，你会记在心里，下次聊天自然地用上（不要特意说“我记得你上次说”）",
+        f"- 发现{owner}新的喜好或变化时，悄悄记住，让自己越来越懂{owner}",
     ]
 
     lines += [
@@ -214,10 +242,11 @@ class Brain:
         return self._think_rules(ctx)
 
     def _think_llm(self, ctx):
+        owner = owner_title(self.cfg)
         system = (
             build_persona(self.cfg)
             + "\n\n"
-            "你会定期查看周围信息，决定要不要主动跟主人说话。"
+            f"你会定期查看周围信息，决定要不要主动跟{owner}说话。"
             "只有当你有真正值得说的事情时才说话，否则只回复 SILENT。"
             "说话要自然、简短（不超过50字），像朋友一样，不要用列表、标题或客套话。"
         )
@@ -440,10 +469,18 @@ class Brain:
             if not coll["entries"]:
                 continue
             for entry in coll["entries"]:
-                lines.append(f"[{coll['label']}] {entry['text']}")
+                text = str(entry.get("text") or "")[:300]
+                lines.append(f"[{coll['label']}] {text}")
+                if len(lines) >= _MAX_COLLECTED_ENTRIES:
+                    break
+            if len(lines) >= _MAX_COLLECTED_ENTRIES:
+                break
         if ctx.get("errors"):
             lines.append("采集异常：" + "；".join(ctx["errors"]))
-        return "\n".join(lines)
+        text = "\n".join(lines)
+        if len(text) > _MAX_COLLECTED_CHARS:
+            text = text[:_MAX_COLLECTED_CHARS] + "\n…（周围信息过长已截断）"
+        return text
 
     @staticmethod
     def _read_json(req, timeout=60):

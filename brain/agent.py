@@ -49,6 +49,7 @@ class Agent(ChatMixin, ThinkMixin):
         self.memory = Memory(self.db)
         self.chat_history = self.db.chat_items(100)
         self.state: dict = self._load_state()
+        self._sync_embed_model()
         self.clock = clock or datetime.now
         # 领域模块（组合）：记忆 / 规划 —— brain 层可独立升级的进化单元。
         # 包模式（brain 包 active）优先从包取三件套（Agent/Memory/Planner）；
@@ -107,6 +108,7 @@ class Agent(ChatMixin, ThinkMixin):
             "merge_seen": {},           # 跨源标题去重指纹（TTL 2h）
             "topics_date": "",         # 兴趣话题自动提取日期（每天一次）
             "topics_list": [],          # 自动提取的话题列表
+            "embed_model": "",          # 当前向量模型（切换时重建向量表）
         }
         return {
             key: self.db.get_state(key, default)
@@ -116,6 +118,19 @@ class Agent(ChatMixin, ThinkMixin):
     def _save_state(self):
         for key, value in self.state.items():
             self.db.set_state(key, value)
+
+    def _sync_embed_model(self):
+        """模型变化时清空旧向量，避免新旧语义混用/维度不匹配。"""
+        model = self.cfg.get("embedding_model", "BAAI/bge-small-zh-v1.5")
+        previous = self.state.get("embed_model", "")
+        if previous and previous != model:
+            try:
+                self.db.clear_embeddings("memory")
+                self.db.clear_embeddings("chat")
+            except Exception:
+                pass
+        self.state["embed_model"] = model
+        self._save_state()
 
     def reload(self, cfg, plugins=None):
         self.cfg = cfg
@@ -127,6 +142,7 @@ class Agent(ChatMixin, ThinkMixin):
         if sig != self._embed_sig:
             self._embed_sig = sig
             self.embedder = rag.default_embedder(cfg, self.data_dir)
+            self._sync_embed_model()
         # 补索引挪到后台线程执行（reindex_async），避免保存设置卡 UI
         self._reindex_pending = True
         # 领域模块重载：updater 切换版本后 reload 即生效（准热切换）；
@@ -185,7 +201,7 @@ class Agent(ChatMixin, ThinkMixin):
         user_text = user_text.strip()
         entry = self.append_chat("user", user_text)
         # 规则提取作为零成本兜底；有 LLM 时主路径是 analyze_and_remember
-        self._extract_facts_rule(user_text)
+        rule_saved = self._extract_facts_rule(user_text)
         self.state["fact_scan_id"] = entry["id"]
         self._save_state()
         reply = self._try_search_intent(user_text)
@@ -206,10 +222,11 @@ class Agent(ChatMixin, ThinkMixin):
         self.append_chat("assistant", reply)
         if (self.cfg.get("api") or {}).get("api_key"):
             # 有 LLM 时由 Agent 自己分析该记住什么（不依赖写死规则）
-            try:
-                self.memory_module.analyze_and_remember(user_text, reply)
-            except Exception:
-                pass
+            if self.memory_module.should_analyze(user_text, rule_saved):
+                try:
+                    self.memory_module.analyze_and_remember(user_text, reply)
+                except Exception:
+                    pass
         if self.stats:
             self.stats.record_chat(2)
         return reply
@@ -321,36 +338,38 @@ class Agent(ChatMixin, ThinkMixin):
             text = line.strip()
             if text.startswith("[FACT]"):
                 fact = text[6:].strip()
-                if fact and fact not in [i["text"] for i in self.memory.facts()]:
-                    self._remember("fact", fact, importance=4)
-                    if self.stats:
+                if fact:
+                    item_id = self._remember("fact", fact, importance=4)
+                    if item_id is not None and self.stats:
                         self.stats.record_fact()
             elif text.startswith("[FACT:"):
                 # [FACT:category] 结构化事实（LLM 可自行分类，如 [FACT:schedule]）
                 category = text[6:text.find("]")].strip()
                 fact = text[text.find("]") + 1:].strip()
-                if category and fact and fact not in [i["text"] for i in self.memory.facts()]:
-                    self._remember(
+                if category and fact:
+                    item_id = self._remember(
                         "fact",
                         fact,
                         category=category,
                         importance=4,
                         expires_at=self._parse_schedule_expiry(fact),
                     )
-                    if self.stats:
+                    if item_id is not None and self.stats:
                         self.stats.record_fact()
             elif text.startswith("[OBSERVE]"):
                 # 巡视时的观察记录（低重要性，不显示给主人）
                 observe = text[9:].strip()
                 if observe:
-                    self._remember("thought", observe, importance=2, source="observation")
-                    if self.stats:
+                    item_id = self._remember(
+                        "thought", observe, importance=2, source="observation"
+                    )
+                    if item_id is not None and self.stats:
                         self.stats.record_thought()
             elif text.startswith("[THINK]"):
                 thought = text[7:].strip()
                 if thought:
-                    self._remember("thought", thought)
-                    if self.stats:
+                    item_id = self._remember("thought", thought)
+                    if item_id is not None and self.stats:
                         self.stats.record_thought()
             else:
                 body.append(line)
@@ -362,4 +381,4 @@ class Agent(ChatMixin, ThinkMixin):
 
     def _extract_facts_rule(self, user_text):
         """规则事实提取（委托 brain.memory）。"""
-        self.memory_module.extract_facts(user_text)
+        return self.memory_module.extract_facts(user_text)

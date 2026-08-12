@@ -13,6 +13,7 @@ build_time_context / build_recent_thread），Kernel 即可切换实现。
 import random
 
 import search
+from brain.llm import owner_title
 
 CURIOSITY_QUESTIONS = [
     "你今天过得怎么样？",
@@ -33,26 +34,30 @@ class Planner:
     def __init__(self, agent):
         self.agent = agent
 
+    def _owner(self):
+        return owner_title(self.agent.cfg)
+
     # ---------- 上下文构建 ----------
 
     def build_time_context(self, now=None):
-        """时间感知：现在是几点、星期几、主人可能在干嘛。"""
+        """时间感知：现在是几点、星期几、用户可能在干嘛。"""
         now = now or self.agent.clock()
+        owner = self._owner()
         hour = now.hour
         if 5 <= hour < 8:
-            phase = "清晨，主人可能刚起床或准备上班"
+            phase = f"清晨，{owner}可能刚起床或准备上班"
         elif 8 <= hour < 12:
-            phase = "上午，主人大概率在工作/学习中"
+            phase = f"上午，{owner}大概率在工作/学习中"
         elif 12 <= hour < 14:
-            phase = "中午，主人可能在午休或吃饭"
+            phase = f"中午，{owner}可能在午休或吃饭"
         elif 14 <= hour < 18:
-            phase = "下午，主人大概率在工作/学习中"
+            phase = f"下午，{owner}大概率在工作/学习中"
         elif 18 <= hour < 21:
-            phase = "傍晚到晚上，主人可能刚下班回家"
+            phase = f"傍晚到晚上，{owner}可能刚下班回家"
         elif 21 <= hour < 23:
-            phase = "晚上，主人可能在放松休息"
+            phase = f"晚上，{owner}可能在放松休息"
         else:
-            phase = "深夜，主人可能已经睡了，不要打扰"
+            phase = f"深夜，{owner}可能已经睡了，不要打扰"
         weekday = "一二三四五六日"[now.weekday()]
         return f"现在是{now.strftime('%m月%d日')}周{weekday}，{now.strftime('%H:%M')}，{phase}。"
 
@@ -64,8 +69,10 @@ class Planner:
         ]
         if not recent:
             return ""
+        owner = self._owner()
+        user_label = "用户：" if owner == "你" else owner + "："
         return "\n".join(
-            ("主人：" if m["role"] == "user" else "你：") + m["text"][:60]
+            (user_label if m["role"] == "user" else "你：") + m["text"][:60]
             for m in recent[-n * 2:]
         )
 
@@ -160,10 +167,18 @@ class Planner:
             if group["category"] in ("preference", "habit"):
                 for item in group["items"]:
                     text = item["text"]
-                    if text.startswith("主人喜欢") or text.startswith("主人习惯"):
-                        keyword = text[4:].strip()
+                    owner = self._owner()
+                    prefixes = (
+                        owner + "喜欢", owner + "习惯",
+                        "主人喜欢", "主人习惯",
+                    )
+                    for prefix in prefixes:
+                        if not text.startswith(prefix):
+                            continue
+                        keyword = text[len(prefix):].strip()
                         if keyword and len(keyword) <= 20:
                             return f"{keyword} 最新消息"
+                        break
         for coll in ctx.get("collections", []):
             if coll["plugin"] == "rss_news" and coll["entries"]:
                 title = coll["entries"][0]["text"]
@@ -202,13 +217,14 @@ class Planner:
         import json
         import re
 
+        owner = self._owner()
         profile = self.agent._build_memory_profile()
-        if not profile or profile.startswith("还没有关于主人的记录"):
+        if not profile or profile.startswith(f"还没有关于{owner}的记录") or profile.startswith("还没有关于主人的记录"):
             return []
         if self.agent.cfg["api"]["api_key"]:
             try:
                 system = (
-                    "从下面关于主人的记录中提取 5-8 个适合搜索资讯的话题关键词。"
+                    f"从下面关于{owner}的记录中提取 5-8 个适合搜索资讯的话题关键词。"
                     "要求：名词短语 2-4 字（如 摄影、人工智能、健身），"
                     "去掉情绪词和动词，只输出 JSON 数组如 [\"摄影\",\"AI\"]，不要其他内容。\n\n"
                     + profile
@@ -225,11 +241,22 @@ class Planner:
                 pass  # 降级规则提取
         # 规则降级：从常见事实句式里抽关键词
         topics = []
-        for pattern in (
-            r"主人喜欢(?:看|听|玩|打|读)?([^，。！？]{1,10})",
-            r"主人最近在(?:学|看|追|玩|读)([^，。！？]{1,10})",
-            r"主人习惯：([^，。！？]{1,10})",
-        ):
+        prefixes = sorted({owner, "主人"})
+        patterns = [
+            re.compile(
+                rf"{re.escape(p)}喜欢(?:看|听|玩|打|读)?([^，。！？]{{1,10}})"
+            )
+            for p in prefixes
+        ] + [
+            re.compile(
+                rf"{re.escape(p)}最近在(?:学|看|追|玩|读)([^，。！？]{{1,10}})"
+            )
+            for p in prefixes
+        ] + [
+            re.compile(rf"{re.escape(p)}习惯：([^，。！？]{{1,10}})")
+            for p in prefixes
+        ]
+        for pattern in patterns:
             for group in self.agent.db.memory_profile(limit_per=10, roles=("fact",)):
                 for item in group["items"]:
                     match = re.search(pattern, item["text"])
@@ -265,7 +292,7 @@ class Planner:
                 self.mark_proactive(now)
                 return message
 
-        # 2) 日程提醒：主人提过的日程临近（每天最多一次，不受冷却限制）
+        # 2) 日程提醒：用户提过的日程临近（每天最多一次，不受冷却限制）
         schedule = self.agent.db.memory_schedule_due(
             within_hours=12, now=now.strftime("%Y-%m-%d %H:%M")
         )

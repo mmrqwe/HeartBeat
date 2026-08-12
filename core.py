@@ -54,6 +54,7 @@ from brain.llm import (  # noqa: F401
     MOOD_STYLE,
     DEFAULT_EXAMPLE_LINES,
     build_persona,
+    owner_title,
 )
 from brain.skills import (  # noqa: F401
     SKILL_NAME_MAX,

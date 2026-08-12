@@ -14,6 +14,7 @@ import agent
 import core
 import search
 import tools
+from brain.memory import MemoryModule
 
 
 class _Patch:
@@ -608,6 +609,61 @@ def test_chat_llm_tools_exhaustion_final_reply_keeps_context(tmp_path):
                for m in final_msgs)
 
 
+def test_chat_llm_tools_empty_final_uses_tool_context(tmp_path):
+    """模型拿到工具结果后输出空正文：必须用全上下文收尾，而不是回“嗯嗯”。"""
+    a = _make_agent(tmp_path)
+    calls = {"tools": 0, "final": 0}
+
+    class FakeBrain:
+        def complete_tools(self, messages, decls):
+            calls["tools"] += 1
+            if calls["tools"] == 1:
+                return "", [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": '{"query": "x"}'},
+                }]
+            return "", []
+
+        def complete(self, messages, max_tokens=None, **kw):
+            calls["final"] += 1
+            return "最终总结：工具结果已读取"
+
+    a.brain = FakeBrain()
+    a._run_tool = lambda *a, **k: "结果X"
+    a.stats = None
+    reply = a._chat_llm_tools("测试", None)
+    assert reply == "最终总结：工具结果已读取"
+    assert calls["final"] == 1
+
+
+def test_chat_llm_tools_fallback_summary_when_final_empty(tmp_path):
+    """最终总结也为空时，直接把工具结果摘要给主人，绝不再回空话。"""
+    a = _make_agent(tmp_path)
+    calls = {"tools": 0}
+
+    class FakeBrain:
+        def complete_tools(self, messages, decls):
+            calls["tools"] += 1
+            if calls["tools"] == 1:
+                return "", [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": '{"query": "x"}'},
+                }]
+            return "", []
+
+        def complete(self, messages, max_tokens=None, **kw):
+            return ""
+
+    a.brain = FakeBrain()
+    a._run_tool = lambda *a, **k: "结果X"
+    a.stats = None
+    reply = a._chat_llm_tools("测试", None)
+    assert "工具结果已返回" in reply
+    assert "结果X" in reply
+
+
 def test_think_rules_schedule_reminder(tmp_path):
     """规则模式：临近日程自动提醒（每天最多一次）。"""
     a = _make_agent(tmp_path)
@@ -1056,6 +1112,142 @@ def _run_plain():
     if failures:
         raise SystemExit(1)
     print("ALL TESTS PASSED")
+
+
+class _FakeEmbedder:
+    def __init__(self, vector=None):
+        self.ready = True
+        self._vector = vector or [0.25] * 512
+
+    def embed_one(self, text):
+        return list(self._vector)
+
+
+def test_memory_semantic_dedup(tmp_path):
+    a = _make_agent(tmp_path)
+    if not a.db.vec_ready:
+        return
+    a.embedder = _FakeEmbedder()
+    first = a.memory_module.remember(
+        "fact", "主人喜欢喝咖啡", category="preference"
+    )
+    second = a.memory_module.remember(
+        "fact", "主人爱喝咖啡", category="preference"
+    )
+    assert second == first
+    assert len(a.memory.all_facts()) == 1
+
+
+def test_remember_contradiction_retires_old(tmp_path):
+    a = _make_agent(tmp_path)
+    a.db.add_memory("fact", "主人喜欢喝咖啡", category="preference")
+    a.memory_module.remember("fact", "主人不喜欢咖啡了", category="preference")
+    items = {i["text"]: i for i in a.db.memory_items(limit=None)}
+    assert items["主人喜欢喝咖啡"]["expires_at"] is not None
+    assert "主人不喜欢咖啡了" in items
+
+
+def test_handle_forget_deletes(tmp_path):
+    a = _make_agent(tmp_path)
+    a.db.add_memory("fact", "主人喜欢摄影", category="preference")
+    saved = a.memory_module.extract_facts("忘掉摄影")
+    assert saved == 0
+    assert not any("摄影" in i["text"] for i in a.db.memory_items(limit=None))
+
+
+def test_relevant_keyword_fallback_marks_used(tmp_path):
+    a = _make_agent(tmp_path)
+    mid = a.db.add_memory("fact", "主人喜欢喝咖啡", category="preference")
+    results = a.memory_module.relevant("咖啡", k=5)
+    assert any(i["id"] == mid for i in results)
+    assert a.db.memory_items(limit=None)[0]["last_used_at"] is not None
+
+
+def test_merge_pool_dedup_and_cap():
+    pool = MemoryModule._merge_pool(
+        [
+            {"id": 1, "role": "fact", "text": "a", "distance": 0.5, "importance": 4},
+            {"id": 1, "role": "fact", "text": "a", "distance": 0.4, "importance": 4},
+            {"id": 2, "role": "fact", "text": "b", "distance": 0.9, "importance": 1},
+        ],
+        k=2,
+    )
+    assert [i["id"] for i in pool] == [1, 2]
+
+
+def test_should_analyze_gate(tmp_path):
+    a = _make_agent(tmp_path)
+    assert a.memory_module.should_analyze("哈哈", 0) is False
+    assert a.memory_module.should_analyze("我最近买了新能源股票", 0) is True
+    assert a.memory_module.should_analyze("我喜欢咖啡", 1) is False
+
+
+def test_owner_title_config_used(tmp_path):
+    cfg = _cfg()
+    cfg["owner_title"] = "小明"
+    a = _make_agent(tmp_path, cfg=cfg)
+    a._extract_facts_rule("我叫小红，我喜欢喝咖啡")
+    texts = [i["text"] for i in a.memory.all_facts()]
+    assert "小明叫小红" in texts
+    assert "小明喜欢喝咖啡" in texts
+    persona = core.build_persona(cfg)
+    assert "住在小明的电脑里" in persona
+    assert "称为「小明」" in persona
+    cfg2 = _cfg()
+    cfg2["owner_title"] = ""
+    cfg2["role"] = "女生"
+    assert core.owner_title(cfg2) == "你"
+    cfg3 = _cfg()
+    cfg3["owner_title"] = ""
+    cfg3["role"] = "小橘猫"
+    assert core.owner_title(cfg3) == "主人"
+
+
+def test_context_trims_long_history_and_tool_results(tmp_path):
+    a = _make_agent(tmp_path)
+    a.append_chat("user", "很长" * 300)
+    a.append_chat("assistant", "好")
+    _, messages, _ = a._build_chat_messages("hi")
+    previous_user = messages[1]
+    assert previous_user["role"] == "user"
+    assert len(previous_user["content"]) < 700
+    trimmed = a._trim_tool_result("x" * 5000)
+    assert len(trimmed) < 5000
+    assert "省略" in trimmed
+
+
+def test_compact_tool_rounds_keeps_recent(tmp_path):
+    a = _make_agent(tmp_path)
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+    ]
+    for i in range(8):
+        messages.append({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": str(i)}],
+        })
+        messages.append({"role": "tool", "tool_call_id": str(i), "content": "r"})
+    compacted = a._compact_tool_rounds(messages, max_rounds=3)
+    rounds = sum(1 for m in compacted if m.get("tool_calls"))
+    assert rounds == 3
+    assert any(
+        m["role"] == "user" and "省略" in m["content"]
+        for m in compacted
+    )
+
+
+def test_think_context_text_capped(tmp_path):
+    a = _make_agent(tmp_path)
+    ctx = {
+        "collections": [
+            {"label": "rss", "entries": [{"text": "内容" * 300} for _ in range(50)]}
+        ],
+        "errors": [],
+    }
+    text = a.brain._context_text(ctx)
+    assert len(text) < 4500
 
 
 if __name__ == "__main__":

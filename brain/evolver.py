@@ -101,7 +101,7 @@ class Evolver:
         contract = sorted(self.updater.REQUIRED_METHODS[name])
         cls = self.updater.CLASSES[name]
         system = (
-            "你是桌宠「小跳」的自我进化引擎。主人要求你升级自己的某个领域模块。"
+            "你是桌宠「小跳」的自我进化引擎。用户要求你升级自己的某个领域模块。"
             "你会拿到该模块的当前完整源码和升级需求，请输出升级后的【完整模块源码】。\n"
             "硬性要求：\n"
             f"1. 类名必须是 {cls}，构造函数签名 __init__(self, agent) 保持不变；\n"
@@ -139,7 +139,7 @@ class Evolver:
             "- planner.py：规则决策（Planner：问候/预算/冷却/时间感知/规则发言）\n"
         )
         system = (
-            "你是桌宠「小跳」的自我进化引擎。主人要求你升级自己的【某个子模块】。\n"
+            "你是桌宠「小跳」的自我进化引擎。用户要求你升级自己的【某个子模块】。\n"
             "你将拿到 brain 包全部文件清单与职责说明，请根据需求选择一个文件整文件重写。\n"
             "候选文件与职责：\n" + files + "\n"
             "输出格式（严格）：\n"
@@ -371,21 +371,21 @@ class Evolver:
             "ctx.arxiv_search(query, limit=5) 学术搜索\n"
             "ctx.http_text(url, timeout=10) 只读 HTTP 文本\n"
             "ctx.http_json(url, timeout=10) 只读 HTTP JSON\n"
-            "ctx.run_bash(command) 执行 shell 命令（写操作需主人确认）\n"
-            "ctx.download_file(url, filename=None) 下载文件（需主人确认）\n"
-            "ctx.install_skill(zip_path) 安装技能包（需主人确认）\n"
+            "ctx.run_bash(command) 执行 shell 命令（写操作需用户确认）\n"
+            "ctx.download_file(url, filename=None) 下载文件（需用户确认）\n"
+            "ctx.install_skill(zip_path) 安装技能包（需用户确认）\n"
             "ctx.skill_status(name) 检查已安装技能状态（只读）\n"
-            "ctx.skill_setup(name) 运行技能初始化脚本（安装官方 CLI，需主人确认）\n"
-            "ctx.skill_auth(name, secret) 用 Access Secret 配置技能认证（需主人确认，不回显 secret）\n"
+            "ctx.skill_setup(name) 运行技能初始化脚本（安装官方 CLI，需用户确认）\n"
+            "ctx.skill_auth(name, secret) 用 Access Secret 配置技能认证（需用户确认，不回显 secret）\n"
             "ctx.skill_exec(name, args) 调用已安装技能 CLI 的只读命令（如 zhihu 的 hot/search/answer，args 为字符串列表）\n"
             "ctx.sandbox_read(path) 读取沙盒工作区文件\n"
-            "ctx.sandbox_write(path, content) 写入沙盒工作区文件（需主人确认）\n"
+            "ctx.sandbox_write(path, content) 写入沙盒工作区文件（需用户确认）\n"
             "ctx.sandbox_list(path='.') 列出沙盒工作区目录\n"
-            "ctx.sandbox_run(command) 在沙盒工作区执行完整 shell 命令（需主人确认）\n"
+            "ctx.sandbox_run(command) 在沙盒工作区执行完整 shell 命令（需用户确认）\n"
             "ctx.now 当前时间（datetime）"
         )
         system = (
-            "你是桌宠「小跳」的自我进化引擎。主人要求你为自己编写一个新的工具模块。\n"
+            "你是桌宠「小跳」的自我进化引擎。用户要求你为自己编写一个新的工具模块。\n"
             "工具模块是纯 Python 文件，契约：\n"
             "TOOL_NAME = \"英文小写加下划线的新工具名\"（不得与现有工具重名）\n"
             "TOOL_DESCRIPTION = \"一句话说明工具用途（LLM 据此决定何时调用它）\"\n"

@@ -25,8 +25,12 @@ class ThinkMixin:
         now = self.clock()
         if self.stats:
             self.stats.record_tick()
+        try:
+            self.memory_module.cleanup(now=now.strftime("%Y-%m-%d %H:%M"))
+        except Exception:
+            pass
         self._update_mood(ctx)
-        # 记忆补采（含安静时段，不打扰主人）：把水位线之后的主人对白扫一遍
+        # 记忆补采（含安静时段，不打扰用户）：把水位线之后的对白扫一遍
         self._extract_facts_watermark()
         if self._is_quiet(now):
             return None
@@ -94,6 +98,7 @@ class ThinkMixin:
         T3 静默：不调 LLM
         """
         today = now.strftime("%Y-%m-%d")
+        owner = core.owner_title(self.cfg)
 
         # 天气类别快照：每次巡视更新，突变才触发
         wc = self._weather_class(ctx)
@@ -105,18 +110,18 @@ class ThinkMixin:
         if 8 <= now.hour < 12 and self.state.get("last_brief_date") != today:
             self.state["last_brief_date"] = today
             self._save_state()
-            return "brief", "新的一天，给主人一句简短的晨间问候，可以提今天的天气或日程。"
+            return "brief", f"新的一天，给{owner}一句简短的晨间问候，可以提今天的天气或日程。"
 
         # T0 日程临近（每天最多一次）
         schedule = self.db.memory_schedule_due(within_hours=12)
         if schedule and self.state.get("last_schedule_remind_date") != today:
             self.state["last_schedule_remind_date"] = today
             self._save_state()
-            return "schedule", f"主人之前说{schedule[-1]['text']}，时间快到了，可以提醒一下。"
+            return "schedule", f"{owner}之前说{schedule[-1]['text']}，时间快到了，可以提醒一下。"
 
         # T0 天气突变（类别变化）
         if wc and wc != prev_wc:
-            return "weather", f"天气变成了{wc}，值得说的可以跟主人提一句。"
+            return "weather", f"天气变成了{wc}，值得说的可以跟{owner}提一句。"
 
         # 预算：T1/T2 共用，耗尽即静默
         if self.state.get("llm_budget_date") != today:
@@ -144,14 +149,14 @@ class ThinkMixin:
                 + "；".join(t[:40] for t in merged)[:120],
             )
 
-        # T1 画像记忆回响（每 12h 最多一次：想起主人说过的事）
+        # T1 画像记忆回响（每 12h 最多一次：想起用户说过的事）
         if now.timestamp() - self.state.get("last_echo_ts", 0.0) >= 12 * 3600:
             top = self._profile_hint()
             if top:
                 self.state["last_echo_ts"] = now.timestamp()
                 self._save_state()
                 _spend()
-                return "echo", f"想起主人之前说过：{top}，可以关心一下进展。"
+                return "echo", f"想起{owner}之前说过：{top}，可以关心一下进展。"
 
         # T2 冷却 + 概率自主（更积极：60% 机会主动探索）
         if not self._cooldown_ok(now) or random.random() >= 0.6:
@@ -163,22 +168,24 @@ class ThinkMixin:
         if not self.cfg.get("tools_enabled", True):
             return self._think_llm_simple(ctx, trigger=trigger)
         context = self.brain._context_text(ctx)
+        owner = core.owner_title(self.cfg)
+        owner_section = "【你的画像】" if owner == "你" else f"【{owner}画像】"
         system = (
             core.build_persona(self.cfg, mood=self.state.get("mood"))
             + "\n\n"
-            "你会每隔一段时间主动巡视，思考要不要跟主人说话。\n"
+            f"你会每隔一段时间主动巡视，思考要不要跟{owner}说话。\n"
             "值得说话的情况（按优先级）：\n"
-            "1) 主人的日程临近（考试/会议/出差/体检等）——主动提醒\n"
-            "2) 主人关心的话题有值得说的新信息（可用工具搜索确认）\n"
+            f"1) {owner}的日程临近（考试/会议/出差/体检等）——主动提醒\n"
+            f"2) {owner}关心的话题有值得说的新信息（可用工具搜索确认）\n"
             "3) 天气/环境有明显变化\n"
-            "4) 想起主人说过的事，想跟进问问\n"
+            f"4) 想起{owner}说过的事，想跟进问问\n"
             "5) 有新鲜有趣的事想分享\n"
             + (
                 "\n【本次巡视触发】" + trigger + "\n"
                 if trigger
                 else "\n【本次巡视触发】自由巡视\n"
             )
-            + "【主人画像】\n"
+            + owner_section + "\n"
             + self._build_memory_profile()
             + "\n\n【时间感知】\n"
             + self._build_time_context()
@@ -188,9 +195,10 @@ class ThinkMixin:
             + (context or "（暂无采集到信息）")
             + "\n\n"
             "如果确实没什么值得说的，只输出 SILENT，不要硬聊。\n"
-            "如果你对主人有了新观察（比如他最近常在忙什么），另起一行写 [OBSERVE] 一句，不会显示给主人。\n"
+            f"如果你对{owner}有了新观察（比如他最近常在忙什么），另起一行写 [OBSERVE] 一句，不会显示给{owner}。\n"
             "你也可以另起一行写 [THINK] 记下自己的想法。\n"
-            "输出要说的话不超过60字，自然口语，不要列表和标题。"
+            "输出要说的话不超过60字，自然口语，不要列表和标题。\n"
+            "优先说对用户有用的话；使用工具前想清楚是否必要，限流或失败不要反复重试。"
         )
         system += self._skill_section(patrol=True)
         messages = [
@@ -227,28 +235,31 @@ class ThinkMixin:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.get("id", ""),
-                    "content": result,
+                    "content": self._trim_tool_result(result),
                 })
+            messages = self._compact_tool_rounds(messages)
         return None
 
     def _think_llm_simple(self, ctx, trigger=None):
         context = self.brain._context_text(ctx)
+        owner = core.owner_title(self.cfg)
+        owner_section = "【你的画像】" if owner == "你" else f"【{owner}画像】"
         system = (
             core.build_persona(self.cfg, mood=self.state.get("mood"))
             + "\n\n"
-            "你会每隔一段时间主动巡视，思考要不要跟主人说话。\n"
+            f"你会每隔一段时间主动巡视，思考要不要跟{owner}说话。\n"
             "值得说话的情况（按优先级）：\n"
-            "1) 主人的日程临近（考试/会议/出差/体检等）——主动提醒\n"
-            "2) 主人关心的话题有值得说的新信息\n"
+            f"1) {owner}的日程临近（考试/会议/出差/体检等）——主动提醒\n"
+            f"2) {owner}关心的话题有值得说的新信息\n"
             "3) 天气/环境有明显变化\n"
-            "4) 想起主人说过的事，想跟进问问\n"
+            f"4) 想起{owner}说过的事，想跟进问问\n"
             "5) 有新鲜有趣的事想分享\n"
             + (
                 "\n【本次巡视触发】" + trigger + "\n"
                 if trigger
                 else "\n【本次巡视触发】自由巡视\n"
             )
-            + "【主人画像】\n"
+            + owner_section + "\n"
             + self._build_memory_profile()
             + "\n\n【时间感知】\n"
             + self._build_time_context()
@@ -258,9 +269,10 @@ class ThinkMixin:
             + (context or "（暂无采集到信息）")
             + "\n\n"
             "如果确实没什么值得说的，只输出 SILENT，不要硬聊。\n"
-            "如果你对主人有了新观察，另起一行写 [OBSERVE] 一句，不会显示给主人。\n"
+            f"如果你对{owner}有了新观察，另起一行写 [OBSERVE] 一句，不会显示给{owner}。\n"
             "你也可以另起一行写 [THINK] 记下自己的想法。\n"
-            "输出要说的话不超过60字，自然口语，不要列表和标题。"
+            "输出要说的话不超过60字，自然口语，不要列表和标题。\n"
+            "优先说对用户有用的话，避免空泛寒暄。"
         )
         reply = self._parse_agent_reply(self.brain.complete([
             {"role": "system", "content": system},

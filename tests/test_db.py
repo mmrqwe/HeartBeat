@@ -329,5 +329,62 @@ def _run_plain():
     print("ALL TESTS PASSED")
 
 
+def test_vec_search_filters_expired(tmp_path):
+    d = _db(tmp_path)
+    if not d.vec_ready:
+        return
+    past_id = d.add_memory(
+        "fact", "旧日程", category="schedule", expires_at="2000-01-01 00:00"
+    )
+    live_id = d.add_memory("fact", "主人喜欢咖啡")
+    d.add_embedding("memory", past_id, [0.1] * 512)
+    d.add_embedding("memory", live_id, [0.1] * 512)
+    results = d.search_embeddings("memory", [0.1] * 512, k=5)
+    texts = [r["text"] for r in results]
+    assert "旧日程" not in texts
+    assert "主人喜欢咖啡" in texts
+
+
+def test_cleanup_memory_expired_and_cap(tmp_path):
+    d = _db(tmp_path)
+    d.add_memory("fact", "过期日程", category="schedule", expires_at="2000-01-01 00:00")
+    for i in range(3):
+        d.add_memory("fact", f"事实{i}")
+    expired, capped = d.cleanup_memory(now="2099-01-01 00:00", cap=2)
+    assert (expired, capped) == (1, 1)
+    assert len(d.memory_items(limit=None)) == 2
+
+
+def test_keyword_search_fallback(tmp_path):
+    d = _db(tmp_path)
+    d.add_memory("fact", "主人喜欢喝咖啡", category="preference")
+    d.add_memory("fact", "明天开会", category="schedule", expires_at="2000-01-01 00:00")
+    results = d.search_memory_keywords("咖啡", k=5, now="2099-01-01 00:00")
+    assert any("咖啡" in r["text"] for r in results)
+    assert not any("开会" in r["text"] for r in results)
+
+
+def test_retire_and_delete_memory_like(tmp_path):
+    d = _db(tmp_path)
+    d.add_memory("fact", "主人喜欢咖啡", category="preference")
+    assert d.retire_memory_like("咖啡", category="preference") == 1
+    items = d.memory_items(limit=None)
+    assert items[0]["expires_at"] is not None
+    d.add_memory("fact", "主人喜欢摄影", category="preference")
+    assert d.delete_memory_like("摄影") == 1
+    assert not any("摄影" in i["text"] for i in d.memory_items(limit=None))
+
+
+def test_clear_embeddings(tmp_path):
+    d = _db(tmp_path)
+    if not d.vec_ready:
+        return
+    mid = d.add_memory("fact", "需要重建")
+    d.add_embedding("memory", mid, [0.5] * 512)
+    assert d.ids_without_embedding("memory") == []
+    assert d.clear_embeddings("memory")
+    assert mid in d.ids_without_embedding("memory")
+
+
 if __name__ == "__main__":
     _run_plain()

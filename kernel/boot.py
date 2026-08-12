@@ -15,6 +15,7 @@ from pathlib import Path
 
 DEFAULT_CONFIG = {
     "pet_name": "小跳",
+    "owner_title": "",
     "role": "小橘猫",
     "personality": "活泼、有点毒舌，但很关心主人",
     "speaking_style": "",
@@ -32,6 +33,7 @@ DEFAULT_CONFIG = {
     "tools_enabled": True,
     "shell_tools_mode": "confirm",
     "shell_workdir": "",
+    "memory_cap": 500,
     "collectors": {
         "weather": {"enabled": True},
         "rss_news": {"enabled": True},

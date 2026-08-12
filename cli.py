@@ -90,6 +90,16 @@ def _make_parser():
     db_sub.add_parser("info", help="数据库统计")
     db_sub.add_parser("chat-clear", help="清空聊天记录")
 
+    p_memory = sub.add_parser("memory", help="记忆管理：列表/清空/清理/导出")
+    mem_sub = p_memory.add_subparsers(dest="mem_cmd", required=True)
+    p_mem_list = mem_sub.add_parser("list", help="列出记忆（可按类别筛选）")
+    p_mem_list.add_argument("--category", default=None, help="identity/preference/habit/schedule/finance/misc")
+    p_mem_list.add_argument("--limit", type=int, default=100)
+    mem_sub.add_parser("clear", help="清空全部记忆")
+    mem_sub.add_parser("prune", help="清理过期记忆并按 memory_cap 上限淘汰")
+    p_mem_export = mem_sub.add_parser("export", help="导出全部记忆为 JSON")
+    p_mem_export.add_argument("path", help="输出 JSON 文件路径")
+
     p_embed = sub.add_parser("embed", help="测试本地向量模型")
     p_embed.add_argument("text")
 
@@ -250,6 +260,9 @@ def _run(argv, default_config=None):
         print("chat cleared")
         return 0
 
+    if cmd == "memory":
+        return _memory_cmd(config, args)
+
     if cmd == "embed":
         cfg_path, cfg, _, _, _, _ = _load(config)
         embedder = rag.default_embedder(cfg, cfg_path.parent)
@@ -278,6 +291,43 @@ def _run(argv, default_config=None):
         return _skill_cmd(args)
 
     print(f"unknown command: {cmd}")
+    return 2
+
+
+def _memory_cmd(config, args):
+    _, _, database, _, _, ag = _load(config)
+    if args.mem_cmd == "list":
+        items = database.memory_items(limit=args.limit)
+        if args.category:
+            items = [i for i in items if i.get("category") == args.category]
+        for it in items:
+            print(
+                f"[{it['id']}] {it['role']} {it['category']} "
+                f"imp={it['importance']} {it['time']} {it['text']}"
+            )
+        print(f"total: {len(items)}")
+        return 0
+    if args.mem_cmd == "clear":
+        database.clear_memory()
+        print("memory cleared")
+        return 0
+    if args.mem_cmd == "prune":
+        expired, capped = ag.memory_module.cleanup()
+        print(f"pruned: expired={expired}, capped={capped}")
+        return 0
+    if args.mem_cmd == "export":
+        items = database.memory_items(limit=None)
+        payload = {
+            "exported_at": time.strftime("%Y-%m-%d %H:%M"),
+            "count": len(items),
+            "items": items,
+        }
+        Path(args.path).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"exported {len(items)} memories -> {args.path}")
+        return 0
     return 2
 
 

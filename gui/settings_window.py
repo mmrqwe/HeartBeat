@@ -3,6 +3,7 @@
 import copy
 import json
 import time
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
@@ -11,6 +12,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -111,6 +113,7 @@ class SettingsWindow(QDialog):
             self._basic[key] = spin
 
         add_text("pet_name", "宠物名字")
+        add_text("owner_title", "对你的称呼（留空自动：人物类角色用“你”，其他用“主人”）")
         add_text("role", "自我认知（角色）")
         add_text("personality", "性格底色")
         add_text("speaking_style", "说话方式（可选，留空跟随皮肤）")
@@ -356,15 +359,33 @@ class SettingsWindow(QDialog):
         hint.setWordWrap(True)
         hint.setObjectName("Hint")
         layout.addWidget(hint)
+        filter_row = QHBoxLayout()
+        filter_label = QLabel("筛选：")
+        self.memory_category = QComboBox()
+        self.memory_category.addItem("全部", None)
+        for cat in ("identity", "preference", "habit", "schedule", "finance", "misc"):
+            self.memory_category.addItem(cat, cat)
+        self.memory_category.currentIndexChanged.connect(self._refresh_memory_tab)
+        filter_row.addWidget(filter_label)
+        filter_row.addWidget(self.memory_category)
+        filter_row.addStretch(1)
+        layout.addLayout(filter_row)
         self.memory_list = QListWidget()
         self.memory_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         layout.addWidget(self.memory_list, 1)
         buttons = QHBoxLayout()
         delete_btn = QPushButton("删除选中")
         delete_btn.clicked.connect(self._delete_selected_memory)
+        clear_btn = QPushButton("清空全部")
+        clear_btn.setObjectName("Danger")
+        clear_btn.clicked.connect(self._clear_all_memory)
+        export_btn = QPushButton("导出")
+        export_btn.clicked.connect(self._export_memory)
         refresh_btn = QPushButton("刷新")
         refresh_btn.clicked.connect(self._refresh_memory_tab)
         buttons.addWidget(delete_btn)
+        buttons.addWidget(clear_btn)
+        buttons.addWidget(export_btn)
         buttons.addWidget(refresh_btn)
         buttons.addStretch(1)
         layout.addLayout(buttons)
@@ -374,21 +395,27 @@ class SettingsWindow(QDialog):
     def _refresh_memory_tab(self):
         self.memory_list.clear()
         self._memory_ids = []
+        self._memory_all = []
         agent = getattr(self.controller, "agent", None)
         if agent is None:
             return
         try:
-            items = agent.memory.recent(100)
+            items = agent.memory.recent(500)
         except Exception:
             items = []
+        category = self.memory_category.currentData()
+        if category:
+            items = [it for it in items if it.get("category") == category]
+        self._memory_all = items
         if not items:
-            self.memory_list.addItem("（还没有记住什么，多聊聊天吧）")
+            self.memory_list.addItem("（当前筛选下没有记忆）")
             return
         category_names = {
             "identity": "身份",
             "preference": "喜好",
             "habit": "习惯",
             "schedule": "日程",
+            "finance": "财务",
             "misc": "其他",
         }
         for it in items:
@@ -407,6 +434,42 @@ class SettingsWindow(QDialog):
         mid = self._memory_ids[row]
         agent.db.delete_memory(mid)
         self._refresh_memory_tab()
+
+    def _clear_all_memory(self):
+        agent = getattr(self.controller, "agent", None)
+        if agent is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "清空记忆",
+            "确定清空全部记忆吗？此操作不可恢复。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer == QMessageBox.Yes:
+            agent.db.clear_memory()
+            self._refresh_memory_tab()
+
+    def _export_memory(self):
+        agent = getattr(self.controller, "agent", None)
+        if agent is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出记忆", "heartbeat-memory.json", "JSON (*.json)"
+        )
+        if not path:
+            return
+        items = agent.db.memory_items(limit=None)
+        payload = {
+            "exported_at": time.strftime("%Y-%m-%d %H:%M"),
+            "count": len(items),
+            "items": items,
+        }
+        Path(path).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        QMessageBox.information(self, "导出完成", f"已导出 {len(items)} 条记忆")
 
     def _build_stats_tab(self):
         tab = QWidget()
