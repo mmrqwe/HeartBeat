@@ -14,6 +14,7 @@ import re
 import time
 
 import core
+import db
 import search
 import tools
 from brain import context as context_mgr
@@ -587,6 +588,15 @@ class ThinkMixin:
     def _audit_tool(self, source, tool, detail, mode, approved, ok, summary):
         try:
             self.db.log_tool(source, tool, detail, mode, approved, ok, summary)
+        except Exception:
+            pass
+        # P1 事件时间线：tool.called（与 tool_logs 并存，按 trace_id 聚合调试）
+        try:
+            self.db.log_event(
+                db.EventType.TOOL_CALLED, "brain.tool",
+                {"tool": tool, "source": source, "ok": ok, "approved": approved},
+                getattr(self, "_trace_id", ""),
+            )
         except Exception:
             pass
         # 旁路事件通知（不阻塞工具循环）：审计日志 / 统计 / UI 各自订阅。

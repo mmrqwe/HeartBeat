@@ -1,6 +1,6 @@
 """kernel.runtime：运行时内核（Qt 事件循环上的任务调度）。
 
-它只做事件循环与任务管理：定时触发、线程提交、看门狗超时、epoch 竞态保护。
+它只做事件循环与任务管理：定时触发、线程池提交、看门狗超时、epoch 竞态保护。
 不知道任务内容是什么（巡视 / 聊天 / 采集都一样处理）。
 
 设计约束（与 Qt 主循环的关系）：
@@ -9,10 +9,17 @@
 - 子线程中仅执行 work()，其结果经信号回主线程；
 - epoch 竞态保护：同一任务只接受最新一次触发的结果，过期结果自动丢弃。
 
+P1（2026-08-12）线程池化：
+- ThreadPoolExecutor(max_workers=3) 替代每次 trigger 新建 daemon Thread——
+  并发线程数上限 = 任务数（_busy 同名防并发），且未来任务增多不再线程爆炸；
+- Future 只用于取消（超时取消排队任务）与关闭清理，结果仍走 Qt Signal；
+- stop_all：shutdown(wait=False, cancel_futures=True) + _stopping 标志——
+  在途任务不再 emit（防关闭后信号残留），排队任务取消执行。
+
 Runtime 可独立于 GUI 使用（QObject 需要 QCoreApplication 存在）。
 """
 
-import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
@@ -21,12 +28,14 @@ class Runtime(QObject):
     """任务调度内核。
 
     每个任务拥有：单次定时器（周期由 schedule_next 决定，手动触发不依赖定时器）、
-    看门狗（超时重置任务并回调 on_timeout）、epoch（丢弃过期线程结果）。
+    看门狗（超时重置任务并回调 on_timeout）、epoch（丢弃过期线程结果）、
+    Future（线程池提交句柄，用于超时取消与关闭清理）。
     """
 
     # (task_name, epoch, result) / (task_name, epoch, error) / (task_name)
+    # error 传异常对象（不 str 化）：宿主侧可分类（基础设施故障 vs brain 故障）
     task_done = Signal(str, int, object)
-    task_error = Signal(str, int, str)
+    task_error = Signal(str, int, object)
     task_timeout = Signal(str)
 
     def __init__(self, parent=None):
@@ -35,6 +44,9 @@ class Runtime(QObject):
         self._epochs = {}
         self._busy = set()
         self._stopped = False
+        # 关闭标志：stop_all 置位后，在途任务完成时不再 emit（防信号残留）
+        self._stopping = False
+        self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="hb-task")
 
         self.task_done.connect(self._on_task_done)
         self.task_error.connect(self._on_task_error)
@@ -104,9 +116,14 @@ class Runtime(QObject):
         self._epochs[name] += 1
         self._busy.add(name)
         spec["watchdog"].start(spec["timeout_ms"])
-        threading.Thread(
-            target=self._run, args=(name, self._epochs[name], args), daemon=True
-        ).start()
+        try:
+            spec["future"] = self._executor.submit(
+                self._run, name, self._epochs[name], args
+            )
+        except RuntimeError:
+            # 线程池已关闭（stop_all 后）：不再启动
+            self._busy.discard(name)
+            return False
         return True
 
     def current_epoch(self, name):
@@ -135,21 +152,32 @@ class Runtime(QObject):
         return name in self._busy
 
     def stop_all(self):
-        """停止所有定时器与看门狗（不杀在途线程——daemon 随进程退出）。"""
+        """停止所有定时器与看门狗；线程池关闭。
+
+        shutdown(wait=False, cancel_futures=True)：排队未执行的任务取消，
+        在途任务继续跑完但 _stopping 标志使其不再 emit（防关闭后信号残留）。
+        """
         self._stopped = True
+        self._stopping = True
         for spec in self._tasks.values():
             spec["timer"].stop()
             spec["watchdog"].stop()
         self._busy.clear()
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
 
     # ---------- 内部 ----------
 
     def _run(self, name, epoch, args):
+        if self._stopping:
+            return  # 关闭中：在途任务不再 emit
         spec = self._tasks[name]
         try:
             result = spec["work"](epoch, *args)
         except Exception as exc:
-            self.task_error.emit(name, epoch, str(exc))
+            self.task_error.emit(name, epoch, exc)
             return
         self.task_done.emit(name, epoch, result)
 
@@ -187,6 +215,9 @@ class Runtime(QObject):
             return  # 迟到的超时（任务已结束）
         self._epochs[name] += 1  # 使在途结果过期
         self._busy.discard(name)
+        future = spec.get("future")
+        if future is not None:
+            future.cancel()  # 排队中的任务取消执行（运行中的无法中断，结果会被 epoch 丢弃）
         if spec["on_timeout"]:
             try:
                 spec["on_timeout"]()

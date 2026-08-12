@@ -13,6 +13,7 @@ import re
 import time
 from datetime import timedelta
 
+import db
 from brain.llm import owner_title
 
 FOLLOW_KEYWORDS = ("考试", "开会", "面试", "报告", "加班", "出差")
@@ -49,6 +50,17 @@ class MemoryModule:
     def _owner(self):
         return owner_title(self.agent.cfg)
 
+    def _enqueue_embed(self, kind, item_id, text):
+        """异步向量入队：Agent 注入 embed_queue（main.py）时入队返回 True；
+        否则返回 False（测试/CLI 直连保持同步旧行为）。"""
+        q = getattr(self.agent, "embed_queue", None)
+        if q is None:
+            return False
+        try:
+            return bool(q.enqueue(kind, item_id, text))
+        except Exception:
+            return False
+
     # ---------- 记忆写入 ----------
 
     def remember(self, role, text, category="misc", importance=3, source="chat",
@@ -69,17 +81,27 @@ class MemoryModule:
             role, text, category=category, importance=importance,
             source=source, expires_at=expires_at,
         )
-        if self.agent.db.vec_ready:
+        # P1 事件时间线：memory.created（仅真正新增时；去重命中不记录）
+        try:
+            self.agent.db.log_event(
+                db.EventType.MEMORY_CREATED, "brain.memory",
+                {"role": role, "category": category, "id": item_id},
+                getattr(self.agent, "_trace_id", ""),
+            )
+        except Exception:
+            pass
+        if self.agent.db.vec_ready and not self._enqueue_embed("memory", item_id, text):
             vector = self.agent.embedder.embed_one(text)
             if vector:
                 self.agent.db.add_embedding("memory", item_id, vector)
         return item_id
 
     def _dedup_fact_id(self, text):
-        """精确 + 语义去重：去重范围是全量事实，不再只看最近 20 条。"""
-        for item in self.agent.memory.all_facts():
-            if item["text"] == text:
-                return item["id"]
+        """精确 + 语义去重：先 SQL 精确匹配（O(log N)，走索引），
+        未命中再向量近重复（O(N) 向量扫描兜底）。"""
+        exact = self.agent.db.find_fact_by_text(text)
+        if exact is not None:
+            return exact
         if not (self.agent.db.vec_ready and self.agent.embedder.ready):
             return None
         try:
@@ -129,6 +151,8 @@ class MemoryModule:
 
     def embed_chat(self, item_id, text):
         if not self.agent.db.vec_ready:
+            return
+        if self._enqueue_embed("chat", item_id, text):
             return
         vector = self.agent.embedder.embed_one(text)
         if vector:
@@ -244,7 +268,7 @@ class MemoryModule:
             (r"(?:请你|你|帮我)?(?:记住|记一下|记下来|记住一下|以后记得)(?:[：:，,]?\s*)(.{2,60})", f"{owner}要求记住：{{}}", "misc", 3),
             (r"(?:我希望你|你以后要|以后你)([^，。！？]{2,60})", f"{owner}希望：{{}}", "preference", 3),
         ]
-        existing = {i["text"] for i in self.agent.memory.all_facts()}
+        seen = set()
         saved = 0
         for pattern, template, category, importance in rules:
             match = re.search(pattern, user_text)
@@ -254,7 +278,8 @@ class MemoryModule:
                 fact = match.group(0)
             else:
                 fact = template.format(match.group(1))
-            if fact not in existing:
+            # 精确查重走 SQL（O(log N)），不再全量加载；seen 防同轮重复规则命中
+            if fact not in seen and self.agent.db.find_fact_by_text(fact) is None:
                 item_id = self.remember(
                     "fact",
                     fact,
@@ -265,7 +290,7 @@ class MemoryModule:
                     ),
                 )
                 if item_id is not None:
-                    existing.add(fact)
+                    seen.add(fact)
                     saved += 1
                     if self.agent.stats:
                         self.agent.stats.record_fact()
@@ -329,7 +354,7 @@ class MemoryModule:
             ) or ""
         except Exception:
             return 0
-        existing = {i["text"] for i in self.agent.memory.all_facts()}
+        seen = set()
         saved = 0
         for line in raw.splitlines():
             line = line.strip()
@@ -344,7 +369,9 @@ class MemoryModule:
                     fact = fact[end + 1:].strip()
             elif fact.startswith("]"):
                 fact = fact[1:].strip()
-            if not fact or fact in existing or self._is_sensitive_fact(fact):
+            # 精确查重走 SQL（O(log N)）；seen 防 LLM 本批重复输出同一条
+            if not fact or fact in seen or self._is_sensitive_fact(fact) \
+                    or self.agent.db.find_fact_by_text(fact) is not None:
                 continue
             if category not in ("identity", "preference", "habit", "schedule", "finance", "misc"):
                 category = "misc"
@@ -357,7 +384,7 @@ class MemoryModule:
                 expires_at=self.parse_schedule_expiry(fact) if category == "schedule" else None,
             )
             if item_id is not None:
-                existing.add(fact)
+                seen.add(fact)
                 saved += 1
                 if self.agent.stats:
                     self.agent.stats.record_fact()

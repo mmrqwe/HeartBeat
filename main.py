@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
@@ -21,6 +22,8 @@ from gui.chat_window import ChatWindow
 from gui.pet_window import PetWindow
 from gui.search_window import SearchWindow
 from gui.settings_window import SettingsWindow
+
+from kernel.embedqueue import EmbedQueue
 
 TICK_TIMEOUT_MS = 180_000
 CHAT_TIMEOUT_MS = 1_800_000  # 30 分钟：支持 100 轮工具循环的复杂任务
@@ -52,6 +55,9 @@ class HeartBeatApp:
         self.data_dir = self.kernel.data_dir
         self.db = db.Database(self.data_dir / "heartbeat.db")
         self.stats = core.Stats(self.db)
+        # 向量索引异步队列（P0）：embedding 挪到后台单 worker，聊天/记忆写入
+        # 不再同步跑 ONNX 推理；worker 失败 log-and-drop，缺失向量由 reindex 补齐
+        self.embed_queue = EmbedQueue()
         self.agent = agent.create_agent(
             self.cfg,
             self.plugins,
@@ -59,7 +65,9 @@ class HeartBeatApp:
             stats=self.stats,
             db=self.db,
             brain_loader=self.kernel.updater,
+            embed_queue=self.embed_queue,
         )
+        self.embed_queue.set_worker(self._embed_worker)
         # 事件总线注入：agent 工具执行 → tool.executed 旁路通知（异步回主线程）
         self.agent.eventbus = self.kernel.eventbus
         # 运行期健康监控（kernel.monitor）：tick/chat 心跳 + 超阈值自动回滚
@@ -318,15 +326,25 @@ class HeartBeatApp:
 
     def _tick_work(self, epoch):
         """主动思考任务体（子线程执行）：采集 + 生活循环。返回 (message, errors)。"""
-        ctx = core.gather(
-            self.plugins,
-            self.cfg,
-            self.stats,
-            context={"topics": self.agent.patrol_topics()},
-        )
-        message = self.agent.live(ctx)
-        errors = "，".join(ctx["errors"])
-        return message, errors
+        trace = f"tick_{uuid.uuid4().hex[:8]}"
+        self.agent._trace_id = trace
+        self.db.log_event(db.EventType.TICK_STARTED, "main.tick", {}, trace)
+        t0 = time.time()
+        try:
+            ctx = core.gather(
+                self.plugins,
+                self.cfg,
+                self.stats,
+                context={"topics": self.agent.patrol_topics()},
+            )
+            message = self.agent.live(ctx)
+            errors = "，".join(ctx["errors"])
+            return message, errors
+        finally:
+            self.db.log_event(
+                db.EventType.TICK_FINISHED, "main.tick",
+                {"elapsed_ms": int((time.time() - t0) * 1000)}, trace,
+            )
 
     def _show_tick_result(self, result):
         """主线程回调（kernel.runtime 已过滤过期 epoch）。"""
@@ -350,12 +368,18 @@ class HeartBeatApp:
         self._update_chat_stats()
 
     def _tick_timeout(self):
-        self.monitor.record_tick(False)
+        self.monitor.record_tick(False, failure="timeout")
         self._set_status("思考超时，已重置，稍后自动重试")
 
     def _tick_error(self, error):
-        """tick 任务异常（主线程回调）：计入 Monitor 心跳并透出给用户。"""
-        self.monitor.record_tick(False)
+        """tick 任务异常（主线程回调）：按故障域计入 Monitor 心跳并透出给用户。
+
+        P0 错误分类：网络/provider 等基础设施故障只审计不累计回滚，
+        避免“LLM/网络挂了 → 误判 brain 坏了 → 自动回滚”。
+        """
+        self.monitor.record_tick(
+            False, failure=self.monitor.classify_failure(error), exc=error
+        )
         stamp = time.strftime("%H:%M")
         text = f"{stamp} 思考异常：{error}"
         self._set_status(text)
@@ -384,6 +408,11 @@ class HeartBeatApp:
     def _on_brain_switched(self, payload):
         """updater 热切换回调：重载领域模块（失败保持旧模块，不中断会话）。"""
         module_name, version = payload
+        # P1 事件时间线：brain.updated（rollback 详情在 updates.log 审计）
+        self.db.log_event(
+            db.EventType.BRAIN_UPDATED, "updater",
+            {"module": module_name, "version": version},
+        )
         ok = self.agent.reload_brain_modules()
         self._set_status(
             f"大脑模块 {module_name} 已切换到 {version}"
@@ -456,9 +485,21 @@ class HeartBeatApp:
 
     def _chat_work(self, epoch, text):
         """聊天任务体（子线程执行）：带工具循环的 LLM 回复。"""
-        return self.agent.chat(
-            text, on_delta=lambda t, e=epoch: self._stream_delta(e, t)
+        trace = f"chat_{uuid.uuid4().hex[:8]}"
+        self.agent._trace_id = trace
+        self.db.log_event(
+            db.EventType.CHAT_STARTED, "main.chat", {"text_len": len(text)}, trace,
         )
+        t0 = time.time()
+        try:
+            return self.agent.chat(
+                text, on_delta=lambda t, e=epoch: self._stream_delta(e, t)
+            )
+        finally:
+            self.db.log_event(
+                db.EventType.CHAT_FINISHED, "main.chat",
+                {"elapsed_ms": int((time.time() - t0) * 1000)}, trace,
+            )
 
     def _stream_delta(self, epoch, text):
         if epoch != self.kernel.runtime.current_epoch("chat"):
@@ -500,7 +541,7 @@ class HeartBeatApp:
 
     def _chat_timeout(self):
         self._set_status("回复超时，已停止等待")
-        self.monitor.record_chat(False)  # 超时计入窗口失败（与异常同权）
+        self.monitor.record_chat(False, failure="timeout")  # 超时归基础设施故障：留痕不累计回滚
         if self.chat_win:
             self.chat_win.cancel_stream()  # 清理流式占位气泡，避免影响下次回复
             self.chat_win.set_thinking(False)
@@ -510,8 +551,14 @@ class HeartBeatApp:
         self._drain_chat_pending()
 
     def _chat_error(self, error):
-        """chat 任务异常（主线程回调）：计入 Monitor 窗口并透出给用户。"""
-        self.monitor.record_chat(False)
+        """chat 任务异常（主线程回调）：按故障域计入 Monitor 窗口并透出给用户。
+
+        P0 错误分类：LLM 服务商网络故障/429/key 失效等基础设施故障只审计
+        不累计——不会因服务端问题误判 brain 失速而自动回滚。
+        """
+        self.monitor.record_chat(
+            False, failure=self.monitor.classify_failure(error), exc=error
+        )
         stamp = time.strftime("%H:%M")
         text = f"{stamp} 回复失败：{error}"
         self._set_status("回复失败，请稍后重试")
@@ -552,6 +599,24 @@ class HeartBeatApp:
         self.search_win.show()
         self.search_win.raise_()
         self.search_win.activateWindow()
+
+    def _embed_worker(self, kind, item_id, text):
+        """后台向量索引任务（embed 队列单 worker 串行执行，P0）。
+
+        失败 log-and-drop：不重试不阻塞队列，缺失向量由 reindex 补齐。
+        embedder 引用实时取 self.agent.embedder——reload 重建后自动生效
+        （属性赋值原子替换 + GIL：旧 ONNX session 正在执行的推理安全完成）。
+        """
+        if kind not in ("memory", "chat"):
+            return
+        try:
+            if not self.agent.db.vec_ready or not self.agent.embedder.ready:
+                return
+            vector = self.agent.embedder.embed_one(text)
+            if vector:
+                self.agent.db.add_embedding(kind, item_id, vector)
+        except Exception:
+            pass  # log-and-drop：缺失向量由下次 reindex 补齐
 
     def save_settings(self, cfg):
         self.cfg = cfg

@@ -16,7 +16,7 @@ from brain.planner import CURIOSITY_QUESTIONS  # noqa: F401
 
 
 def create_agent(cfg, plugins=None, data_dir=None, stats=None, db=None,
-                 brain_loader=None, clock=None):
+                 brain_loader=None, clock=None, embed_queue=None):
     """Agent 工厂：brain 包 active 且可加载 → 实例化包内 Agent 类
     （控制流进入进化域）；否则用内置 Agent（零行为变更）。"""
     if brain_loader is not None:
@@ -27,11 +27,11 @@ def create_agent(cfg, plugins=None, data_dir=None, stats=None, db=None,
                     cls = getattr(sys.modules[f"{pkg.__name__}.agent"], "Agent")
                     return cls(
                         cfg, plugins, data_dir, stats=stats, db=db,
-                        brain_loader=brain_loader, clock=clock,
+                        brain_loader=brain_loader, clock=clock, embed_queue=embed_queue,
                     )
         except Exception:
             pass
     return Agent(
         cfg, plugins, data_dir, stats=stats, db=db,
-        brain_loader=brain_loader, clock=clock,
+        brain_loader=brain_loader, clock=clock, embed_queue=embed_queue,
     )

@@ -11,6 +11,22 @@ VEC_DIM = 512  # BAAI/bge-small-zh-v1.5 的向量维度
 DEFAULT_MEMORY_CAP = 500  # 记忆条数上限（可被配置 memory_cap 覆盖）
 
 
+class EventType:
+    """事件时间线类型常量（P1 Event Store）：集中管理防拼写错误。
+
+    与 tool_logs / stats / updates.log 并存：events 只做统一时间线，
+    统计与审计继续用各自机制（不替代）。
+    """
+
+    CHAT_STARTED = "chat.started"
+    CHAT_FINISHED = "chat.finished"
+    TICK_STARTED = "tick.started"
+    TICK_FINISHED = "tick.finished"
+    TOOL_CALLED = "tool.called"
+    MEMORY_CREATED = "memory.created"
+    BRAIN_UPDATED = "brain.updated"
+
+
 class Database:
     def __init__(self, path):
         self.path = Path(path)
@@ -38,6 +54,8 @@ class Database:
                     expires_at TEXT,
                     last_used_at TEXT
                 );
+                CREATE INDEX IF NOT EXISTS idx_memory_role_text
+                    ON memory(role, text);
                 CREATE TABLE IF NOT EXISTS chat_messages(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     role TEXT NOT NULL,
@@ -90,6 +108,17 @@ class Database:
                     ok INTEGER NOT NULL DEFAULT 0,
                     summary TEXT NOT NULL DEFAULT ''
                 );
+                CREATE TABLE IF NOT EXISTS events(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT '',
+                    payload TEXT NOT NULL DEFAULT '',
+                    trace_id TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+                CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
+                CREATE INDEX IF NOT EXISTS idx_events_trace ON events(trace_id);
                 """
             )
             columns = {
@@ -174,6 +203,19 @@ class Database:
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return [dict(row) for row in reversed(rows)]
+
+    def find_fact_by_text(self, text):
+        """事实精确查重：SQL 等值匹配（走 idx_memory_role_text 索引）。
+
+        替代“全量加载 + Python 循环”的去重抽象（O(N) → O(log N)）；
+        语义去重（向量近重复）仍由调用方在未命中时兜底。
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM memory WHERE role='fact' AND text=? LIMIT 1",
+                (str(text or "").strip(),),
+            ).fetchone()
+        return row["id"] if row else None
 
     def memory_profile(self, limit_per=3, roles=None, now=None):
         """按类别分组的记忆画像：每类取 importance 最高的 limit_per 条。
@@ -487,6 +529,52 @@ class Database:
                  (summary or "")[:500]),
             )
             self._conn.commit()
+
+    def log_event(self, type_, source="", payload=None, trace_id=""):
+        """事件时间线（P1）：统一调试/监控时间线，与 tool_logs/stats 并存。
+
+        - 同步单行 INSERT（WAL 亚毫秒），不做异步队列——埋点必须在主链路
+          立即可见，且单行插入开销可忽略；
+        - 任何异常静默返回 False：埋点绝不阻断主链路；
+        - payload 为 JSON 可序列化对象；trace_id 关联一次会话（chat_xxx/tick_xxx）。
+        """
+        try:
+            blob = json.dumps(payload, ensure_ascii=False) if payload is not None else ""
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO events(ts, type, source, payload, trace_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        str(type_),
+                        str(source or ""),
+                        blob,
+                        str(trace_id or ""),
+                    ),
+                )
+                self._conn.commit()
+            return True
+        except Exception:
+            return False
+
+    def event_items(self, type_=None, limit=100, trace_id=None):
+        """查询事件时间线（调试用）：按时间倒序，可按类型/会话过滤。"""
+        query = "SELECT id, ts, type, source, payload, trace_id FROM events"
+        params = []
+        conditions = []
+        if type_:
+            conditions.append("type = ?")
+            params.append(str(type_))
+        if trace_id:
+            conditions.append("trace_id = ?")
+            params.append(str(trace_id))
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
 
     def tool_log_items(self, limit=100):
         with self._lock:

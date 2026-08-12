@@ -496,10 +496,14 @@ if __name__ == "__main__":
             patch = _Patch()
             try:
                 params = list(inspect.signature(fn).parameters)
-                if "monkeypatch" in params:
+                if "tmp_path" in params and "monkeypatch" in params:
                     fn(Path(tmp), patch)
-                else:
+                elif "monkeypatch" in params:
+                    fn(patch)
+                elif "tmp_path" in params:
                     fn(Path(tmp))
+                else:
+                    fn()
                 print(f"PASS {name}")
             except Exception:
                 failed += 1

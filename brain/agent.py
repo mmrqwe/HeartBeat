@@ -33,7 +33,7 @@ from .planner import Planner
 class Agent(ChatMixin, ThinkMixin):
     """桌宠的自主层：SQLite 记忆 + 向量检索 + 想法 + 主动行为。"""
 
-    def __init__(self, cfg, plugins=None, data_dir=None, clock=None, stats=None, db=None, brain_loader=None):
+    def __init__(self, cfg, plugins=None, data_dir=None, clock=None, stats=None, db=None, brain_loader=None, embed_queue=None):
         self.cfg = cfg
         self.plugins = plugins or {}
         self.data_dir = Path(data_dir) if data_dir else Path(".")
@@ -44,6 +44,9 @@ class Agent(ChatMixin, ThinkMixin):
         self._reindex_pending = False
         self.tool_confirm_cb: Optional[Callable[[str], bool]] = None  # GUI 注入：confirm 档写命令的用户确认回调
         self.eventbus = None  # GUI 注入：kernel.eventbus（工具执行旁路通知）
+        # 向量索引异步队列（kernel.embedqueue，GUI 注入）：embedding 不再同步
+        # 阻塞聊天/记忆写入；None（测试/CLI 直连）时保持同步旧行为
+        self.embed_queue = embed_queue
         self.brain_loader = brain_loader  # 自进化加载器（kernel.updater），None=用内置实现
         self.memory = Memory(self.db)
         self.chat_history = self.db.chat_items(100)
@@ -134,6 +137,12 @@ class Agent(ChatMixin, ThinkMixin):
         model = self.cfg.get("embedding_model", "BAAI/bge-small-zh-v1.5")
         previous = self.state.get("embed_model", "")
         if previous and previous != model:
+            # 队列里待处理的旧模型任务一并作废（向量表已清空，reindex 会全表补齐）
+            if self.embed_queue is not None:
+                try:
+                    self.embed_queue.clear()
+                except Exception:
+                    pass
             try:
                 self.db.clear_embeddings("memory")
                 self.db.clear_embeddings("chat")
@@ -379,7 +388,13 @@ class Agent(ChatMixin, ThinkMixin):
         )
 
     def _embed_chat(self, item_id, text):
-        """聊天向量索引（委托 brain.memory）。"""
+        """聊天向量索引（委托 brain.memory）：有异步队列时入队，否则同步。"""
+        if self.embed_queue is not None:
+            try:
+                if self.embed_queue.enqueue("chat", item_id, text):
+                    return
+            except Exception:
+                pass
         self.memory_module.embed_chat(item_id, text)
 
     def _relevant_memories(self, query, k=5):

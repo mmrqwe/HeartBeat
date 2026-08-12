@@ -71,6 +71,69 @@ def test_state_roundtrip(tmp_path):
     assert d2.get_state("last_proactive_ts") == 123.45
 
 
+def test_find_fact_by_text_exact(tmp_path):
+    """P0：SQL 精确查重（索引等值匹配），未命中返回 None。"""
+    d = _db(tmp_path)
+    mid = d.add_memory("fact", "主人喜欢喝咖啡", category="preference")
+    assert d.find_fact_by_text("主人喜欢喝咖啡") == mid
+    assert d.find_fact_by_text(" 主人喜欢喝咖啡 ") == mid  # strip 后命中
+    assert d.find_fact_by_text("主人爱喝咖啡") is None
+
+
+def test_find_fact_by_text_role_filtered(tmp_path):
+    """只匹配 fact 角色：thought 同文本不命中。"""
+    d = _db(tmp_path)
+    d.add_memory("thought", "主人喜欢喝咖啡")
+    assert d.find_fact_by_text("主人喜欢喝咖啡") is None
+
+
+def test_find_fact_by_text_index_created(tmp_path):
+    """(role, text) 索引随建表创建。"""
+    d = _db(tmp_path)
+    idx = d._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_memory_role_text'"
+    ).fetchone()
+    assert idx is not None, "缺 idx_memory_role_text 索引"
+
+
+def test_event_log_write_and_query(tmp_path):
+    """P1 Event Store：写入 + 时间线查询（按类型/会话过滤）。"""
+    d = _db(tmp_path)
+    assert d.log_event("chat.started", "main.chat", {"text_len": 3}, "chat_abc")
+    assert d.log_event("chat.finished", "main.chat", {"elapsed_ms": 12}, "chat_abc")
+    assert d.log_event("tool.called", "brain.tool", {"tool": "web_search"})
+    items = d.event_items(limit=10)
+    assert len(items) == 3
+    assert items[0]["type"] == "tool.called"  # 倒序
+    chat_events = d.event_items(type_="chat.started", limit=10)
+    assert len(chat_events) == 1
+    assert chat_events[0]["trace_id"] == "chat_abc"
+    traced = d.event_items(trace_id="chat_abc", limit=10)
+    assert len(traced) == 2
+    payload = traced[0]["payload"]
+    assert "elapsed_ms" in payload  # JSON 文本可解析
+
+
+def test_event_log_silent_on_failure(tmp_path):
+    """埋点失败静默返回 False，不抛异常（不阻断主链路）。"""
+    d = _db(tmp_path)
+    # 不可序列化 payload → 静默 False
+    assert d.log_event("x", "src", object()) is False
+    assert d.event_items(limit=10) == []
+
+
+def test_event_indexes_created(tmp_path):
+    """events 时间线索引（ts/type/trace_id）随建表创建。"""
+    d = _db(tmp_path)
+    names = {
+        r["name"]
+        for r in d._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_events_%'"
+        ).fetchall()
+    }
+    assert {"idx_events_ts", "idx_events_type", "idx_events_trace"} <= names
+
+
 def test_stats_record_today_totals_days(tmp_path):
     d = _db(tmp_path)
     d.stats_record_llm(prompt_tokens=100, completion_tokens=20, cached_tokens=30)

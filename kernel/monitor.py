@@ -1,11 +1,15 @@
-"""kernel.monitor：运行期健康监控（自进化安全网，阶段4）。
+"""kernel.monitor：运行期健康监控（自进化安全网，阶段4 + P0 错误分类）。
 
 职责：
 - 三层指标：tick 心跳（连续失败/超时）、chat 异常（窗口内累计）、超时；
+- **错误分类（P0，2026-08-12）**：基础设施故障（网络/provider/超时/认证）与
+  brain 故障（确定性异常/契约失败）分开——只有 brain 故障累计触发回滚，
+  infra/timeout 只审计留痕，避免“LLM 服务挂了 → 误判 brain 坏了 → 回滚”；
 - 阈值外部 JSON 配置（<data>/monitor.json），文件损坏回退默认值；
 - 连续异常自动触发 updater.rollback（brain 包回退到上一个可用版本），
   一次运行最多回滚一次（防循环）；
-- 审计：回滚/降级动作写 <data>/brain/updates.log（action=monitor_rollback）；
+- 审计：回滚/降级/infra 失败/未分类异常写 <data>/brain/updates.log
+  （action=monitor_rollback / monitor_failure / monitor_unclassified）；
 - 启动自测：fake 注入验证回滚链路（见 tests.test_monitor）。
 
 依赖方向：只依赖 stdlib；updater 由宿主注入（kernel↔宿主组合）。
@@ -27,9 +31,20 @@ DEFAULT_THRESHOLDS = {
     "max_auto_rollbacks": 1,
 }
 
+# 基础设施故障特征（异常类型全名 module.Name 转小写后的子串匹配）。
+# denylist 方案：匹配 → infra（不累计回滚）；未匹配 → brain（累计）。
+# 新异常类型未匹配时记 monitor_unclassified 审计（去重），便于扩充此表。
+_INFRA_MARKERS = (
+    "httpx", "urllib", "requests", "socket", "ssl", "dns",
+    "timeout", "connection", "eof", "responseread", "readerror",
+    "streaminterrupted", "apiconnection", "apirequest", "authentication",
+    "ratelimit", "badrequest", "protocollerror", "remoteprotocol",
+    "openai", "anthropic", "provider", "unexpectedeof",
+)
+
 
 class Monitor:
-    """运行期健康监控：记录 tick/chat 指标，超阈值自动回滚进化模块。"""
+    """运行期健康监控：记录 tick/chat 指标（分错误域），超阈值自动回滚进化模块。"""
 
     def __init__(self, data_dir, updater: Any = None):
         self.data_dir = Path(data_dir)
@@ -40,6 +55,9 @@ class Monitor:
         self._chat_window_start = time.time()
         self._rollbacks_done = 0
         self._last_action = ""  # 最近一次动作（audit 与测试断言用）
+        # 未分类异常类型名（去重，防刷屏；cap 防泄漏）
+        self._unclassified_logged = set()
+        self._unclassified_cap = 100
 
     # ---------- 阈值配置（外部 JSON，损坏回退默认） ----------
 
@@ -61,18 +79,57 @@ class Monitor:
             pass  # 损坏回退默认
         return thresholds
 
+    # ---------- 错误分类（P0） ----------
+
+    def classify_failure(self, exc) -> str:
+        """错误分类：infra（网络/provider/超时/认证）| brain（其余）| timeout（无对象）。
+
+        启发式 denylist：未匹配的新异常类型默认 brain（宁可误回滚也不漏回滚），
+        并记 monitor_unclassified 审计（按类型名去重），便于扩充特征表。
+        """
+        if exc is None:
+            return "timeout"
+        key = f"{type(exc).__module__}.{type(exc).__name__}"
+        low = key.lower()
+        if any(marker in low for marker in _INFRA_MARKERS):
+            return "infra"
+        self._audit_unclassified(key)
+        return "brain"
+
+    def _audit_unclassified(self, exc_key):
+        """未匹配异常类型记审计（去重，不刷屏）。"""
+        if exc_key in self._unclassified_logged:
+            return
+        if len(self._unclassified_logged) >= self._unclassified_cap:
+            return
+        self._unclassified_logged.add(exc_key)
+        self._audit("monitor_unclassified", module="classify",
+                    detail=f"未分类异常类型：{exc_key}（默认按 brain 处理）")
+
     # ---------- 指标记录 ----------
 
-    def record_tick(self, ok: bool, elapsed: float = 0.0):
-        """tick 心跳：ok=False（异常或超时）累加连续失败，成功清零。"""
+    def record_tick(self, ok: bool, failure: Optional[str] = None,
+                    exc: Any = None, elapsed: float = 0.0):
+        """tick 心跳：ok=False（异常或超时）累加连续失败，成功清零。
+
+        failure 取值：None（旧语义，计入失败）/ "brain"（计入失败并审计）/
+        "infra"（网络/provider 等，仅审计不累计）/ "timeout"（仅审计不累计）。
+        """
         if ok:
             self._tick_fail_streak = 0
             return None
-        self._tick_fail_streak += 1
-        return self._maybe_recover("tick")
+        if failure in (None, "brain"):
+            if failure == "brain":
+                self._audit_failure("tick", "brain", exc)
+            self._tick_fail_streak += 1
+            return self._maybe_recover("tick")
+        # infra / timeout：不累计回滚，但留痕（诊断“为什么没回滚”）
+        self._audit_failure("tick", failure, exc)
+        return None
 
-    def record_chat(self, ok: bool, elapsed: float = 0.0):
-        """chat 心跳：滑动窗口内累计失败（窗口过期清零）。"""
+    def record_chat(self, ok: bool, failure: Optional[str] = None,
+                    exc: Any = None, elapsed: float = 0.0):
+        """chat 心跳：滑动窗口内累计失败（窗口过期清零）。分类语义同 record_tick。"""
         now = time.time()
         window = float(self.thresholds["chat_window_seconds"])
         if now - self._chat_window_start > window:
@@ -80,8 +137,14 @@ class Monitor:
             self._chat_window_start = now
         if ok:
             return None
-        self._chat_fail_count += 1
-        return self._maybe_recover("chat")
+        if failure in (None, "brain"):
+            if failure == "brain":
+                self._audit_failure("chat", "brain", exc)
+            self._chat_fail_count += 1
+            return self._maybe_recover("chat")
+        # infra / timeout：不累计回滚，但留痕
+        self._audit_failure("chat", failure, exc)
+        return None
 
     # ---------- 自动回滚 ----------
 
@@ -146,6 +209,17 @@ class Monitor:
                 handle.write(record + "\n")
         except OSError:
             pass  # 审计失败不阻断
+
+    def _audit_failure(self, channel, failure_type, exc=None):
+        """infra/timeout/brain 失败留痕：诊断“为什么没回滚/为什么回滚了”。
+
+        detail 用纯文本（不嵌套 JSON，避免双重转义影响可读性与检索）。
+        """
+        parts = [f"channel={channel}", f"failure_type={failure_type}"]
+        if exc is not None:
+            parts.append(f"exc_type={type(exc).__module__}.{type(exc).__name__}")
+            parts.append(f"exc_msg={str(exc)[:200]}")
+        self._audit("monitor_failure", module=channel, detail=" ".join(parts))
 
     # ---------- 启动自测 ----------
 

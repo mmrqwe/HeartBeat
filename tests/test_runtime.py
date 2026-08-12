@@ -129,6 +129,46 @@ def test_on_timer_custom_callback():
     rt.stop_all()
 
 
+def test_error_callback_receives_exception_object():
+    """on_error 收到异常对象（P0：宿主侧可分类基础设施/brain 故障）。"""
+    rt = Runtime()
+    errors = []
+    rt.add_task(
+        "t6",
+        work=lambda epoch: (_ for _ in ()).throw(ValueError("boom")),
+        timeout_ms=5000,
+        on_error=lambda e: errors.append(e),
+    )
+    assert rt.trigger("t6"), "t6 trigger"
+    wait(200)
+    assert len(errors) == 1 and isinstance(errors[0], ValueError), f"errors: {errors}"
+    assert str(errors[0]) == "boom"
+
+
+def test_stop_all_cancels_queued_and_silences_inflight():
+    """线程池化（P1）：stop_all 取消排队任务；在途任务完成后不再 emit。"""
+    rt = Runtime()
+    results = []
+
+    def slow(epoch):
+        time.sleep(0.2)
+        return "late"
+
+    # 占满 3 个 worker（其中一个立即完成）后提交排队任务
+    rt.add_task("a", work=slow, timeout_ms=5000, on_result=lambda r: results.append(("a", r)))
+    rt.add_task("b", work=slow, timeout_ms=5000, on_result=lambda r: results.append(("b", r)))
+    rt.add_task("c", work=slow, timeout_ms=5000, on_result=lambda r: results.append(("c", r)))
+    rt.add_task("d", work=lambda epoch: "d-ok", timeout_ms=5000,
+                on_result=lambda r: results.append(("d", r)))
+    assert rt.trigger("a") and rt.trigger("b") and rt.trigger("c")
+    assert rt.trigger("d"), "d 排队中"
+    rt.stop_all()
+    wait(600)
+    # d 被取消（排队未执行）；a/b/c 在途执行但 _stopping 后不再 emit
+    assert not any(r[0] == "d" for r in results), f"排队任务应被取消: {results}"
+    assert all(r[0] in ("a", "b", "c") for r in results), f"在途任务应被静默: {results}"
+
+
 def _run_all():
     tests = [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_")]
     failed = 0

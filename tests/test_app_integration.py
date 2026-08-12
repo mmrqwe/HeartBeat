@@ -114,8 +114,8 @@ def test_monitor_wired_to_tick_and_chat():
     tmp, hb, orig_gather = _make_app()
     try:
         calls = []
-        hb.monitor.record_tick = lambda ok, elapsed=0.0: calls.append(("tick", ok))
-        hb.monitor.record_chat = lambda ok, elapsed=0.0: calls.append(("chat", ok))
+        hb.monitor.record_tick = lambda ok, failure=None, exc=None, elapsed=0.0: calls.append(("tick", ok))
+        hb.monitor.record_chat = lambda ok, failure=None, exc=None, elapsed=0.0: calls.append(("chat", ok))
         hb.agent.live = lambda ctx: None
         hb.agent.chat = lambda user_text, on_delta=None: "ok"
 
@@ -141,6 +141,39 @@ def test_monitor_wired_to_tick_and_chat():
         QTimer.singleShot(0, hb._autonomy_tick)
         wait(300)
         assert ("tick", False) in calls, calls
+    finally:
+        hb.kernel.stop()
+        tmp.cleanup()
+        core.gather = orig_gather
+
+
+def test_events_written_for_chat_and_tick():
+    """P1：chat/tick 任务埋点写入 events 时间线（trace_id 关联会话）。
+
+    注意：_make_app 的 data_dir 是真实用户目录（Kernel 迁移逻辑），
+    events 表与真实库共享——断言必须按 trace_id 过滤本测试会话。
+    """
+    tmp, hb, orig_gather = _make_app()
+    try:
+        hb.agent.live = lambda ctx: None
+        hb.agent.chat = lambda user_text, on_delta=None: "ok"
+        # tick 会话
+        QTimer.singleShot(0, hb._autonomy_tick)
+        wait(300)
+        tick_trace = getattr(hb.agent, "_trace_id", "") or ""
+        assert tick_trace.startswith("tick_"), f"tick trace 缺失：{tick_trace!r}"
+        tick_events = hb.db.event_items(trace_id=tick_trace, limit=10)
+        assert {e["type"] for e in tick_events} == {"tick.started", "tick.finished"}, tick_events
+        # chat 会话
+        hb._send_chat("hi")
+        wait(300)
+        chat_trace = getattr(hb.agent, "_trace_id", "") or ""
+        assert chat_trace.startswith("chat_"), f"chat trace 缺失：{chat_trace!r}"
+        chat_events = hb.db.event_items(trace_id=chat_trace, limit=10)
+        assert len(chat_events) == 2, chat_events
+        assert {e["type"] for e in chat_events} == {"chat.started", "chat.finished"}, chat_events
+        # started/finished 同 trace
+        assert chat_events[0]["trace_id"] == chat_events[1]["trace_id"] == chat_trace
     finally:
         hb.kernel.stop()
         tmp.cleanup()

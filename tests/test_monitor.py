@@ -151,6 +151,85 @@ def test_self_test_detects_broken_updater(tmp_path):
     assert not ok, "自测应检测到回滚链路故障"
 
 
+# ---------- P0：错误分类（基础设施故障不触发回滚，留痕审计） ----------
+
+
+class _FakeHttpxError(Exception):
+    """名字含 httpx 的异常（模拟 provider 网络故障）。"""
+
+
+def test_chat_infra_failures_do_not_trigger_rollback(tmp_path):
+    """网络/provider 等基础设施故障只审计，不累计回滚。"""
+    upd = FakeUpdater()
+    m = _monitor(tmp_path, updater=upd, chat_limit=3)
+    for _ in range(6):
+        m.record_chat(False, failure="infra")
+    assert upd.rollback_calls == [], "infra 失败不应触发回滚"
+    log = (tmp_path / "brain" / "updates.log").read_text(encoding="utf-8")
+    assert '"action": "monitor_failure"' in log
+    assert "failure_type=infra" in log
+
+
+def test_tick_infra_failures_do_not_trigger_rollback(tmp_path):
+    upd = FakeUpdater()
+    m = _monitor(tmp_path, updater=upd, tick_limit=3)
+    for _ in range(6):
+        m.record_tick(False, failure="infra")
+    assert upd.rollback_calls == [], "tick infra 失败不应触发回滚"
+
+
+def test_chat_brain_failures_trigger_rollback(tmp_path):
+    """brain 故障（显式分类）仍累计触发回滚，并审计异常详情。"""
+    upd = FakeUpdater()
+    m = _monitor(tmp_path, updater=upd, chat_limit=3)
+    for _ in range(3):
+        m.record_chat(False, failure="brain", exc=ValueError("契约损坏"))
+    assert upd.rollback_calls == ["brain"]
+    log = (tmp_path / "brain" / "updates.log").read_text(encoding="utf-8")
+    assert "failure_type=brain" in log
+    assert "契约损坏" in log
+
+
+def test_timeout_failures_audited_not_counted(tmp_path):
+    """超时归基础设施故障：留痕不累计（不回滚）。"""
+    upd = FakeUpdater()
+    m = _monitor(tmp_path, updater=upd, chat_limit=3)
+    for _ in range(6):
+        m.record_chat(False, failure="timeout")
+    assert upd.rollback_calls == []
+    log = (tmp_path / "brain" / "updates.log").read_text(encoding="utf-8")
+    assert "failure_type=timeout" in log
+
+
+def test_infra_failures_do_not_dilute_brain_count(tmp_path):
+    """infra 失败不稀释 brain 计数：5 次 infra + 3 次 brain 应触发回滚。"""
+    upd = FakeUpdater()
+    m = _monitor(tmp_path, updater=upd, chat_limit=3)
+    for _ in range(5):
+        m.record_chat(False, failure="infra")
+    for _ in range(3):
+        m.record_chat(False, failure="brain")
+    assert upd.rollback_calls == ["brain"]
+
+
+def test_classify_failure_domains(tmp_path):
+    """分类：网络/provider → infra；确定性异常 → brain；无对象 → timeout。"""
+    m = Monitor(tmp_path)
+    assert m.classify_failure(TimeoutError("connect")) == "infra"
+    assert m.classify_failure(_FakeHttpxError("429")) == "infra"
+    assert m.classify_failure(ValueError("brain bug")) == "brain"
+    assert m.classify_failure(None) == "timeout"
+
+
+def test_classify_unclassified_audited_once(tmp_path):
+    """未匹配异常类型记审计（按类型去重，不刷屏），默认按 brain 处理。"""
+    m = Monitor(tmp_path)
+    assert m.classify_failure(ValueError("x")) == "brain"
+    assert m.classify_failure(ValueError("y")) == "brain"  # 同类型不重复审计
+    log = (tmp_path / "brain" / "updates.log").read_text(encoding="utf-8")
+    assert log.count("monitor_unclassified") == 1
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in sorted(globals().items()):
