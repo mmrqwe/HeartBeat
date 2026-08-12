@@ -134,66 +134,214 @@ def test_gather(monkeypatch):
 
 # ---------- 插件：天气 ----------
 
+def _wttr_payload(temp="18", feels="17", desc="Cloudy"):
+    return json.dumps({
+        "current_condition": [{
+            "temp_C": temp,
+            "FeelsLikeC": feels,
+            "weatherDesc": [{"value": desc}],
+            "humidity": "66",
+            "windspeedKmph": "12",
+        }]
+    })
+
+
+def _reset_weather():
+    weather._reset_health()
+    weather._LAST_GOOD = None
+    weather._LAST_GOOD_TS = 0.0
+
+
 def test_weather_collect(monkeypatch):
-    def fake_http(url, timeout=12):
+    def fake_http(url, timeout=8, tries=2):
         if "format=j1" in url:
-            return json.dumps({
-                "current_condition": [{
-                    "temp_C": "18",
-                    "FeelsLikeC": "17",
-                    "weatherDesc": [{"value": "Cloudy"}],
-                    "humidity": "66",
-                    "windspeedKmph": "12",
-                }]
-            })
+            return _wttr_payload()
         return "多云"
 
+    _reset_weather()
     monkeypatch.setattr(core, "http_text", fake_http)
     entries = weather.collect({"city": "shanghai"})
     assert "多云" in entries[0]["text"]
     assert entries[0]["data"]["temp"] == 18
+    assert entries[0]["data"]["source"] == "wttr.in"
 
 
 def test_weather_collect_retries_ssl_eof(monkeypatch):
-    """wttr.in 偶发 SSL 断连：前两次失败第三次成功，应自愈。"""
+    """wttr.in 偶发 SSL 断连：首次失败重试成功，应自愈。"""
     calls = {"n": 0}
 
-    def flaky(url, timeout=12):
+    def flaky(url, timeout=8, tries=2):
         calls["n"] += 1
-        if "format=j1" in url and calls["n"] <= 2:
+        if "format=j1" in url and calls["n"] <= 1:
             raise OSError(
                 "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol"
             )
         if "format=j1" in url:
-            return json.dumps({
-                "current_condition": [{
-                    "temp_C": "18",
-                    "FeelsLikeC": "17",
-                    "weatherDesc": [{"value": "Cloudy"}],
-                    "humidity": "66",
-                    "windspeedKmph": "12",
-                }]
-            })
+            return _wttr_payload()
         return "多云"
 
+    _reset_weather()
     monkeypatch.setattr(core, "http_text", flaky)
     monkeypatch.setattr(weather, "_RETRY_DELAY", 0)  # 测试不等真实退避
     entries = weather.collect({"city": "shanghai"})
     assert entries[0]["data"]["temp"] == 18
-    assert calls["n"] >= 3  # j1 第三次才成功
+    assert calls["n"] >= 2  # j1 第二次才成功
 
 
 def test_weather_collect_retry_exhausted(monkeypatch):
-    def broken(url, timeout=12):
+    def broken(url, timeout=8, tries=2):
         raise OSError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred")
 
+    def broken_json(url, timeout=10):
+        raise OSError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred")
+
+    _reset_weather()
     monkeypatch.setattr(core, "http_text", broken)
+    monkeypatch.setattr(core, "http_json", broken_json)
     monkeypatch.setattr(weather, "_RETRY_DELAY", 0)
     try:
         weather.collect({"city": "shanghai"})
         assert False, "should raise after retries exhausted"
     except OSError:
         pass
+
+
+def test_weather_multi_source_fallback(monkeypatch):
+    """主源抛异常 → 切备源成功。"""
+    _reset_weather()
+    calls = {"b": 0}
+
+    def fail_a(settings):
+        raise OSError("wttr down")
+
+    def ok_b(settings):
+        calls["b"] += 1
+        return {"temp": 20, "feels": 21, "desc": "多云", "humidity": "50", "wind": "3", "source": "open-meteo"}
+
+    monkeypatch.setattr(weather, "SOURCES", [("a", fail_a), ("b", ok_b)])
+    entries = weather.collect({"city": "武汉"})
+    assert entries[0]["data"]["source"] == "open-meteo"
+    assert calls["b"] == 1
+    assert weather._health["a"]["fails"] == 1
+    assert "b" not in weather._health  # 成功源无健康记录
+
+
+def test_weather_circuit_breaker(monkeypatch):
+    """连续失败 2 次进入冷却，第 3 次该源被跳过不再调用。"""
+    _reset_weather()
+    calls = {"n": 0}
+
+    def always_fail(settings):
+        calls["n"] += 1
+        raise OSError("down")
+
+    monkeypatch.setattr(weather, "SOURCES", [("s", always_fail)])
+    for _ in range(2):
+        try:
+            weather.collect({"city": "武汉"})
+        except OSError:
+            pass
+    assert calls["n"] == 2
+    assert weather._source_cooling("s")
+    try:
+        weather.collect({"city": "武汉"})
+        assert False, "all sources cooling should raise"
+    except RuntimeError:
+        pass
+    assert calls["n"] == 2  # 第 3 次直接跳过，未发起请求
+
+
+def test_weather_circuit_breaker_recovers(monkeypatch):
+    """冷却过期后试探：成功则复位。"""
+    _reset_weather()
+    weather._record_failure("s", now=0)
+    weather._record_failure("s", now=0)
+    assert weather._source_cooling("s", now=100)
+    ok = {"temp": 20, "feels": 21, "desc": "晴", "humidity": "50", "wind": "3", "source": "s"}
+
+    def good(settings):
+        return ok
+
+    monkeypatch.setattr(weather, "SOURCES", [("s", good)])
+    weather._health["s"]["cool_until"] = 0  # 冷却已过期
+    entries = weather.collect({"city": "武汉"})
+    assert entries[0]["data"]["temp"] == 20
+    assert "s" not in weather._health  # 成功后复位
+
+
+def test_weather_last_good_fallback(monkeypatch):
+    """全源失败时返回最近一次成功结果（TTL 内），天气不中断。"""
+    _reset_weather()
+    monkeypatch.setattr(weather, "SOURCES", [("a", lambda s: {
+        "temp": 25, "feels": 26, "desc": "晴", "humidity": "40", "wind": "5", "source": "a",
+    })])
+    entries = weather.collect({"city": "武汉"})
+    assert entries[0]["data"]["temp"] == 25
+
+    def fail(settings):
+        raise OSError("down")
+
+    monkeypatch.setattr(weather, "SOURCES", [("a", fail), ("b", fail)])
+    entries = weather.collect({"city": "武汉"})
+    assert entries[0]["data"]["temp"] == 25  # 旧数据兜底
+
+
+def test_weather_open_meteo_skips_without_city():
+    """无城市配置时 Open-Meteo 不可用（无 IP 定位），返回 None 不算失败。"""
+    assert weather._fetch_open_meteo({}) is None
+    assert weather._fetch_open_meteo({"city": ""}) is None
+
+
+def test_weather_open_meteo_collect(monkeypatch):
+    """真实 SOURCES 下：主源挂 + 有城市 → Open-Meteo 兜底，WMO code 映射中文。"""
+    _reset_weather()
+
+    def fake_http_json(url, timeout=10):
+        if "geocoding" in url:
+            return {"results": [{"latitude": 30.59, "longitude": 114.3}]}
+        return {"current": {
+            "temperature_2m": 24.6,
+            "apparent_temperature": 26.1,
+            "relative_humidity_2m": 80,
+            "weather_code": 61,
+            "wind_speed_10m": 8.2,
+        }}
+
+    def broken_text(url, timeout=8, tries=2):
+        raise OSError("wttr down")
+
+    monkeypatch.setattr(core, "http_text", broken_text)
+    monkeypatch.setattr(core, "http_json", fake_http_json)
+    monkeypatch.setattr(weather, "_RETRY_DELAY", 0)
+    entries = weather.collect({"city": "武汉"})
+    data = entries[0]["data"]
+    assert data["source"] == "open-meteo"
+    assert data["temp"] == 25
+    assert data["feels"] == 26
+    assert data["desc"] == "小雨"  # WMO 61
+
+
+def test_weather_geocode_cached(monkeypatch):
+    """城市名不变则 geocode 只请求一次。"""
+    geocalls = {"n": 0}
+
+    def fake_http_json(url, timeout=10):
+        if "geocoding" in url:
+            geocalls["n"] += 1
+            return {"results": [{"latitude": 30.59, "longitude": 114.3}]}
+        return {"current": {
+            "temperature_2m": 20.0,
+            "apparent_temperature": 21.0,
+            "relative_humidity_2m": 50,
+            "weather_code": 2,
+            "wind_speed_10m": 3.0,
+        }}
+
+    monkeypatch.setattr(core, "http_json", fake_http_json)
+    weather._geocode_cache.clear()
+    weather._fetch_open_meteo({"city": "武汉"})
+    weather._fetch_open_meteo({"city": "武汉"})
+    assert geocalls["n"] == 1
 
 
 def test_weather_suggest():
