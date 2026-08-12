@@ -287,7 +287,7 @@ class Agent(ChatMixin, ThinkMixin):
             # 有 LLM 时由 Agent 自己分析该记住什么（不依赖写死规则）
             if self.memory_module.should_analyze(user_text, rule_saved):
                 try:
-                    self.memory_module.analyze_and_remember(user_text, reply)
+                    self._analyze_async(user_text, reply)
                 except Exception:
                     pass
         if self.stats:

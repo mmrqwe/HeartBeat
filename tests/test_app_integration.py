@@ -11,6 +11,7 @@
 
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -102,6 +103,78 @@ def test_chat_lifecycle_and_stale_delta():
         # 完成：busy 复位 + 状态流转
         assert not rt.is_busy("chat"), "chat 完成后应复位 busy"
         assert hb.pet._status_text == "陪我聊天中", f"状态应为‘陪我聊天中’，实际：{hb.pet._status_text}"
+    finally:
+        hb.kernel.stop()
+        tmp.cleanup()
+        core.gather = orig_gather
+
+
+def test_monitor_wired_to_tick_and_chat():
+    """Monitor 必须看到 tick/chat 的成功、异常与超时（防止自动回滚空转）。"""
+    tmp, hb, orig_gather = _make_app()
+    try:
+        calls = []
+        hb.monitor.record_tick = lambda ok, elapsed=0.0: calls.append(("tick", ok))
+        hb.monitor.record_chat = lambda ok, elapsed=0.0: calls.append(("chat", ok))
+        hb.agent.live = lambda ctx: None
+        hb.agent.chat = lambda user_text, on_delta=None: "ok"
+
+        QTimer.singleShot(0, hb._autonomy_tick)
+        wait(300)
+        assert ("tick", True) in calls, calls
+
+        hb._send_chat("hi")
+        wait(300)
+        assert ("chat", True) in calls, calls
+
+        def boom_chat(user_text, on_delta=None):
+            raise RuntimeError("boom")
+
+        hb.agent.chat = boom_chat
+        hb._send_chat("hi2")
+        wait(400)
+        assert ("chat", False) in calls, calls
+
+        rt = hb.kernel.runtime
+        rt._tasks["tick"]["timeout_ms"] = 60
+        hb.agent.live = lambda ctx: time.sleep(0.4) or None
+        QTimer.singleShot(0, hb._autonomy_tick)
+        wait(300)
+        assert ("tick", False) in calls, calls
+    finally:
+        hb.kernel.stop()
+        tmp.cleanup()
+        core.gather = orig_gather
+
+
+def test_chat_busy_queues_next_message():
+    """chat 忙碌时新消息应排队，空闲后按 FIFO 继续，不静默丢弃。"""
+    tmp, hb, orig_gather = _make_app()
+    try:
+        rt = hb.kernel.runtime
+        gate = threading.Event()
+        calls = []
+
+        def fake_chat(user_text, on_delta=None):
+            calls.append(user_text)
+            if user_text == "first":
+                gate.wait(2)
+            return "ok"
+
+        hb.agent.chat = fake_chat
+        hb._send_chat("first")
+        wait(200)
+        assert rt.is_busy("chat")
+
+        hb._send_chat("second")
+        assert hb._chat_pending == ["second"]
+        assert "已排队" in hb.pet._status_text
+
+        gate.set()
+        wait(600)
+        assert calls == ["first", "second"], calls
+        assert hb._chat_pending == []
+        assert not rt.is_busy("chat")
     finally:
         hb.kernel.stop()
         tmp.cleanup()

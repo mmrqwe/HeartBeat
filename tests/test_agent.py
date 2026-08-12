@@ -289,6 +289,60 @@ def test_display_stream_text_hides_directives():
     assert agent.Agent._display_stream_text(raw) == "好的"
 
 
+def test_display_stream_text_hides_structured_directives():
+    raw = "好的\n[FACT:schedule] 明天开会\n[OBSERVE] 主人很忙\n[THINK] 记一下\n正文"
+    shown = agent.Agent._display_stream_text(raw)
+    assert "[FACT:schedule]" not in shown
+    assert "[OBSERVE]" not in shown
+    assert "[THINK]" not in shown
+    assert shown == "好的\n正文"
+
+
+def test_build_chat_messages_no_duplicate_current_user(tmp_path):
+    a = _make_agent(tmp_path)
+    a.append_chat("user", "今天天气怎么样")
+    _, messages, _ = a._build_chat_messages("今天天气怎么样")
+    hits = [
+        m for m in messages
+        if m.get("role") == "user" and m.get("content") == "今天天气怎么样"
+    ]
+    assert len(hits) == 1
+
+
+def test_chat_defers_memory_analysis_to_background(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(
+        agent.Agent, "_analyze_async",
+        lambda self, user_text, reply: calls.append((user_text, reply)),
+    )
+    monkeypatch.setattr(core.Brain, "complete", lambda self, msgs, **kw: "好的")
+    monkeypatch.setattr(
+        core.Brain, "complete_tools",
+        lambda self, msgs, tools, **kw: ("好的", []),
+    )
+    cfg = _cfg()
+    cfg["api"]["api_key"] = "test-key"
+    a = _make_agent(tmp_path, cfg=cfg)
+    assert a.chat("我今天买了个新耳机") == "好的"
+    assert calls and calls[0][0] == "我今天买了个新耳机"
+
+
+def test_analyze_async_uses_daemon_thread(monkeypatch, tmp_path):
+    started = []
+
+    class FakeThread:
+        def __init__(self, target, args, daemon=False):
+            started.append((target, args, daemon))
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(threading, "Thread", FakeThread)
+    a = _make_agent(tmp_path)
+    a._analyze_async("用户说", "回复")
+    assert started and started[0][2] is True
+
+
 def test_chat_llm_tool_loop(monkeypatch, tmp_path):
     """聊天路径：LLM 先调 bash 工具再回复；confirm 档写操作必须请求用户确认。"""
     calls = {"n": 0}

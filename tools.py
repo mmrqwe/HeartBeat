@@ -680,6 +680,23 @@ def _search_primitive(kind, label, default_limit):
     return fn
 
 
+def _safe_http_text(url, timeout=10):
+    """进化工具 ctx 的 HTTP 读通道：与下载通道同款 SSRF 校验。"""
+    try:
+        kdownload.validate_http_target(url)
+    except kdownload.DownloadError as exc:
+        return f"请求被拒绝：{exc}"
+    return core.http_text(url, timeout=timeout)
+
+
+def _safe_http_json(url, timeout=10):
+    try:
+        kdownload.validate_http_target(url)
+    except kdownload.DownloadError as exc:
+        return f"请求被拒绝：{exc}"
+    return core.http_json(url, timeout=timeout)
+
+
 def _make_tool_ctx(mode, source, confirm_cb, audit, cwd):
     """进化工具 handler 的 ctx：原语绑定真实实现，权限与内置工具完全一致
     （run_bash/download/install 原语内部自带分级确认与审计）。"""
@@ -690,8 +707,8 @@ def _make_tool_ctx(mode, source, confirm_cb, audit, cwd):
         "weather": _search_primitive("weather", "天气", 1),
         "wiki_search": _search_primitive("wiki", "百科", 5),
         "arxiv_search": _search_primitive("arxiv", "学术", 5),
-        "http_text": core.http_text,
-        "http_json": core.http_json,
+        "http_text": _safe_http_text,
+        "http_json": _safe_http_json,
         "run_bash": lambda command: _exec_bash(
             {"command": str(command)}, source, confirm_cb, audit, mode, cwd
         ),

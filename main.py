@@ -100,6 +100,7 @@ class HeartBeatApp:
         self.chat_win = None
         self.settings_win = None
         self.search_win = None
+        self._chat_pending = []
 
         self.pet.show()
 
@@ -289,6 +290,7 @@ class HeartBeatApp:
             timeout_ms=TICK_TIMEOUT_MS,
             work=self._tick_work,
             on_result=self._show_tick_result,
+            on_error=self._tick_error,
             on_timeout=self._tick_timeout,
             # 定时到点走 _autonomy_tick：重排 + busy 检查 + “思考中…”状态提示
             # （与原版 QTimer 直接连 _autonomy_tick 的语义逐行等价）
@@ -299,6 +301,7 @@ class HeartBeatApp:
             timeout_ms=CHAT_TIMEOUT_MS,
             work=self._chat_work,
             on_result=self._show_reply,
+            on_error=self._chat_error,
             on_timeout=self._chat_timeout,
         )
         # 启动后 15 秒首次主动思考
@@ -315,21 +318,19 @@ class HeartBeatApp:
 
     def _tick_work(self, epoch):
         """主动思考任务体（子线程执行）：采集 + 生活循环。返回 (message, errors)。"""
-        try:
-            ctx = core.gather(
-                self.plugins,
-                self.cfg,
-                self.stats,
-                context={"topics": self.agent.patrol_topics()},
-            )
-            message = self.agent.live(ctx)
-            errors = "，".join(ctx["errors"])
-        except Exception as exc:
-            message, errors = None, str(exc)
+        ctx = core.gather(
+            self.plugins,
+            self.cfg,
+            self.stats,
+            context={"topics": self.agent.patrol_topics()},
+        )
+        message = self.agent.live(ctx)
+        errors = "，".join(ctx["errors"])
         return message, errors
 
     def _show_tick_result(self, result):
         """主线程回调（kernel.runtime 已过滤过期 epoch）。"""
+        self.monitor.record_tick(True)
         message, errors = result
         stamp = time.strftime("%H:%M")
         if message:
@@ -349,7 +350,19 @@ class HeartBeatApp:
         self._update_chat_stats()
 
     def _tick_timeout(self):
+        self.monitor.record_tick(False)
         self._set_status("思考超时，已重置，稍后自动重试")
+
+    def _tick_error(self, error):
+        """tick 任务异常（主线程回调）：计入 Monitor 心跳并透出给用户。"""
+        self.monitor.record_tick(False)
+        stamp = time.strftime("%H:%M")
+        text = f"{stamp} 思考异常：{error}"
+        self._set_status(text)
+        self.agent.append_chat("system", text)
+        if self.chat_win:
+            self.chat_win.add_message("system", text)
+        self._update_chat_stats()
 
     def _set_status(self, text):
         self.pet.set_status(text)
@@ -436,18 +449,16 @@ class HeartBeatApp:
 
     def _send_chat(self, text):
         self.pet.play("think")
-        self.kernel.runtime.trigger("chat", text)
+        if not self.kernel.runtime.trigger("chat", text):
+            self._chat_pending.append(text)
+            self._set_status("上一条还在回复中，已排队")
+            return
 
     def _chat_work(self, epoch, text):
         """聊天任务体（子线程执行）：带工具循环的 LLM 回复。"""
-        try:
-            return self.agent.chat(
-                text, on_delta=lambda t, e=epoch: self._stream_delta(e, t)
-            )
-        except Exception as exc:
-            reply = f"我卡壳了：{exc}"
-            self.agent.append_chat("assistant", reply)
-            return reply
+        return self.agent.chat(
+            text, on_delta=lambda t, e=epoch: self._stream_delta(e, t)
+        )
 
     def _stream_delta(self, epoch, text):
         if epoch != self.kernel.runtime.current_epoch("chat"):
@@ -465,6 +476,7 @@ class HeartBeatApp:
 
     def _show_reply(self, reply):
         """主线程回调（kernel.runtime 已过滤过期 epoch）。"""
+        self.monitor.record_chat(True)
         self.pet.play("talk", 1600)
         if self.chat_win:
             if self.chat_win.is_streaming():
@@ -476,6 +488,7 @@ class HeartBeatApp:
             self.chat_win.set_mood(self.agent.state.get("mood", "平静"))
             self.chat_win.set_daily_stats(self._daily_stats_text())
         self._set_status("陪我聊天中")
+        self._drain_chat_pending()
 
     def _on_evolve_status(self, text):
         """自我进化进度/结果（agent 后台线程 → 信号桥 → 主线程）。"""
@@ -494,6 +507,29 @@ class HeartBeatApp:
             self.chat_win.add_message(
                 "system", f"{time.strftime('%H:%M')} 回复超时，网络可能卡住了，请重试"
             )
+        self._drain_chat_pending()
+
+    def _chat_error(self, error):
+        """chat 任务异常（主线程回调）：计入 Monitor 窗口并透出给用户。"""
+        self.monitor.record_chat(False)
+        stamp = time.strftime("%H:%M")
+        text = f"{stamp} 回复失败：{error}"
+        self._set_status("回复失败，请稍后重试")
+        self.agent.append_chat("system", text)
+        if self.chat_win:
+            self.chat_win.cancel_stream()
+            self.chat_win.set_thinking(False)
+            self.chat_win.add_message("system", text)
+        self._drain_chat_pending()
+
+    def _drain_chat_pending(self):
+        """chat 空闲后取出排队消息（FIFO），避免忙碌时输入被静默丢弃。"""
+        if not self._chat_pending:
+            return
+        text = self._chat_pending[0]
+        if self.kernel.runtime.trigger("chat", text):
+            self._chat_pending.pop(0)
+            self.pet.play("think")
 
     def _clear_chat(self):
         self.agent.clear_chat_history()

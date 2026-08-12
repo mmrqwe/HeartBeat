@@ -180,7 +180,7 @@ class Updater:
     # evolver 是核心锁定集（进化引擎自身），agent.py 绝对导入宿主实现，
     # 不随包版本漂移；__init__/_contract 为包入口与契约声明。
     _PACKAGE_BUNDLE = ("agent.py", "agent_chat.py", "agent_think.py",
-                       "memory.py", "planner.py")
+                       "memory.py", "planner.py", "skills.py")
     _PACKAGE_INIT = (
         "from .agent import Agent\n"
         "from .memory import MemoryModule\n"

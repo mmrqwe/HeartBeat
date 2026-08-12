@@ -19,6 +19,7 @@ import core
 import search
 import tools
 from brain import context as context_mgr
+from .skills import scan_skill_metadata
 
 
 class ChatMixin:
@@ -265,6 +266,23 @@ class ChatMixin:
             except Exception:
                 pass
 
+    def _analyze_async(self, user_text, reply):
+        """记忆分析放到后台 daemon 线程，不阻塞 chat() 主链路。"""
+        try:
+            threading.Thread(
+                target=self._run_analyze_memory,
+                args=(user_text, reply),
+                daemon=True,
+            ).start()
+        except Exception:
+            pass
+
+    def _run_analyze_memory(self, user_text, reply):
+        try:
+            self.memory_module.analyze_and_remember(user_text, reply)
+        except Exception:
+            pass
+
     def _chat_llm(self, user_text):
         system, messages, budget = self._build_chat_messages(user_text)
         reply = self._parse_agent_reply(
@@ -473,7 +491,15 @@ class ChatMixin:
 
     def _build_chat_messages(self, user_text):
         relevant = self._relevant_memories(user_text, 5)
-        recent = [m for m in self.chat_history[-8:] if m["role"] in ("user", "assistant")]
+        history = self.chat_history
+        if (
+            history
+            and history[-1].get("role") == "user"
+            and history[-1].get("text") == user_text
+        ):
+            # 当前用户消息已在动态尾部追加，避免历史里再带一次
+            history = history[:-1]
+        recent = [m for m in history[-8:] if m["role"] in ("user", "assistant")]
         knowledge = bool(self._KNOWLEDGE_RE.search(user_text))
         owner = core.owner_title(self.cfg)
         narrator = "用户" if owner == "你" else owner
@@ -549,33 +575,9 @@ class ChatMixin:
         """扫描 <data>/skills/*/SKILL.md，返回元数据行（仅 name+description）。"""
         try:
             skills_root = Path(core.user_data_dir()) / "skills"
+            return "\n".join(scan_skill_metadata(skills_root))
         except Exception:
             return ""
-        if not skills_root.is_dir():
-            return ""
-        try:
-            folders = sorted(skills_root.iterdir())
-        except OSError:
-            return ""
-        lines = []
-        for folder in folders:
-            if not folder.is_dir():
-                continue
-            md = folder / "SKILL.md"
-            if not md.is_file():
-                continue
-            try:
-                meta = core.parse_skill_frontmatter(
-                    md.read_text(encoding="utf-8", errors="replace")
-                )
-            except OSError:
-                continue
-            if not meta:
-                continue
-            name = meta.get("name") or folder.name
-            desc = meta.get("description", "")
-            lines.append(f"[skill] name: {name} | desc: {self._truncate_text(desc, 200)}")
-        return "\n".join(lines)
 
     def _skill_section(self, patrol=False):
         """已安装技能的 system 段落：结构化标签 + 非指令声明 + 全局规则。
@@ -609,7 +611,12 @@ class ChatMixin:
         visible = [
             line
             for line in lines
-            if not (line.startswith("[FACT]") or line.startswith("[THINK]"))
+            if not (
+                line.startswith("[FACT]")
+                or line.startswith("[FACT:")
+                or line.startswith("[THINK]")
+                or line.startswith("[OBSERVE]")
+            )
         ]
         return "\n".join(visible)
 

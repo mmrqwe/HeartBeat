@@ -37,6 +37,14 @@ FORBIDDEN_CALLS = {
     "eval", "exec", "compile", "__import__", "open", "input",
     "breakpoint", "globals", "locals",
 }
+# pathlib 等方法名黑名单：pathlib 本身放行（宿主 agent.py 需要），但候选
+# 模块不允许直接读写文件/目录（read_text/write_text/iterdir 等均为文件 IO）。
+FORBIDDEN_ATTR_CALLS = frozenset({
+    "read_text", "read_bytes", "write_text", "write_bytes",
+    "open", "unlink", "mkdir", "rmdir", "rename",
+    "symlink_to", "hardlink_to", "touch", "iterdir", "glob", "rglob",
+    "readlink", "link_to",
+})
 # 生成 token 预算上限（超过视为失败，防白花钱）
 MAX_GEN_TOKENS = 8000
 # 验证失败后的重试次数（总计最多 MAX_ATTEMPTS+1 次生成，带错误反馈）
@@ -282,21 +290,22 @@ class Evolver:
                     root = alias.name.split(".")[0]
                     if root not in ALLOWED_IMPORTS:
                         errors.append(f"禁止 import：{alias.name}")
-            elif isinstance(node, ast.ImportFrom) and node.module:
+            elif isinstance(node, ast.ImportFrom):
                 # 包内相对导入（from .memory import ...）放行——限于包内，
                 # 不会逃逸到外部（候选包整体原子安装，_contract 约束布局）
-                if node.module.startswith("."):
+                if node.level > 0:
                     continue
-                root = node.module.split(".")[0]
-                if root not in ALLOWED_IMPORTS:
+                if node.module and node.module.split(".")[0] not in ALLOWED_IMPORTS:
                     errors.append(f"禁止 import：{node.module}")
             elif isinstance(node, ast.Call):
                 func = node.func
                 if isinstance(func, ast.Name) and func.id in FORBIDDEN_CALLS:
                     errors.append(f"禁止调用：{func.id}()")
-                elif isinstance(func, ast.Attribute) and func.attr in FORBIDDEN_CALLS:
+                elif isinstance(func, ast.Attribute):
                     # 仅拦截 dunder 属性调用（如 x.__import__()）；普通方法名
                     # （如 re.compile/x.eval）不是内置逃逸面，误杀得不偿失
+                    if func.attr in FORBIDDEN_ATTR_CALLS:
+                        errors.append(f"禁止文件 IO 调用：{func.attr}()")
                     if func.attr.startswith("__"):
                         errors.append(f"禁止调用：{func.attr}()")
         return errors

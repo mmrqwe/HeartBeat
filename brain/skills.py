@@ -5,6 +5,7 @@
 """
 
 import re
+from pathlib import Path
 
 SKILL_NAME_MAX = 40    # 技能名截断
 SKILL_DESC_MAX = 200   # 技能描述截断（注入 system prompt 的最小元数据面）
@@ -44,3 +45,37 @@ def parse_skill_frontmatter(text):
         if desc:
             data["description"] = desc[:SKILL_DESC_MAX]
     return data
+
+
+def scan_skill_metadata(skills_root):
+    """扫描 <skills_root>/*/SKILL.md，返回元数据行（name + desc）。
+
+    文件 IO 集中在本模块（可进化包内受信任代码），自进化候选模块不直接
+    触碰 pathlib 读写/目录遍历，便于 Evolver 静态安全边界收口。
+    """
+    lines = []
+    root = Path(skills_root)
+    if not root.is_dir():
+        return lines
+    try:
+        folders = sorted(root.iterdir())
+    except OSError:
+        return lines
+    for folder in folders:
+        if not folder.is_dir():
+            continue
+        md = folder / "SKILL.md"
+        if not md.is_file():
+            continue
+        try:
+            meta = parse_skill_frontmatter(
+                md.read_text(encoding="utf-8", errors="replace")
+            )
+        except OSError:
+            continue
+        if not meta:
+            continue
+        name = meta.get("name") or folder.name
+        desc = meta.get("description", "")
+        lines.append(f"[skill] name: {name} | desc: {desc[:SKILL_DESC_MAX]}")
+    return lines

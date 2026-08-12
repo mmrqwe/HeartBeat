@@ -109,6 +109,29 @@ def test_evolve_rejects_dangerous_import(tmp_path):
     assert ev.updater.active_version("planner") == "v1.0"
 
 
+def test_check_safety_blocks_pathlib_io():
+    """pathlib 放行但不许文件 IO：read_text/write_text/目录遍历均拒绝。"""
+    from brain.evolver import Evolver
+
+    assert Evolver.check_safety(None, PLANNER_SRC) == []
+    bad_read = (
+        "from pathlib import Path\n"
+        "class M:\n"
+        "    def profile(self):\n"
+        "        return Path('config.json').read_text()\n"
+    )
+    errors = Evolver.check_safety(None, bad_read)
+    assert any("read_text" in e for e in errors), errors
+
+    bad_write = "from pathlib import Path\nPath('x').write_text('y')\n"
+    errors = Evolver.check_safety(None, bad_write)
+    assert any("write_text" in e for e in errors), errors
+
+    bad_iter = "from pathlib import Path\nfor p in Path('.').iterdir():\n    pass\n"
+    errors = Evolver.check_safety(None, bad_iter)
+    assert any("iterdir" in e for e in errors), errors
+
+
 def test_evolve_retry_with_feedback(tmp_path):
     """首次生成语法错误 → 带反馈重试 → 第二次成功。"""
     fake = FakeBrain([BAD_SRC, PLANNER_EVOLVED])

@@ -692,6 +692,13 @@ def test_sandbox_read_write_list_run_and_policy():
             patch.restore()
 
 
+def test_evolved_tool_ctx_http_blocks_ssrf():
+    """进化工具 ctx.http_text/http_json 与下载通道共用 SSRF 校验。"""
+    ctx = tools._make_tool_ctx("confirm", tools.SOURCE_USER, None, None, None)
+    assert "请求被拒绝" in ctx.http_text("http://127.0.0.1/secret")
+    assert "请求被拒绝" in ctx.http_json("http://169.254.169.254/latest/meta-data/")
+
+
 # ---------- 声明生成 ----------
 
 def test_declarations_default_has_bash():

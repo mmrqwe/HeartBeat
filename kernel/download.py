@@ -91,6 +91,15 @@ def _check_target(url):
             raise DownloadError(f"目标地址在阻断网段（{addr}），已拒绝")
 
 
+def validate_http_target(url):
+    """公开目标校验：仅 http/https 且解析 IP 不在阻断网段。
+
+    下载、重定向以及进化工具 ctx.http_text/http_json 共用同一道 SSRF 防线。
+    """
+    _check_scheme(url)
+    _check_target(url)
+
+
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     """重定向时校验新目标（防 file:// 逃逸与重定向进内网）。"""
 
@@ -134,8 +143,7 @@ def download_file(
     url = (url or "").strip()
     if not url:
         raise DownloadError("下载地址为空")
-    _check_scheme(url)
-    _check_target(url)
+    validate_http_target(url)
     dest = Path(dest_dir)
     try:
         dest.mkdir(parents=True, exist_ok=True)
