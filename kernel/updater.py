@@ -24,8 +24,74 @@ from typing import Any
 
 from . import toolsafety
 
+
+def _extract_rules_lines(src):
+    """提取源码中 extract_facts 的规则表条目行（内置 policy 的结构标记）。
+
+    定位规则：`rules = [` 开头到下一个行尾 `]`。定位失败抛 ValueError。
+    """
+    lines = src.splitlines()
+    start = end = None
+    for i, line in enumerate(lines):
+        if "rules = [" in line:
+            start = i
+        if start is not None and line.strip() == "]":
+            end = i
+            break
+    if start is None or end is None:
+        raise ValueError("规则表未定位")
+    return lines[start + 1:end]
+
+
+def _inject_rules_into_target(target_src, added_lines):
+    """把新增规则行注入目标源码的规则表区域（更新而非新增的迁移层）。
+
+    优先按 `# --- rules:start/end ---` 标记定位（内置新版本带标记），
+    退化到 `rules = [` 定位；已存在行跳过。失败返回 None（调用方回退
+    标准内置版本）。
+    """
+    lines = target_src.splitlines()
+    marker_start = marker_end = None
+    for i, line in enumerate(lines):
+        if line.strip() == "# --- rules:start ---":
+            marker_start = i
+        if marker_start is not None and line.strip() == "# --- rules:end ---":
+            marker_end = i
+            break
+    if marker_start is not None and marker_end is not None:
+        insert_at = marker_end
+    else:
+        start = end = None
+        for i, line in enumerate(lines):
+            if "rules = [" in line:
+                start = i
+            if start is not None and line.strip() == "]":
+                end = i
+                break
+        if start is None or end is None:
+            return None
+        insert_at = end
+    deduped = [ln for ln in added_lines if ln not in lines]
+    if not deduped:
+        return target_src
+    # 统一缩进到目标文件规则行缩进（取插入点前一条规则行的前导空白）
+    try:
+        prev = lines[insert_at - 1]
+        stripped = prev.lstrip()
+        indent = prev[:len(prev) - len(stripped)]
+    except IndexError:
+        indent = "        "
+    out = lines[:insert_at] + [indent + ln.strip() for ln in deduped] + lines[insert_at:]
+    return "\n".join(out) + "\n"
+
+
 # 可进化模块清单（brain 层，允许 AI 替换升级）
 BUILTIN_MODULES = ("memory", "planner", "brain")
+# 内置修复版本（bugfix 发布时提升）：启动时 active 版本低于该版本且目标
+# 版本目录不存在 → 安装并切换（旧版本目录保留，可 rollback/switch 找回）；
+# 目标版本目录已存在（用户曾升级后主动回退）→ 尊重用户选择，不强制切换。
+# 语义：这是内置源码的新版本号，不是自进化版本——只提升行为修复对应的模块。
+BUILTIN_VERSIONS = {"memory": "1.2", "planner": "1.0", "brain": "1.0"}
 
 # 包模块：版本单元是目录（多文件 + __init__.py + _contract.py），
 # 整体版本化（active 指向整个包版本，禁止包内混版本）。
@@ -159,6 +225,10 @@ class Updater:
 
         每次 Kernel 启动调用：已安装则做加载预检，损坏自动回滚，
         保证升级失败不会卡死启动（自进化安全底座）。
+
+        内置修复版本升级：active 版本低于 BUILTIN_VERSIONS 且目标版本目录
+        不存在 → 安装内置新版本并切换（bugfix 发布生效的唯一通道）；
+        目标版本目录已存在 → 用户曾主动回退，尊重选择不强制。
         """
         # P2 拆包迁移（旧布局 brain 包内含 policy → 独立版本单元），
         # 幂等：新布局包（无 policy 文件）直接跳过。
@@ -167,7 +237,6 @@ class Updater:
             base = self.root / name
             if not base.is_dir() or not (base / "active").exists():
                 self._install_builtin(name)
-                continue
             try:
                 self.load(name)
             except Exception:
@@ -176,9 +245,83 @@ class Updater:
                 if self.rollback(name) is None:
                     self._install_builtin(name)
                     self._audit("rebuild", name, "v1.0", detail="active 损坏且无旧版本可回退")
+                continue
+            self._upgrade_builtin_fix(name)
 
     # ---------- 旧布局迁移（P2 拆包） ----------
 
+    def _upgrade_builtin_fix(self, name):
+        """内置修复版本升级：active 低于内置版本且目标目录不存在时安装切换。
+
+        只对 load 成功的模块执行；失败静默（升级不阻断启动，下次启动重试）。
+
+        方案 E：切换前尝试把用户进化版的规则表新增行迁移进内置修复版
+        （尽力而为——只迁移新增行，不迁移修改/删除行；失败保持标准版）。
+        """
+        try:
+            builtin = BUILTIN_VERSIONS.get(name, "1.0")
+            target = f"v{builtin}"
+            active = self.active_version(name) or "v1.0"
+            if self._version_key(active) >= self._version_key(target):
+                return
+            if (self._base(name) / target).is_dir():
+                # 目标版本目录已存在：用户曾升级后主动回退，尊重选择
+                return
+            self._install_builtin(name, builtin)
+            migrated = 0
+            if self._version_key(active) > self._version_key("v1.0"):
+                migrated = self._try_migrate_rules(name, active, builtin)
+            self._audit("builtin_upgrade", name, target,
+                        detail=f"内置修复版本（迁移用户规则 {migrated} 行），"
+                               "旧版本目录保留可回滚")
+        except Exception:
+            pass
+
+    def _try_migrate_rules(self, name, from_version, to_version):
+        """把用户进化版相对内置 v1.0 基线的规则表新增行注入内置修复版。
+
+        只迁移“新增行”（声明式规则数据）；修改/删除行不迁移——修改行
+        很可能就是本次被修复的 bug 逻辑。成功写 migration_marker.json。
+        任何失败返回 0，保持标准内置版本（失败安全）。
+        """
+        base = self._base(name)
+        target_path = base / f"v{to_version}" / f"{name}.py"
+        try:
+            user_src = (base / from_version / f"{name}.py").read_text(
+                encoding="utf-8")
+            baseline_src = (base / "v1.0" / f"{name}.py").read_text(
+                encoding="utf-8")
+            target_src = target_path.read_text(encoding="utf-8")
+        except OSError:
+            return 0
+        try:
+            user_rules = _extract_rules_lines(user_src)
+            base_rules = _extract_rules_lines(baseline_src)
+        except ValueError:
+            return 0
+        added = [ln for ln in user_rules if ln not in base_rules]
+        if not added:
+            return 0
+        merged = _inject_rules_into_target(target_src, added)
+        if merged is None or merged == target_src:
+            return 0
+        try:
+            compile(merged, str(target_path), "exec")
+        except SyntaxError:
+            return 0
+        try:
+            target_path.write_text(merged, encoding="utf-8")
+            (base / f"v{to_version}" / "migration_marker.json").write_text(
+                json.dumps({
+                    "from_version": from_version,
+                    "migrated_lines": len(added),
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                }, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            return 0
+        return len(added)
     def _migrate_legacy_brain_package(self):
         """旧布局（brain 包内含 memory.py/planner.py）→ 新布局（包只含控制流）。
 
@@ -251,15 +394,15 @@ class Updater:
         except OSError as exc:
             self._audit("migrate_failed", "brain", version, detail=str(exc))
 
-    def _install_builtin(self, name):
+    def _install_builtin(self, name, version="1.0"):
         if name in PACKAGE_MODULES:
-            self._install_builtin_package(name)
+            self._install_builtin_package(name, version=version)
             return
         src = self._builtin_source(name)
-        version_dir = self.root / name / "v1.0"
+        version_dir = self.root / name / f"v{version}"
         version_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, version_dir / f"{name}.py")
-        self._write_active(name, "v1.0")
+        self._write_active(name, f"v{version}")
 
     # 包模块内置文件清单（P2 拆包后）：控制流四件套——Agent 主类 +
     # 聊天/思考混入 + 技能元数据（agent_chat 相对导入的依赖）。
@@ -274,10 +417,10 @@ class Updater:
         "EXPORTS = {'agent.py': 'Agent'}\n"
     )
 
-    def _install_builtin_package(self, name):
+    def _install_builtin_package(self, name, version="1.0"):
         """包模块首启安装：从内置源（开发=项目 brain/，frozen=_MEIPASS/brain）
-        拷 PACKAGE_BUNDLE 文件 + 生成 __init__.py/_contract.py → v1.0。"""
-        version_dir = self.root / name / "v1.0"
+        拷 PACKAGE_BUNDLE 文件 + 生成 __init__.py/_contract.py → 指定版本。"""
+        version_dir = self.root / name / f"v{version}"
         version_dir.mkdir(parents=True, exist_ok=True)
         src_dir = self._builtin_package_dir(name)
         for file_name in self._PACKAGE_BUNDLE:
@@ -287,7 +430,7 @@ class Updater:
             shutil.copy2(src, version_dir / file_name)
         (version_dir / "__init__.py").write_text(self._PACKAGE_INIT, encoding="utf-8")
         (version_dir / "_contract.py").write_text(self._PACKAGE_CONTRACT, encoding="utf-8")
-        self._write_active(name, "v1.0")
+        self._write_active(name, f"v{version}")
 
     def _builtin_package_dir(self, name):
         """内置包源目录：开发模式=项目 brain/；frozen=_MEIPASS/brain。"""

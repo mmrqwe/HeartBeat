@@ -21,6 +21,8 @@ import core
 from brain.smoke import smoke_test_module
 from kernel.updater import Updater
 
+import kernel.updater as updater_mod
+
 ROOT = Path(__file__).parent.parent  # 项目根（tests/ 的上一级）
 
 
@@ -72,6 +74,18 @@ def _has_evolved_fact(ag):
     return any(i.get("category") == "evolve-test" for i in ag.memory.facts())
 
 
+def _inject_rule(src, rule_line):
+    """在 extract_facts 规则表首行插入一条规则（模拟用户进化定制）。"""
+    lines = src.splitlines()
+    for i, line in enumerate(lines):
+        if "rules = [" in line:
+            lines.insert(i + 1, rule_line)
+            break
+    else:
+        raise AssertionError("未找到 rules 表")
+    return "\n".join(lines) + "\n"
+
+
 # ---------- 首启安装 / 幂等 / 加载 ----------
 
 
@@ -79,8 +93,12 @@ def test_ensure_installed_first_run(tmp_path):
     upd = Updater(tmp_path)
     upd.ensure_installed()
     for name in ("memory", "planner"):
-        assert upd.active_version(name) == "v1.0"
         assert (tmp_path / "brain" / name / "v1.0" / f"{name}.py").is_file()
+    # 内置修复版本（BUILTIN_VERSIONS）首启直接升级
+    assert upd.active_version("planner") == "v1.0"
+    assert upd.active_version("memory") == \
+        f"v{updater_mod.BUILTIN_VERSIONS['memory']}"
+    assert (tmp_path / "brain" / "memory" / "v1.2" / "memory.py").is_file()
     mod = upd.load("memory")
     assert callable(getattr(mod, "MemoryModule", None))
 
@@ -91,7 +109,7 @@ def test_ensure_installed_idempotent(tmp_path):
     first = sorted(p.name for p in (tmp_path / "brain" / "memory").glob("v*"))
     upd.ensure_installed()
     second = sorted(p.name for p in (tmp_path / "brain" / "memory").glob("v*"))
-    assert first == second == ["v1.0"]
+    assert first == second == ["v1.0", "v1.2"]
 
 
 def test_create_instantiates_contract(tmp_path):
@@ -139,8 +157,8 @@ def test_install_new_version_and_active(tmp_path):
     upd = _make_updater(tmp_path)
     cand = _write_candidate(tmp_path, "memory", _evolved_memory_source())
     version = upd.install_candidate("memory", cand)
-    assert version == "v1.1"
-    assert upd.active_version("memory") == "v1.1"
+    assert version == "v1.3"
+    assert upd.active_version("memory") == "v1.3"
     mod = upd.load("memory")
     assert "进化验证" in Path(mod.__file__).read_text(encoding="utf-8")
 
@@ -155,16 +173,16 @@ def test_install_rejects_invalid_no_change(tmp_path):
     except ValueError:
         pass
     assert upd.list_versions("memory") == before
-    assert upd.active_version("memory") == "v1.0"
+    assert upd.active_version("memory") == "v1.2"
 
 
 def test_rollback(tmp_path):
     upd = _make_updater(tmp_path)
     cand = _write_candidate(tmp_path, "memory", _evolved_memory_source())
     upd.install_candidate("memory", cand)
-    assert upd.active_version("memory") == "v1.1"
-    assert upd.rollback("memory") == "v1.0"
-    assert upd.active_version("memory") == "v1.0"
+    assert upd.active_version("memory") == "v1.3"
+    assert upd.rollback("memory") == "v1.2"
+    assert upd.active_version("memory") == "v1.2"
 
 
 def test_switch_and_missing(tmp_path):
@@ -173,8 +191,8 @@ def test_switch_and_missing(tmp_path):
     upd.install_candidate("memory", cand)
     upd.switch("memory", "v1.0")
     assert upd.active_version("memory") == "v1.0"
-    upd.switch("memory", "v1.1")
-    assert upd.active_version("memory") == "v1.1"
+    upd.switch("memory", "v1.3")
+    assert upd.active_version("memory") == "v1.3"
     try:
         upd.switch("memory", "v9.9")
         raise AssertionError("应当拒绝不存在的版本")
@@ -197,7 +215,7 @@ def test_switch_emits_event(tmp_path):
 
     cand = _write_candidate(tmp_path, "memory", _evolved_memory_source())
     upd.install_candidate("memory", cand)
-    assert received == [("memory", "v1.1")], received
+    assert received == [("memory", "v1.3")], received
 
     upd.switch("memory", "v1.0")
     assert received[-1] == ("memory", "v1.0")
@@ -217,10 +235,14 @@ def test_audit_log_written(tmp_path):
     assert log_path.is_file()
     lines = log_path.read_text(encoding="utf-8").strip().splitlines()
     actions = [json.loads(ln) for ln in lines]
-    assert [a["action"] for a in actions] == ["install", "rollback"]
+    assert [a["action"] for a in actions] == [
+        "builtin_upgrade", "install", "rollback",
+    ]
     assert actions[0]["module"] == "memory"
-    assert actions[0]["version"] == "v1.1"
-    assert actions[0]["detail"]  # 记录候选来源路径
+    assert actions[0]["version"] == "v1.2"
+    assert actions[1]["module"] == "memory"
+    assert actions[1]["version"] == "v1.3"
+    assert actions[1]["detail"]  # 记录候选来源路径
     assert all(a.get("ts") for a in actions)
 
 
@@ -228,22 +250,24 @@ def test_startup_rollback_corrupt_active(tmp_path):
     upd = _make_updater(tmp_path)
     cand = _write_candidate(tmp_path, "memory", _evolved_memory_source())
     upd.install_candidate("memory", cand)
-    # 模拟 v1.1 在下次启动前损坏（同步失败/写入中断）
-    (tmp_path / "brain" / "memory" / "v1.1" / "memory.py").write_text(
+    # 模拟 v1.3 在下次启动前损坏（同步失败/写入中断）
+    (tmp_path / "brain" / "memory" / "v1.3" / "memory.py").write_text(
         "def broken(:\n", encoding="utf-8"
     )
-    upd.ensure_installed()  # 启动预检 → 自动回滚 v1.0
-    assert upd.active_version("memory") == "v1.0"
+    upd.ensure_installed()  # 启动预检 → 自动回滚 v1.2
+    assert upd.active_version("memory") == "v1.2"
     upd.load("memory")  # 不抛错
 
 
 def test_startup_rebuild_when_no_older(tmp_path):
     """兜底重建：active=v1.0 损坏且无更旧版本 → ensure_installed 重建 v1.0。"""
     upd = _make_updater(tmp_path)
-    # 只有 v1.0，把它写坏（模拟半写/同步中断）
+    # 只留 v1.0 并写坏（模拟半写/同步中断），模拟无更旧版本状态
+    shutil.rmtree(tmp_path / "brain" / "memory" / "v1.2")
     (tmp_path / "brain" / "memory" / "v1.0" / "memory.py").write_text(
         "def broken(:\n", encoding="utf-8"
     )
+    (tmp_path / "brain" / "memory" / "active").write_text("v1.0\n", encoding="utf-8")
     upd.ensure_installed()  # rollback 无旧版本 → 兜底重建
     assert upd.active_version("memory") == "v1.0"
     upd.load("memory")  # 源码已恢复，可加载
@@ -602,8 +626,8 @@ def test_migrate_legacy_brain_package(tmp_path):
     upd = Updater(tmp_path)
     upd.smoke_runner = smoke_test_module
     upd.ensure_installed()
-    # policy 已导出为独立版本单元
-    assert upd.active_version("memory") == "v1.0"
+    # policy 已导出为独立版本单元；内置修复版本自动升级 active
+    assert upd.active_version("memory") == "v1.2"
     assert upd.active_version("planner") == "v1.0"
     mem_src = (Path(tmp_path) / "brain" / "memory" / "v1.0" / "memory.py").read_text(
         encoding="utf-8")
@@ -614,13 +638,14 @@ def test_migrate_legacy_brain_package(tmp_path):
     assert not (pkg_dir / "planner.py").exists()
     init = (pkg_dir / "__init__.py").read_text(encoding="utf-8")
     assert "MemoryModule" not in init and "from .agent import Agent" in init
-    # 新布局包可加载、Agent 组合独立 policy 生效（增强规则来自迁移导出）
+    # 新布局包可加载；迁移导出的进化版仍可 switch 回验证
     upd.load("brain")
+    upd.switch("memory", "v1.0")
     ag = _make_agent(Path(tempfile.mkdtemp()), brain_loader=upd)
     assert type(ag.memory_module).__name__ == "MemoryModule"
     ag.memory_module.extract_facts("进化验证")
     assert _has_evolved_fact(ag), "迁移导出的 policy 未生效"
-    # 幂等：再次 ensure_installed 无变化
+    # 幂等：再次 ensure_installed 无变化（v1.2 已存在 → 尊重用户切回）
     upd.ensure_installed()
     assert not (pkg_dir / "memory.py").exists()
     assert upd.active_version("memory") == "v1.0"
@@ -644,8 +669,9 @@ def test_migrate_keeps_higher_independent_version(tmp_path):
     (Path(tmp_path) / "brain" / "memory" / "active").write_text("v1.1\n", encoding="utf-8")
     upd = Updater(tmp_path)
     upd.ensure_installed()
-    assert upd.active_version("memory") == "v1.1"
-    # v1.1 未被包内版覆盖
+    # 迁移不覆盖 v1.1；内置修复版本升级切到 v1.2
+    assert upd.active_version("memory") == "v1.2"
+    # v1.1 未被包内版覆盖（目录保留，可 switch 找回）
     v11_src = (Path(tmp_path) / "brain" / "memory" / "v1.1" / "memory.py").read_text(
         encoding="utf-8")
     assert "v1.1 用户进化版" in v11_src
@@ -674,7 +700,61 @@ def test_migrate_rolls_back_legacy_agent_relative_imports(tmp_path):
     assert "from brain.memory import" in agent_src
     # 包可加载、policy 已独立
     upd.load("brain")
-    assert upd.active_version("memory") == "v1.0"
+    assert upd.active_version("memory") == "v1.2"
     # 审计有回退记录
     log = (Path(tmp_path) / "brain" / "updates.log").read_text(encoding="utf-8")
     assert '"action": "migrate_control"' in log
+
+
+# ---------- 内置修复版本升级（方案 E：确定性覆盖 + 规则迁移） ----------
+
+def test_builtin_fix_upgrades_old_active_with_rule_migration(tmp_path):
+    """老用户（v1.1 进化定制）启动新版：内置修复 v1.2 生效 + 规则新增行迁移。"""
+    upd = _make_updater(tmp_path)  # 首启：v1.0 + v1.2，active=v1.2
+    src = (ROOT / "brain" / "memory.py").read_text(encoding="utf-8")
+    v11 = tmp_path / "brain" / "memory" / "v1.1"
+    v11.mkdir()
+    (v11 / "memory.py").write_text(
+        _inject_rule(src, '            (r"(老用户定制)", "检测到{}", "custom-rule", 5),'),
+        encoding="utf-8",
+    )
+    # 回到“升级前”状态：无 v1.2，active=v1.1
+    shutil.rmtree(tmp_path / "brain" / "memory" / "v1.2")
+    (tmp_path / "brain" / "memory" / "active").write_text("v1.1\n", encoding="utf-8")
+    upd.ensure_installed()
+    # 内置修复版本生效 + 用户规则迁移保留
+    assert upd.active_version("memory") == "v1.2"
+    v12_src = (tmp_path / "brain" / "memory" / "v1.2" / "memory.py").read_text(
+        encoding="utf-8")
+    assert "老用户定制" in v12_src, "用户进化规则应迁移到内置修复版"
+    marker = tmp_path / "brain" / "memory" / "v1.2" / "migration_marker.json"
+    assert marker.is_file()
+    assert json.loads(marker.read_text(encoding="utf-8"))["from_version"] == "v1.1"
+    # 老版本目录保留（可 switch 找回）
+    assert (v11 / "memory.py").is_file()
+
+
+def test_builtin_fix_respects_user_rollback(tmp_path):
+    """v1.2 目录已存在但用户主动切回旧版 → 不强制升级。"""
+    upd = _make_updater(tmp_path)
+    upd.switch("memory", "v1.0")
+    upd.ensure_installed()
+    assert upd.active_version("memory") == "v1.0"
+
+
+def test_builtin_fix_migration_failure_keeps_standard(tmp_path):
+    """规则迁移失败（基线 v1.0 缺失）→ 标准内置 v1.2 仍生效（失败安全）。"""
+    upd = _make_updater(tmp_path)
+    src = (ROOT / "brain" / "memory.py").read_text(encoding="utf-8")
+    v11 = tmp_path / "brain" / "memory" / "v1.1"
+    v11.mkdir()
+    (v11 / "memory.py").write_text(
+        _inject_rule(src, '            (r"(定制)", "检测到{}", "custom-rule", 5),'),
+        encoding="utf-8",
+    )
+    shutil.rmtree(tmp_path / "brain" / "memory" / "v1.2")
+    shutil.rmtree(tmp_path / "brain" / "memory" / "v1.0")  # 基线缺失
+    (tmp_path / "brain" / "memory" / "active").write_text("v1.1\n", encoding="utf-8")
+    upd.ensure_installed()
+    assert upd.active_version("memory") == "v1.2"
+    assert not (tmp_path / "brain" / "memory" / "v1.2" / "migration_marker.json").exists()

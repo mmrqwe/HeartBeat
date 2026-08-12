@@ -521,6 +521,7 @@ class MemoryModule:
         excluded.extend(corr_excluded)
         owner = self._owner()
         rules = [
+            # --- rules:start ---
             (r"我叫([^，。！？\s]{1,12})", f"{owner}叫{{}}", "identity", 4),
             (r"(?:我超爱|我最爱|我特别爱|我喜欢|我爱)(.+?)(?:[，。！？、]|$)", f"{owner}喜欢{{}}", "preference", 3),
             (r"我不喜欢(.+?)(?:[，。！？、]|$)", f"{owner}不喜欢{{}}", "preference", 3),
@@ -536,6 +537,7 @@ class MemoryModule:
             (r"(?:我|我最近|最近)(?:今天|昨晚|这两天|有点|总是|经常)?((?:熬夜|失眠|感冒|发烧|头疼|胃疼|过敏|嗓子疼)[^，。！？]{0,8})", f"{owner}最近{{}}", "habit", 3),
             (r"(?:请你|你|帮我)?(?:记住|记一下|记下来|记住一下|以后记得)(?:[：:，,]?\s*)(.{2,60})", f"{owner}要求记住：{{}}", "misc", 3),
             (r"(?:我希望你|你以后要|以后你)([^，。！？]{2,60})", f"{owner}希望：{{}}", "preference", 3),
+            # --- rules:end ---
         ]
         seen = set()
         saved = fixed
