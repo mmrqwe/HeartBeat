@@ -5,8 +5,13 @@
 
 kernel/updater 不 import 业务模块（依赖方向红线），L2 冒烟由本模块
 （应用层）注入执行；返回 True=通过，异常由 validate_candidate 捕获。
+
+P4 行为差分冒烟：单文件模块（memory/planner）候选与 active 版本在相同
+固定输入序列上对比输出形状——只拦结构性破坏（崩/丢字段/类型收窄/新异常），
+语义变更（None→有值、加字段、长度变化）记 WARNING 放行（进化日志审查）。
 """
 
+import logging
 import tempfile
 from pathlib import Path
 
@@ -16,13 +21,16 @@ import db as dbmod
 
 _CLASS_NAMES = {"memory": "MemoryModule", "planner": "Planner"}
 
+log = logging.getLogger("hb.smoke")
 
-def smoke_test_module(module_name, module):
+
+def smoke_test_module(module_name, module, active_module=None):
     """用候选模块实例化契约类并跑契约方法。返回 True=通过，失败抛异常。
 
     支持单文件模块（memory/planner）与包模块（brain，阶段2）：
-    包模式下从子模块取类（agent.py->Agent 等），Agent 做无参浅冒烟；
-    真实 Agent 构造复杂（需 cfg/db），阶段3 接入 L2b mock replay 深冒烟。
+    包模式下从子模块取类（agent.py->Agent 等），Agent 做无参浅冒烟。
+    active_module（P4 差分冒烟）：单文件模块候选 vs active 在固定输入序列上
+    对比输出形状，结构性破坏直接抛错拦截；语义变更记 WARNING。
     """
     if module_name == "brain":
         return _smoke_brain_package(module)
@@ -52,8 +60,112 @@ def smoke_test_module(module_name, module):
             inst.greeting(ag.clock())
             inst.patrol_topics()
             inst.rules_think({"collections": []}, ag.clock())
+        # P4 行为差分冒烟：同一 Agent + 同一输入序列，候选 vs active 输出形状对比
+        if active_module is not None:
+            _diff_contract(module_name, active_module, module, ag)
         database.close()
     return True
+
+
+# ---------- P4 行为差分冒烟 ----------
+
+
+def _fixture_calls(module_name, ag):
+    """固定输入序列（与上方基础冒烟同源，保证公平对比）。
+
+    每个条目 (方法名, 调用函数)——同一序列先跑 active 再跑候选，
+    状态累积一致（各自独立实例）。
+    """
+    if module_name == "memory":
+        return [
+            ("extract_facts", lambda i: i.extract_facts("我叫测试员，明天开会")),
+            ("remember", lambda i: i.remember("fact", "测试员喜欢摄影", category="preference")),
+            ("remember_schedule", lambda i: i.remember("schedule", "明天10点开会", category="schedule")),
+            ("relevant", lambda i: i.relevant("测试员")),
+            ("profile", lambda i: i.profile()),
+            ("parse_schedule_expiry", lambda i: i.parse_schedule_expiry("明天10点开会")),
+            ("followup_candidate", lambda i: i.followup_candidate(ag.clock())),
+            ("format_memories", lambda i: i.format_memories()),
+        ]
+    return [
+        ("build_time_context", lambda i: i.build_time_context()),
+        ("is_quiet", lambda i: i.is_quiet(ag.clock())),
+        ("cooldown_ok", lambda i: i.cooldown_ok(ag.clock())),
+        ("proactive_budget_ok", lambda i: i.proactive_budget_ok()),
+        ("update_mood", lambda i: i.update_mood({"collections": []})),
+        ("greeting", lambda i: i.greeting(ag.clock())),
+        ("plugin_messages", lambda i: i.plugin_messages()),
+        ("pick_search_topic", lambda i: i.pick_search_topic()),
+        ("patrol_topics", lambda i: i.patrol_topics()),
+        ("maybe_save_thought", lambda i: i.maybe_save_thought()),
+        ("rules_think", lambda i: i.rules_think({"collections": []}, ag.clock())),
+    ]
+
+
+def _compare_verdict(name, a_out, a_exc, c_out, c_exc):
+    """差分判决：返回 None=通过；返回 str=WARNING 原因；抛 AssertionError=FAIL。
+
+    规则（架构师定案）：返回类型收窄/丢字段/新异常 FAIL 硬拦截；
+    None→有值（拓宽）、加字段、长度变化 WARNING 放行。
+    """
+    if a_exc is not None or c_exc is not None:
+        if a_exc is not None and c_exc is None:
+            return f"{name}: active 抛 {type(a_exc).__name__} 而候选正常（异常修复，放行）"
+        if a_exc is None and c_exc is not None:
+            raise AssertionError(f"行为差分 {name}：active 正常，候选抛 {type(c_exc).__name__}: {c_exc}")
+        if type(a_exc).__name__ != type(c_exc).__name__:
+            raise AssertionError(
+                f"行为差分 {name}：异常类型变化 {type(a_exc).__name__} → {type(c_exc).__name__}"
+            )
+        return None  # 同类型异常：行为一致
+    if a_out is None and c_out is None:
+        return None
+    if a_out is None:
+        return f"{name}: 返回从 None 拓宽为 {type(c_out).__name__}（语义变更，放行）"
+    if c_out is None:
+        # 容器 → None 是结构性收窄（FAIL）；标量 ↔ None 是语义分支变化
+        # （如随机未命中返回 None 是常态，放行避免偶发误杀）
+        if isinstance(a_out, (list, tuple, dict, set)):
+            raise AssertionError(
+                f"行为差分 {name}：返回收窄为 None（原 {type(a_out).__name__}）"
+            )
+        return f"{name}: 返回从 {type(a_out).__name__} 变为 None（语义分支变化，放行）"
+    if type(a_out).__name__ != type(c_out).__name__:
+        raise AssertionError(
+            f"行为差分 {name}：返回类型变化 {type(a_out).__name__} → {type(c_out).__name__}"
+        )
+    if isinstance(a_out, dict):
+        missing = set(a_out) - set(c_out)
+        if missing:
+            raise AssertionError(f"行为差分 {name}：结果缺少字段 {sorted(missing)}")
+        added = set(c_out) - set(a_out)
+        if added:
+            return f"{name}: 新增字段 {sorted(added)}（语义变更，放行）"
+    elif isinstance(a_out, (list, tuple)) and len(a_out) != len(c_out):
+        return f"{name}: 结果长度 {len(a_out)} → {len(c_out)}（语义变更，放行）"
+    return None
+
+
+def _diff_contract(module_name, active_module, candidate_module, ag):
+    """候选 vs active 差分：同一 Agent、同一固定输入序列、各自独立实例。"""
+    cls_name = _CLASS_NAMES[module_name]
+    active_cls = getattr(active_module, cls_name)
+    candidate_cls = getattr(candidate_module, cls_name)
+    active_inst = active_cls(ag)
+    candidate_inst = candidate_cls(ag)
+    for name, call in _fixture_calls(module_name, ag):
+        try:
+            a_out, a_exc = call(active_inst), None
+        except Exception as exc:
+            a_out, a_exc = None, exc
+        try:
+            c_out, c_exc = call(candidate_inst), None
+        except Exception as exc:
+            c_out, c_exc = None, exc
+        verdict = _compare_verdict(name, a_out, a_exc, c_out, c_exc)
+        if isinstance(verdict, str):
+            log.warning("smoke diff %s: %s", module_name, verdict)
+
 
 
 def _smoke_brain_package(module):

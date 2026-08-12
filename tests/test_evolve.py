@@ -8,6 +8,8 @@ LLM 全部 mock（FakeBrain），不碰真实 API。
 import sys
 from pathlib import Path
 
+from brain.evolver import FULL_REWRITE_MARK
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import agent as agent_mod
@@ -440,7 +442,7 @@ BRAIN_TARGET_OUTPUT = (
 
 def test_evolve_brain_package(tmp_path):
     """包级进化：LLM 选 agent_chat.py 重写 → 组装候选包 → 验证安装 v1.1。"""
-    ev = _make_evolver(tmp_path, FakeBrain([BRAIN_TARGET_OUTPUT]))
+    ev = _make_evolver(tmp_path, FakeBrain(["File: agent_chat.py", FULL_REWRITE_MARK, BRAIN_TARGET_OUTPUT]))
     version = ev.evolve("brain", "聊天时更热情一点")
     assert version == "v1.1"
     assert ev.updater.active_version("brain") == "v1.1"
@@ -456,7 +458,9 @@ def test_evolve_brain_package(tmp_path):
 def test_evolve_brain_rejects_unknown_target(tmp_path):
     """LLM 输出无法确定 TARGET → 拒绝（不安装任何东西）。"""
     fake = FakeBrain([
-        "```python\nclass SomethingElse:\n    pass\n```"
+        "File: agent_chat.py",
+        FULL_REWRITE_MARK,
+        "```python\nclass SomethingElse:\n    pass\n```",
     ])
     ev = _make_evolver(tmp_path, fake)
     try:
@@ -484,6 +488,77 @@ class _Patch:
             else:
                 setattr(target, name, old)
 
+
+
+
+
+def test_evolve_brain_local_rewrite(tmp_path):
+    """P4：brain 包子模块方法级重写——TARGET: agent_chat.ChatMixin._intro_rules
+    → AST 替换 → 组装候选包 → 验证安装 v1.1（不重建整包、其它文件不动）。"""
+    new_intro = (
+        "    def _intro_rules(self):\n"
+        "        \"\"\"进化后的自我介绍：更热情。\"\"\"\n"
+        '        name = self.cfg.get("pet_name", "小跳")\n'
+        '        role = self.cfg.get("role", "小宠物")\n'
+        '        mood = self.state.get("mood", "平静")\n'
+        '        if mood == "开心":\n'
+        '            return f"我是{name}呀，进化版小{role}，今天超开心！"\n'
+        '        return f"我是{name}，你电脑里的小{role}（进化版）。"\n'
+    )
+    fake = FakeBrain([
+        "File: agent_chat.py",
+        # 真实 LLM 输出形态：文件名带 .py 后缀（4 段）
+        "TARGET: agent_chat.py.ChatMixin._intro_rules",
+        f"```python\n{new_intro}```",
+    ])
+    ev = _make_evolver(tmp_path, fake)
+    version = ev.evolve("brain", "自我介绍更热情一点")
+    assert version == "v1.1"
+    assert ev.updater.active_version("brain") == "v1.1"
+    files = ev.updater.source_files("brain")
+    assert "进化版小" in files["agent_chat.py"]
+    # 其它文件未被修改
+    assert "class Agent" in files["agent.py"]
+    # 候选目录已清理
+    assert not list(ev.candidate_root.glob("*"))
+
+
+def test_evolve_brain_local_target_missing_fallback(tmp_path):
+    """P4：brain 局部选靶不存在 → 回退完整文件生成（带失败反馈）。"""
+    fake = FakeBrain([
+        "File: agent_chat.py",
+        "TARGET: agent_chat.ChatMixin.no_such_method",
+        BRAIN_TARGET_OUTPUT,
+    ])
+    ev = _make_evolver(tmp_path, fake)
+    version = ev.evolve("brain", "聊天时更热情一点")
+    assert version == "v1.1"
+    files = ev.updater.source_files("brain")
+    assert "进化标记：2026-08-12 包级生成测试" in files["agent_chat.py"]
+    # 反馈带上失败原因
+    assert any("目标函数不存在" in p[-1]["content"] or "不存在" in p[-1]["content"]
+               for p in fake.prompts)
+
+
+def test_evolve_brain_local_safety_fallback(tmp_path):
+    """P4：brain 局部重写产物含危险调用（open）→ 安全检查拒绝 → 回退完整。"""
+    bad_intro = (
+        "    def _intro_rules(self):\n"
+        '        open("/tmp/hb_evil")\n'
+        '        return "x"\n'
+    )
+    fake = FakeBrain([
+        "File: agent_chat.py",
+        "TARGET: agent_chat.ChatMixin._intro_rules",
+        f"```python\n{bad_intro}```",
+        BRAIN_TARGET_OUTPUT,
+    ])
+    ev = _make_evolver(tmp_path, fake)
+    version = ev.evolve("brain", "自我介绍更热情一点")
+    assert version == "v1.1"
+    files = ev.updater.source_files("brain")
+    assert "进化标记：2026-08-12 包级生成测试" in files["agent_chat.py"]
+    assert not list(ev.candidate_root.glob("*"))
 
 if __name__ == "__main__":
     import inspect

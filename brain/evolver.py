@@ -15,13 +15,20 @@
 """
 
 import ast
+import logging
 import re
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .ast_summarizer import build_call_graph, build_module_summary, format_calls
+from .ast_summarizer import (
+    build_call_graph,
+    build_module_summary,
+    build_module_teaser,
+    build_rewrite_context,
+)
 from .func_replacer import ReplacementError, find_function, replace_function
 
 # 允许的 import 根：stdlib 安全子集 + 项目内模块（planner/memory 现有用法全覆盖）。
@@ -66,13 +73,18 @@ _REQUIREMENT_RE = re.compile(r"[：:，,。！!？?\s]+$")
 _UPGRADE_RE = re.compile(r"^升级\s*([A-Za-z_][A-Za-z0-9_]*)[：:，,]?\s*(.*)$")
 # 技能需求检测：涉及已安装技能时强制要求 ctx.skill_* 原语
 _SKILL_REQ_RE = re.compile(r"技能|skill|zhihu|知乎|热榜|直答", re.IGNORECASE)
-# 两步局部重写（P3）：Step1 选靶输出
+# 两步局部重写（P3）：Step1 选靶输出（1-4 段：函数 / 类.方法 / 文件.类.方法，
+# 文件名可带 .py 后缀）
 LOCAL_TARGET_RE = re.compile(
     r"TARGET\s*[:：]\s*([A-Za-z_][A-Za-z0-9_]*"
-    r"(?:\.[A-Za-z_][A-Za-z0-9_]*)?)",
+    r"(?:\.py)?(?:\.[A-Za-z_][A-Za-z0-9_]*){0,3})",
     re.IGNORECASE,
 )
 FULL_REWRITE_MARK = "FULL_REWRITE"
+# P4 Step1a：先选文件（轻量 teaser 防 >15K prompt 空返回）
+FILE_TARGET_RE = re.compile(
+    r"File\s*[:：]?\s*([A-Za-z_][A-Za-z0-9_]*)\.py", re.IGNORECASE
+)
 
 
 class Evolver:
@@ -218,7 +230,7 @@ class Evolver:
                 "content": "上次生成的代码验证失败：\n" + feedback +
                            "\n请修正后重新输出完整源码（保持契约方法与安全要求不变）。",
             })
-        raw = self.brain.complete(messages, max_tokens=MAX_GEN_TOKENS, timeout=EVOLVE_REQUEST_TIMEOUT) or ""
+        raw = self._complete(messages, max_tokens=MAX_GEN_TOKENS, timeout=EVOLVE_REQUEST_TIMEOUT) or ""
         target, code = self._extract_target_code(raw, name, requirement)
         if not code:
             raise ValueError("模型未返回代码")
@@ -341,10 +353,8 @@ class Evolver:
         requirement = _REQUIREMENT_RE.sub("", requirement).strip()
         if len(requirement) < 4:
             raise ValueError("需求描述太短，请具体说明要加什么功能")
-        if name == "brain":
-            return self._evolve_full(name, requirement, status)
-        # memory/planner：先函数级局部重写（两步，prompt 小），
-        # 失败（模型输出/定位/验证）→ 回退完整文件生成（带失败反馈）
+        # 全部进化域模块先试函数级局部重写（P4：memory/planner 单文件单元、
+        # brain 包子模块均支持），失败回退完整文件生成（带失败原因反馈）
         local_version, reason = self._try_evolve_local(name, requirement, status)
         if local_version is not None:
             return local_version
@@ -381,14 +391,40 @@ class Evolver:
 
     # ---------- 函数级局部重写（P3 两步流水线） ----------
 
-    def _build_target_prompt(self, name, requirement, summary):
-        """Step 1：结构摘要 → LLM 选靶（TARGET: 函数名 或 FULL_REWRITE）。"""
+    def _build_file_prompt(self, requirement, teaser_text):
+        """Step 1a（P4）：极简文件预览 → LLM 输出目标文件（File: xxx.py）。"""
+        system = (
+            "你是桌宠「小跳」的自我进化引擎。用户要求修改 brain 包内的"
+            "一个子模块，你需要先定位【要修改的文件】。\n"
+            "各文件预览如下（只含顶层类/函数名，不含细节）。\n"
+            "输出（严格一行，不要解释）：\n"
+            "- File: <文件名>（如 File: agent_chat.py）"
+        )
+        user = f"升级需求：{requirement}\n\n文件预览：\n{teaser_text}"
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+    def _build_target_prompt(self, name, requirement, summary, package=False):
+        """Step 1：结构摘要 → LLM 选靶（TARGET: 函数名 或 FULL_REWRITE）。
+
+        package=True 时为 brain 包子模块：TARGET 用 文件.类.方法 / 文件.函数
+        （跨文件时必须带文件名避免歧义）。
+        """
+        if package:
+            target_hint = (
+                "TARGET: <文件名>.<类名>.<方法名> 或 <文件名>.<函数名>"
+                "（文件名必带，避免跨文件歧义）"
+            )
+        else:
+            target_hint = "TARGET: <函数名> 或 <类名>.<方法名>"
         system = (
             "你是桌宠「小跳」的自我进化引擎。用户要求修改某个模块，你需要先定位"
             "要修改的【单个函数或方法】。\n"
             "模块结构摘要如下（只含签名与常量，不含函数体）。\n"
             "输出（严格一行，不要解释）：\n"
-            "- TARGET: <函数名> 或 <类名.方法名>（需求聚焦在单个现有函数时）\n"
+            f"- {target_hint}（需求聚焦在单个现有函数时）\n"
             f"- {FULL_REWRITE_MARK}（需求要改多个函数/新增或删除函数/改模块级结构时）"
         )
         user = f"模块：{name}\n升级需求：{requirement}\n\n模块结构摘要：\n{summary}"
@@ -397,22 +433,26 @@ class Evolver:
             {"role": "user", "content": user},
         ]
 
-    def _build_rewrite_prompt(self, name, requirement, target, func_src, call_text, allowed):
-        """Step 2：目标函数源码 + 调用关系 → LLM 输出新函数定义。"""
+    def _build_rewrite_prompt(self, name, requirement, target, context, allowed):
+        """Step 2：1-hop 调用闭包上下文 → LLM 输出新函数定义。
+
+        context（P4 增强）：目标函数完整源码 + 被调函数完整 body +
+        调用方签名 + 引用常量——prompt 比单函数大（6-15K），但 LLM
+        视野完整，跨函数破坏率下降（API 预算换质量）。
+        """
         system = (
             "你是桌宠「小跳」的自我进化引擎。用户要求修改模块里的一个函数/方法。\n"
-            "你会拿到该函数的当前完整源码与调用关系，请输出【新版本的完整函数定义】"
-            "（def 行开始到函数体结束，不要输出函数外的任何代码）。\n"
+            "你会拿到该函数的当前完整源码与调用闭包上下文（被调函数/调用方/常量），"
+            "请输出【新版本的完整函数定义】（def 行开始到函数体结束）。\n"
             "硬性要求：\n"
             f"1. 函数名必须保持 {target.split('.')[-1]}（签名可调整，调用方兼容性由验证兜底）；\n"
             "2. 只允许 import 白名单：" + allowed + "；"
             "函数内不要新增 import（模块头已有依赖直接用）；\n"
-            "3. 保持返回类型与调用语义兼容（调用关系见下，静态分析可能不完整）；\n"
+            "3. 保持返回类型与调用语义兼容（调用闭包见下，静态分析可能不完整）；\n"
             "4. 只输出纯 Python 函数定义（可用 ```python 围栏包裹），不要任何解释文字。"
         )
         user = (
-            f"模块：{name}\n目标：{target}\n升级需求：{requirement}\n\n"
-            f"当前完整源码：\n```python\n{func_src}\n```\n\n{call_text}"
+            f"模块：{name}\n目标：{target}\n升级需求：{requirement}\n\n{context}"
         )
         return [
             {"role": "system", "content": system},
@@ -436,16 +476,166 @@ class Evolver:
             return ""
         return text[pos:].strip()
 
+    def _try_evolve_local_package(self, requirement, status):
+        """brain 包内子模块的函数级重写（P4）：两步选靶（Step1a 文件 →
+        Step1b 函数）→ 子模块内 AST 替换 → 组装候选包 → 验证安装。
+
+        Step1a 用极简 teaser（~1.5K）防 >15K prompt 触发模型空返回；
+        Step1b 单文件摘要选函数；Step2 函数级重写。失败返回 (None, 原因)
+        （调用方回退完整文件生成）。"""
+        candidate_dir = None
+        try:
+            files = self.updater.source_files("brain")
+            # Step1a：先选文件（teaser 防 prompt 过大空返回）
+            teasers = []
+            for fname in ("agent.py", "agent_chat.py", "agent_think.py", "skills.py"):
+                src = files.get(fname)
+                if src:
+                    teasers.append(build_module_teaser(src, fname))
+            status("局部重写：定位目标文件…")
+            raw0 = self._complete(
+                self._build_file_prompt(requirement, "\n\n".join(teasers)),
+                max_tokens=64, timeout=EVOLVE_REQUEST_TIMEOUT,
+            ) or ""
+            mf = FILE_TARGET_RE.search(raw0)
+            if not mf:
+                logging.getLogger("heartbeat.evolver").warning(
+                    "Step1a 输出无法解析：%r", raw0[:300])
+                return None, "未定位到目标文件（Step1 输出无法解析）"
+            file_name = f"{mf.group(1)}.py"
+            if file_name not in files:
+                return None, f"目标文件不存在：{file_name}"
+            # Step1b：单文件摘要选函数
+            status(f"局部重写：定位 {file_name} 内目标函数…")
+            raw1 = self._complete(
+                self._build_target_prompt(
+                    f"brain/{file_name}", requirement,
+                    build_module_summary(files[file_name], file_name)),
+                max_tokens=256, timeout=EVOLVE_REQUEST_TIMEOUT,
+            ) or ""
+            if FULL_REWRITE_MARK in raw1.upper():
+                return None, "需求需整体重写（模型输出 FULL_REWRITE）"
+            m = LOCAL_TARGET_RE.search(raw1)
+            if not m:
+                logging.getLogger("heartbeat.evolver").warning(
+                    "Step1b 输出无法解析：%r", raw1[:300])
+                return None, "未定位到目标函数（Step1 输出无法解析）"
+            file_name, sub_target = self._resolve_package_target(files, m.group(1))
+            if file_name is None:
+                return None, f"目标函数不存在：{m.group(1)}"
+            sub_src = files[file_name]
+            try:
+                _, func_src = find_function(sub_src, sub_target)
+            except ReplacementError as exc:
+                return None, str(exc)
+            status(f"局部重写：重写 {file_name} 的 {sub_target}…")
+            allowed = ", ".join(sorted(ALLOWED_IMPORTS))
+            calls = build_call_graph(sub_src)
+            raw2 = self._complete(
+                self._build_rewrite_prompt(
+                    f"brain/{file_name}", requirement, sub_target,
+                    build_rewrite_context(sub_src, sub_target, calls), allowed,
+                ),
+                max_tokens=MAX_GEN_TOKENS, timeout=EVOLVE_REQUEST_TIMEOUT,
+            ) or ""
+            new_func = self._extract_func_code(raw2)
+            if not new_func:
+                return None, "模型未返回函数代码（Step2）"
+            new_sub_src = replace_function(sub_src, sub_target, new_func)
+            status("局部重写完成，组装候选包并运行验证…")
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            candidate_dir = self.candidate_root / f"brain_{stamp}"
+            candidate_dir.mkdir(parents=True, exist_ok=True)
+            for fname, content in files.items():
+                (candidate_dir / fname).write_text(content, encoding="utf-8")
+            (candidate_dir / file_name).write_text(new_sub_src, encoding="utf-8")
+            errors = self._check_candidate_safety(candidate_dir, [file_name])
+            if errors:
+                return None, "；".join(errors)
+            ok, v_errors = self.updater.validate_candidate("brain", candidate_dir)
+            if not ok:
+                return None, "；".join(v_errors)
+            version = self.updater.install_candidate("brain", candidate_dir)
+            return version, ""
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+        finally:
+            if candidate_dir is not None:
+                shutil.rmtree(candidate_dir, ignore_errors=True)
+
+    def _resolve_package_target(self, files, target):
+        """解析 brain 包内 target → (文件名, 子模块内 target) 或 (None, None)。
+
+        支持：文件.类.方法（文件名可带 .py 后缀）/ 文件.函数（模块级或类内唯一）
+        / 类.方法（跨文件）/ 函数（跨文件首个匹配）。__init__/_contract 不参与。
+        """
+        parts = target.split(".")
+        if len(parts) >= 3 and parts[1] == "py":
+            # agent_chat.py.ChatMixin._intro_rules → (agent_chat.py, ChatMixin._intro_rules)
+            fname = f"{parts[0]}.py"
+            if fname in files:
+                return fname, ".".join(parts[2:])
+            return None, None
+        if len(parts) == 3:
+            # agent_chat.ChatMixin._intro_rules（文件名不带 .py）
+            fname, cls, method = parts
+            if f"{fname}.py" in files:
+                return f"{fname}.py", f"{cls}.{method}"
+            return None, None
+        if len(parts) == 2:
+            fname, name = parts
+            if f"{fname}.py" in files:
+                return f"{fname}.py", name
+            # 类.方法：跨文件找类
+            for fname2 in files:
+                if fname2.endswith(".py") and f"class {parts[0]}" in files[fname2]:
+                    return fname2, target
+            return None, None
+        # 单段：跨文件找函数/方法（首个匹配）
+        for fname in files:
+            if fname in ("__init__.py", "_contract.py"):
+                continue
+            try:
+                find_function(files[fname], target)
+                return fname, target
+            except ReplacementError:
+                continue
+        return None, None
+
+    def _complete(self, messages, max_tokens, timeout, retries=2):
+        """进化专用模型调用：仅对【空返回】重试（P4：deepseek-v4-flash
+        偶发空 content，基础聊天正常但进化 prompt 偶发空）。
+
+        网络错误不在此重试（brain.complete 内部 _post_chat 已重试 2 次），
+        异常直接上抛，由 _try_evolve_local/_evolve_full 的兜底按现有
+        失败路径回退完整生成。全部重试耗尽返回 ""（调用方解析失败回退）。
+        """
+        for attempt in range(retries + 1):
+            raw = self.brain.complete(
+                messages, max_tokens=max_tokens, timeout=timeout) or ""
+            if raw.strip():
+                return raw
+            logging.getLogger("heartbeat.evolver").warning(
+                "LLM 空返回（第 %d 次），重试…", attempt + 1)
+            if attempt < retries:
+                time.sleep(0.5 * (attempt + 1))
+        return ""
+
     def _try_evolve_local(self, name, requirement, status):
         """函数级局部重写（两步）。成功返回 (版本号, "")；失败返回 (None, 原因)
-        由调用方回退完整文件生成。任何异常都被兜底捕获（不中断会话）。"""
+        由调用方回退完整文件生成。任何异常都被兜底捕获（不中断会话）。
+
+        P4：brain（包）走子模块局部重写；memory/planner（单文件单元）直接走。
+        """
+        if name == "brain":
+            return self._try_evolve_local_package(requirement, status)
         candidate_dir = None
         try:
             source = self.current_source(name)
             summary = build_module_summary(source, name)
             calls = build_call_graph(source)
             status("局部重写：定位目标函数…")
-            raw1 = self.brain.complete(
+            raw1 = self._complete(
                 self._build_target_prompt(name, requirement, summary),
                 max_tokens=256, timeout=EVOLVE_REQUEST_TIMEOUT,
             ) or ""
@@ -453,6 +643,8 @@ class Evolver:
                 return None, "需求需整体重写（模型输出 FULL_REWRITE）"
             m = LOCAL_TARGET_RE.search(raw1)
             if not m:
+                logging.getLogger("heartbeat.evolver").warning(
+                    "Step1 输出无法解析：%r", raw1[:300])
                 return None, "未定位到目标函数（Step1 输出无法解析）"
             target = m.group(1)
             try:
@@ -461,10 +653,10 @@ class Evolver:
                 return None, str(exc)
             status(f"局部重写：重写 {target}…")
             allowed = ", ".join(sorted(ALLOWED_IMPORTS))
-            raw2 = self.brain.complete(
+            context = build_rewrite_context(source, target, calls)
+            raw2 = self._complete(
                 self._build_rewrite_prompt(
-                    name, requirement, target, func_src,
-                    format_calls(calls, target), allowed,
+                    name, requirement, target, context, allowed,
                 ),
                 max_tokens=MAX_GEN_TOKENS, timeout=EVOLVE_REQUEST_TIMEOUT,
             ) or ""
@@ -612,7 +804,7 @@ class Evolver:
                     "content": "上次生成的代码验证失败：\n" + feedback +
                                "\n请修正后重新输出完整源码（保持契约与安全要求不变）。",
                 })
-            raw = self.brain.complete(messages, max_tokens=MAX_GEN_TOKENS, timeout=EVOLVE_REQUEST_TIMEOUT) or ""
+            raw = self._complete(messages, max_tokens=MAX_GEN_TOKENS, timeout=EVOLVE_REQUEST_TIMEOUT) or ""
             code = self._extract_code(raw)
             if not code:
                 preview = raw.strip()[:120].replace("\n", " ")

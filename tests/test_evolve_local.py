@@ -167,6 +167,39 @@ def test_replace_async_function():
     assert "async def fetch" in result
 
 
+def test_find_method_by_bare_name():
+    """单段方法名（无类限定）→ 回退搜类内方法（P4 修复 P3 缺陷）。"""
+    node, text = find_function(MODULE_SRC, "greet")
+    assert node.name == "greet"
+    assert "def greet" in text
+    # 多类同名方法 → 多义报错
+    src2 = MODULE_SRC + "\n\nclass Other:\n    def greet(self):\n        return 1\n"
+    try:
+        find_function(src2, "greet")
+        raise AssertionError("多义方法应报错")
+    except ReplacementError as exc:
+        assert "多个类" in str(exc)
+
+
+def test_build_rewrite_context_closure():
+    """P4 上下文增强：目标函数 + 被调函数 body + 调用方签名 + 引用常量。"""
+    from brain.ast_summarizer import build_call_graph, build_rewrite_context
+    graph = build_call_graph(MODULE_SRC)
+    ctx = build_rewrite_context(MODULE_SRC, "Greeter.greet", graph)
+    assert "目标函数 Greeter.greet 当前完整源码" in ctx
+    assert "def greet" in ctx
+    # 被调函数完整 body 内联
+    assert "被调函数 helper 完整源码" in ctx
+    assert "text.strip()" in ctx
+    # 引用常量（greet 用到 GREETING）
+    assert "GREETING" in ctx
+    # 调用方（helper 被 Greeter.greet 调用）
+    ctx2 = build_rewrite_context(MODULE_SRC, "helper", graph)
+    assert "调用方 Greeter.greet 签名" in ctx2
+    # 预算裁剪生效
+    small = build_rewrite_context(MODULE_SRC, "Greeter.greet", graph, max_chars=200)
+    assert len(small) <= 200
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):
@@ -180,3 +213,5 @@ if __name__ == "__main__":
                 failed += 1
     print(f"\n{passed} passed, {failed} failed")
     sys.exit(1 if failed else 0)
+
+

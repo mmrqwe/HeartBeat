@@ -16,6 +16,23 @@ import ast
 from typing import Dict, List
 
 
+def build_module_teaser(source: str, module_name: str = "") -> str:
+    """极简文件预览（P4 Step1a 选文件用）：字符数 + 顶层类/函数名列表。
+
+    体积 ~几百字符/文件，4 个 brain 子模块拼接也不到 2K——避免 Step1
+    prompt 过大触发模型空返回（>15K 已知行为）。
+    """
+    tree = ast.parse(source)
+    tops = []
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            tops.append(f"类 {node.name}")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            tops.append(f"函数 {node.name}")
+    names = "，".join(tops[:60])
+    return f"文件 {module_name}：{len(source)} 字符；顶层：{names}"
+
+
 def _first_doc_line(node) -> str:
     """docstring 首行（去尾标点，截 60 字符）。"""
     doc = ast.get_docstring(node)
@@ -155,3 +172,90 @@ def format_calls(calls: Dict[str, Dict[str, List[str]]], target: str) -> str:
         parts.append("内部调用：" + ", ".join(info["calls"]))
     text = "；".join(parts) if parts else "无直接调用关系"
     return text + "（AST 静态分析，动态/字符串调用可能不完整）"
+
+
+# ---------- P4 重写上下文增强（1-hop 调用闭包） ----------
+
+
+def _node_text_lines(source: str, node) -> str:
+    """节点源码文本段（含装饰器，按行切分）。"""
+    start = node.decorator_list[0].lineno if node.decorator_list else node.lineno
+    lines = source.splitlines()
+    return "\n".join(lines[start - 1:node.end_lineno])
+
+
+def _sig_line(node) -> str:
+    """函数签名行（含类限定上下文由调用方拼接）。"""
+    return _func_line(node)
+
+
+def build_rewrite_context(source: str, target: str, calls: Dict,
+                          max_chars: int = 15000) -> str:
+    """1-hop 调用闭包上下文（P4，利用 API 预算提升重写质量）：
+
+    目标函数完整源码 + 被调函数完整 body（callees）+ 调用方签名与调用点
+    （callers）+ 目标函数引用的模块常量。超限按 callers → constants →
+    callees 顺序裁剪（callees 最接近目标行为，最后裁）。
+    动态/字符串调用标注不完整（L1 契约 + L2 冒烟兜底）。
+    """
+    tree = ast.parse(source)
+    func_map: Dict[str, object] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            func_map[node.name] = node
+        elif isinstance(node, ast.ClassDef):
+            for m in node.body:
+                if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    func_map[f"{node.name}.{m.name}"] = m
+                    if m.name not in func_map:  # 简单名仅当唯一时登记
+                        func_map[m.name] = m
+    constants: Dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name):
+            try:
+                val = ast.unparse(node.value)
+                constants[node.targets[0].id] = val[:80] + ("…" if len(val) > 80 else "")
+            except Exception:
+                pass
+    info = calls.get(target, {"calls": [], "called_by": []})
+    lines = [f"目标函数 {target} 当前完整源码："]
+    lines.append("```python")
+    target_node = func_map.get(target) or func_map.get(target.split(".")[-1])
+    lines.append(_node_text_lines(source, target_node))
+    lines.append("```")
+    callee_parts: List[str] = []
+    for called in info.get("calls", []):
+        node = func_map.get(called)
+        if node is None:
+            callee_parts.append(f"（目标调用 {called}：外部/动态，无法内联）")
+            continue
+        callee_parts.append(
+            f"被调函数 {called} 完整源码：\n```python\n"
+            f"{_node_text_lines(source, node)}\n```"
+        )
+    caller_parts: List[str] = []
+    for caller in info.get("called_by", []):
+        node = func_map.get(caller)
+        if node is None:
+            caller_parts.append(f"（外部调用者 {caller}：签名未知）")
+            continue
+        caller_parts.append(f"调用方 {caller} 签名：{_sig_line(node)}")
+    const_parts: List[str] = []
+    if target_node:
+        target_src = _node_text_lines(source, target_node)
+        for cname, cval in constants.items():
+            if cname in target_src:
+                const_parts.append(f"{cname} = {cval}")
+    parts = caller_parts + const_parts + callee_parts
+    remaining = max_chars - len("\n".join(lines))
+    kept: List[str] = []
+    for part in parts:
+        if remaining - len(part) - 2 <= 0:
+            break
+        kept.append(part)
+        remaining -= len(part) + 2
+    if kept:
+        lines.append("\n\n".join(kept))
+    lines.append("（AST 静态分析：动态/字符串调用可能不完整，签名兼容性由验证兜底）")
+    return "\n".join(lines)

@@ -40,9 +40,20 @@ def find_function(source: str, target: str) -> Tuple[Union[ast.FunctionDef, ast.
     funcs = [n for n in tree.body
              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
              and n.name == target]
-    if not funcs:
-        raise ReplacementError(f"目标函数不存在：{target}")
-    return funcs[0], _node_text(source, funcs[0])
+    if funcs:
+        return funcs[0], _node_text(source, funcs[0])
+    # 模块级无同名函数 → 回退搜类内方法（单段方法名；多类同名 → 多义报错）
+    methods = []
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            methods += [m for m in node.body
+                        if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and m.name == target]
+    if len(methods) == 1:
+        return methods[0], _node_text(source, methods[0])
+    if len(methods) > 1:
+        raise ReplacementError(f"目标方法 {target} 存在于多个类中，请用 类名.方法名 限定")
+    raise ReplacementError(f"目标函数不存在：{target}")
 
 
 def _node_text(source: str, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> str:

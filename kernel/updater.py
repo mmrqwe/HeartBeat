@@ -522,10 +522,17 @@ class Updater:
         missing = sorted(REQUIRED_METHODS[name] - set(dir(cls)))
         if missing:
             return False, [f"L1 缺少方法：{', '.join(missing)}"]
-        # L2：宿主冒烟（构造真实 Agent 跑契约方法）
+        # L2：宿主冒烟（构造真实 Agent 跑契约方法；P4 差分：候选 vs active
+        # 在固定输入序列上对比输出形状——结构性破坏拦截，语义变更警告）
         if run_smoke and self.smoke_runner is not None:
+            active_mod = None
+            if name in BUILTIN_MODULES and self.active_version(name):
+                try:
+                    active_mod = self.load(name)
+                except Exception:
+                    active_mod = None  # active 不可加载（如迁移期）→ 跳过差分
             try:
-                ok = self.smoke_runner(name, module)
+                ok = self.smoke_runner(name, module, active_mod)
             except Exception as exc:
                 return False, [f"L2 冒烟异常：{type(exc).__name__}: {exc}"]
             if not ok:
