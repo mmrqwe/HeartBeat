@@ -86,7 +86,15 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     role TEXT NOT NULL,
                     text TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    session_id TEXT NOT NULL DEFAULT 'default'
+                );
+                CREATE TABLE IF NOT EXISTS sessions(
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    project_dir TEXT UNIQUE,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS agent_state(
                     key TEXT PRIMARY KEY,
@@ -170,7 +178,113 @@ class Database:
             ):
                 if col not in mem_columns:
                     self._conn.execute(f"ALTER TABLE memory ADD COLUMN {col} {ddl}")
+            # 会话分栏迁移：旧库 chat_messages 无 session_id → 补齐并归入默认会话
+            chat_columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(chat_messages)")
+            }
+            if "session_id" not in chat_columns:
+                self._conn.execute(
+                    "ALTER TABLE chat_messages "
+                    "ADD COLUMN session_id TEXT NOT NULL DEFAULT 'default'"
+                )
+            # 索引必须在列迁移之后建（旧库 executescript 时列还不存在）
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_session "
+                "ON chat_messages(session_id, id)"
+            )
+            self._ensure_default_session()
             self._conn.commit()
+
+    def _ensure_default_session(self):
+        """默认会话（无项目目录的闲聊）必须存在；旧数据都归它。"""
+        now = time.strftime("%Y-%m-%d %H:%M")
+        self._conn.execute(
+            "INSERT OR IGNORE INTO sessions(id, name, project_dir, created_at, updated_at) "
+            "VALUES ('default', '默认对话', NULL, ?, ?)",
+            (now, now),
+        )
+
+    # ---------- 会话 ----------
+
+    def list_sessions(self):
+        """会话列表（默认会话置顶），含消息数，按最近活跃排序。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT s.id, s.name, s.project_dir, s.created_at, s.updated_at, "
+                "       (SELECT COUNT(*) FROM chat_messages m WHERE m.session_id = s.id) AS message_count "
+                "FROM sessions s "
+                "ORDER BY CASE s.id WHEN 'default' THEN 0 ELSE 1 END, s.updated_at DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def session(self, session_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, name, project_dir, created_at, updated_at FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def find_session_by_project_dir(self, project_dir):
+        """按项目目录找会话（目录为主键绑定）；无匹配返回 None。"""
+        if not str(project_dir or "").strip():
+            return self.session("default")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, name, project_dir, created_at, updated_at "
+                "FROM sessions WHERE project_dir = ?",
+                (str(project_dir),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def create_session(self, name, project_dir=None):
+        """新建会话；project_dir 已存在会话时直接返回已有会话（目录↔会话一对一）。"""
+        import uuid
+
+        project_dir = str(project_dir or "").strip() or None
+        existing = self.find_session_by_project_dir(project_dir) if project_dir else None
+        if existing is not None:
+            return existing["id"]
+        now = time.strftime("%Y-%m-%d %H:%M")
+        sid = uuid.uuid4().hex
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO sessions(id, name, project_dir, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (sid, str(name or "会话")[:40], project_dir, now, now),
+            )
+            self._conn.commit()
+        return sid
+
+    def rename_session(self, session_id, name):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sessions SET name = ? WHERE id = ?",
+                (str(name or "会话")[:40], session_id),
+            )
+            self._conn.commit()
+
+    def delete_session(self, session_id):
+        """删除会话并级联删除其消息。默认会话不可删（返回 False）。"""
+        if session_id == "default":
+            return False
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            self._conn.execute(
+                "DELETE FROM chat_messages WHERE session_id = ?", (session_id,)
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def _touch_session(self, session_id):
+        """活跃时间更新（消息写入时调用；会话不存在时静默跳过）。"""
+        if session_id is None:
+            return
+        now = time.strftime("%Y-%m-%d %H:%M")
+        self._conn.execute(
+            "UPDATE sessions SET updated_at = ? WHERE id = ?", (now, session_id)
+        )
 
     def _init_vec(self):
         try:
@@ -387,27 +501,43 @@ class Database:
 
     # ---------- 聊天 ----------
 
-    def add_chat(self, role, text):
+    def add_chat(self, role, text, session_id="default"):
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO chat_messages(role, text, created_at) VALUES (?, ?, ?)",
-                (role, text.strip(), time.strftime("%Y-%m-%d %H:%M")),
+                "INSERT INTO chat_messages(role, text, created_at, session_id) "
+                "VALUES (?, ?, ?, ?)",
+                (role, text.strip(), time.strftime("%Y-%m-%d %H:%M"), session_id or "default"),
             )
+            self._touch_session(session_id)
             self._conn.commit()
             return cur.lastrowid
 
-    def chat_items(self, limit=100):
+    def chat_items(self, limit=100, session_id=None):
+        """session_id=None 返回全量（兼容旧调用/记忆水位线），否则只取该会话。"""
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT id, role, text, created_at AS time FROM chat_messages "
-                "ORDER BY id DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            if session_id is None:
+                rows = self._conn.execute(
+                    "SELECT id, role, text, created_at AS time, session_id FROM chat_messages "
+                    "ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT id, role, text, created_at AS time, session_id FROM chat_messages "
+                    "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                    (session_id, limit),
+                ).fetchall()
         return [dict(row) for row in reversed(rows)]
 
-    def clear_chat(self):
+    def clear_chat(self, session_id=None):
+        """session_id=None 全清（旧语义）；显式传只清该会话。"""
         with self._lock:
-            self._conn.execute("DELETE FROM chat_messages")
+            if session_id is None:
+                self._conn.execute("DELETE FROM chat_messages")
+            else:
+                self._conn.execute(
+                    "DELETE FROM chat_messages WHERE session_id = ?", (session_id,)
+                )
             if self.vec_ready:
                 self._conn.execute("DELETE FROM chat_vec")
             self._conn.commit()

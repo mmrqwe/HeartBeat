@@ -45,7 +45,6 @@ class Agent(ChatMixin, ThinkMixin):
         # 阻塞聊天/记忆写入；None（测试/CLI 直连）时保持同步旧行为
         self.embed_queue = embed_queue
         self.memory = Memory(self.db)
-        self.chat_history = self.db.chat_items(100)
         self.state: dict = self._load_state()
         self._sync_embed_model()
         self.clock = clock or datetime.now
@@ -194,31 +193,34 @@ class Agent(ChatMixin, ThinkMixin):
         except Exception:
             pass
 
-    # ---------- 聊天记录 ----------
+    # ---------- 聊天记录（会话分栏：消息归属 session_id，默认会话收闲聊/系统消息） ----------
 
-    def append_chat(self, role, text):
-        item_id = self.db.add_chat(role, text)
+    def append_chat(self, role, text, session_id="default"):
+        item_id = self.db.add_chat(role, text, session_id=session_id)
         entry = {
             "id": item_id,
             "role": role,
             "text": text,
             "time": time.strftime("%Y-%m-%d %H:%M"),
+            "session_id": session_id or "default",
         }
-        self.chat_history.append(entry)
-        self.chat_history = self.chat_history[-100:]
         if role == "user":
             self._embed_chat(item_id, text)
         return entry
 
-    def clear_chat_history(self):
-        self.db.clear_chat()
-        self.chat_history = []
+    def chat_history(self, session_id=None, limit=100):
+        """聊天历史（session_id=None 全量，否则只取该会话；db 实时读）。"""
+        return self.db.chat_items(limit=limit, session_id=session_id)
+
+    def clear_chat_history(self, session_id=None):
+        """清空聊天记录：session_id=None 全清（旧语义），否则只清该会话。"""
+        self.db.clear_chat(session_id)
 
     # ---------- 聊天入口 ----------
 
-    def chat(self, user_text, on_delta=None):
+    def chat(self, user_text, on_delta=None, session_id="default"):
         user_text = user_text.strip()
-        entry = self.append_chat("user", user_text)
+        entry = self.append_chat("user", user_text, session_id=session_id)
         # 规则提取作为零成本兜底；有 LLM 时主路径是 analyze_and_remember
         rule_saved = self._extract_facts_rule(user_text)
         self.state["fact_scan_id"] = entry["id"]
@@ -229,14 +231,14 @@ class Agent(ChatMixin, ThinkMixin):
                 on_delta(reply)
         elif self.cfg["api"]["api_key"]:
             if self.cfg.get("tools_enabled", True):
-                reply = self._chat_llm_tools(user_text, on_delta)
+                reply = self._chat_llm_tools(user_text, on_delta, session_id=session_id)
             elif on_delta and self.cfg.get("stream", True):
-                reply = self._chat_llm_stream(user_text, on_delta)
+                reply = self._chat_llm_stream(user_text, on_delta, session_id=session_id)
             else:
-                reply = self._chat_llm(user_text)
+                reply = self._chat_llm(user_text, session_id=session_id)
         else:
             reply = self._chat_rules(user_text)
-        self.append_chat("assistant", reply)
+        self.append_chat("assistant", reply, session_id=session_id)
         if (self.cfg.get("api") or {}).get("api_key"):
             # 有 LLM 时由 Agent 自己分析该记住什么（不依赖写死规则）
             if self.memory_module.should_analyze(user_text, rule_saved):
@@ -408,12 +410,14 @@ class Agent(ChatMixin, ThinkMixin):
 
     # ---------- Coding 协作（P0：同步循环） ----------
 
-    def coding_task(self, user_text, on_status=None, on_delta=None, max_rounds=None):
+    def coding_task(self, user_text, on_status=None, on_delta=None, max_rounds=None,
+                    session_id="default"):
         """Coding 模式入口：在 project_dir 项目内完成编程任务。
 
         安全基座在 kernel（pathguard/processpool/权限判定），控制循环在
         brain.coding_agent（策略层）。工具以 SOURCE_USER 执行——写操作
         走 confirm 档用户确认，与聊天路径的 confirm_cb 共用同一弹窗。
+        session_id：任务发起的会话（回复归属，不回写历史，由宿主落库）。
         """
         from brain.coding_agent import run_coding_task
 
@@ -423,4 +427,5 @@ class Agent(ChatMixin, ThinkMixin):
         return run_coding_task(
             self.brain, self.cfg, user_text, run,
             on_status=on_status, on_delta=on_delta, max_rounds=max_rounds,
+            history=self.chat_history(session_id=session_id, limit=12),
         )

@@ -62,9 +62,9 @@ class Planner:
         return f"现在是{now.strftime('%m月%d日')}周{weekday}，{now.strftime('%H:%M')}，{phase}。"
 
     def build_recent_thread(self, n=3):
-        """最近几轮对话脉络（不含记忆库，纯最近聊天）。"""
+        """最近几轮对话脉络（不含记忆库，纯最近聊天，跨会话）。"""
         recent = [
-            m for m in self.agent.chat_history[-n * 2:]
+            m for m in self.agent.chat_history(limit=n * 2)[-n * 2:]
             if m["role"] in ("user", "assistant") and m["text"].strip()
         ]
         if not recent:

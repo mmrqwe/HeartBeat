@@ -64,10 +64,15 @@ DEFAULT_CONFIG = {
 def user_data_dir():
     """用户数据目录（跨平台）。配置、数据库、模型缓存都放这里，重编译/升级不丢数据。
 
+    - 测试/验收隔离：环境变量 HB_DATA_DIR 优先（macOS 下 Path.home() 不跟随
+      HOME，隔离 HOME 无效，必须显式覆盖数据目录）。
     - macOS:   ~/Library/Application Support/HeartBeat
     - Windows: %APPDATA%/HeartBeat
     - Linux:   $XDG_DATA_HOME/HeartBeat 或 ~/.local/share/HeartBeat
     """
+    override = os.environ.get("HB_DATA_DIR", "").strip()
+    if override:
+        return Path(override)
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "HeartBeat"
     if os.name == "nt":

@@ -51,10 +51,21 @@ def _project_tree_text(project_dir, depth=2, cap=60):
     return text
 
 
-def _build_messages(cfg, user_request):
+def _build_messages(cfg, user_request, history=None):
     project_dir = os.path.expanduser(str(cfg.get("project_dir", "") or "").strip())
     system = CODING_SYSTEM.format(owner=core.owner_title(cfg), project_dir=project_dir)
     system += "\n\n当前项目结构：\n" + _project_tree_text(project_dir)
+    if history:
+        recent = [
+            m for m in history
+            if m.get("role") in ("user", "assistant") and m.get("text", "").strip()
+        ][-8:]
+        if recent:
+            lines = ["\n\n同一会话的最近对话（保持语气连贯，不要复述）："]
+            for m in recent:
+                who = "主人" if m["role"] == "user" else "小猫"
+                lines.append(f"{who}：{m['text'].strip()[:200]}")
+            system += "\n".join(lines)
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": user_request},
@@ -90,7 +101,8 @@ def _final_summary(brain, messages):
 
 
 def run_coding_task(brain, cfg, user_request, run_tool,
-                    on_status=None, on_delta=None, max_rounds=None):
+                    on_status=None, on_delta=None, max_rounds=None,
+                    history=None):
     """P0 Coding 循环：同步执行，返回最终回复文本。
 
     brain:   core.Brain（complete_tools / complete）
@@ -99,6 +111,7 @@ def run_coding_task(brain, cfg, user_request, run_tool,
     on_status(str)：步骤进度回调（UI 状态行）
     on_delta(str)：预留（P0 循环不流式，最终回复经返回值传递）
     max_rounds：轮次上限（测试可调小，默认 MAX_ROUNDS）
+    history：同会话最近聊天（注入上下文保持语气连贯）
     """
     max_rounds = int(max_rounds or MAX_ROUNDS)
     project_dir = str(cfg.get("project_dir", "") or "").strip()
@@ -108,7 +121,7 @@ def run_coding_task(brain, cfg, user_request, run_tool,
     if not os.path.isdir(expanded):
         return f"项目目录不存在：{project_dir}。请在设置里重新选择。"
     decls = tools.coding_declarations(cfg)
-    messages = _build_messages(cfg, user_request)
+    messages = _build_messages(cfg, user_request, history=history)
     for round_no in range(1, max_rounds + 1):
         messages, _ = context_mgr.truncate_messages(
             list(messages), BUDGET_TOKENS, keep_recent=HISTORY_STEP_LIMIT

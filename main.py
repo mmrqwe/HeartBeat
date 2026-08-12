@@ -100,6 +100,8 @@ class HeartBeatApp:
         self.search_win = None
         self._chat_pending = []
         self._coding_pending = []
+        # 当前活跃会话（多对话）：任务入队时随 payload 透传，回复归属不会串
+        self.current_session_id = "default"
 
         self.pet.show()
 
@@ -404,18 +406,26 @@ class HeartBeatApp:
                 on_send=self._send_chat,
                 on_clear=self._clear_chat,
                 on_pick_dir=self._pick_project_dir,
+                on_new_session=self._new_session,
+                on_switch_session=self._switch_session,
+                on_delete_session=self._delete_session,
             )
-            for entry in self.agent.chat_history:
+            for entry in self.agent.chat_history(session_id=self.current_session_id):
                 self.chat_win.add_message(entry["role"], entry["text"], entry.get("time"))
             self.chat_win.set_mood(self.agent.state.get("mood", "平静"))
             self.chat_win.set_project_dir(str(self.cfg.get("project_dir", "") or ""))
+            self._refresh_sessions()
         self.chat_win.set_daily_stats(self._daily_stats_text())
         self.chat_win.show()
         self.chat_win.raise_()
         self.chat_win.activateWindow()
 
     def _pick_project_dir(self):
-        """目录按钮：选择编程项目目录（选好后编程任务自然路由，无需切换模式）。"""
+        """目录按钮：选择编程项目目录 → 启用该目录对应的会话（没有则新建绑定）。
+
+        目录↔会话一对一：已有绑定会话则切过去（保留之前的对话上下文），
+        否则用目录名新建会话并绑定。
+        """
         from PySide6.QtWidgets import QFileDialog
 
         current = str(self.cfg.get("project_dir", "") or "")
@@ -424,11 +434,63 @@ class HeartBeatApp:
         )
         if not path:
             return
-        self.cfg["project_dir"] = path
-        self.kernel.save_settings(self.cfg)  # 持久化 + config.saved 广播
-        if self.chat_win:
-            self.chat_win.set_project_dir(path)
+        existing = self.db.find_session_by_project_dir(path)
+        if existing is not None:
+            self._switch_session(existing["id"])
+        else:
+            sid = self.db.create_session(Path(path).name or "新会话", project_dir=path)
+            self._switch_session(sid)
         self._set_status(f"编程目录：{path}")
+
+    # ---------- 多对话（会话列表） ----------
+
+    def _refresh_sessions(self):
+        """聊天窗会话列表刷新（消息数/活跃排序变化后调用）；非真实窗口则跳过。"""
+        if self.chat_win is not None and hasattr(self.chat_win, "set_sessions"):
+            self.chat_win.set_sessions(self.db.list_sessions(), self.current_session_id)
+
+    def _switch_session(self, session_id):
+        """切换当前会话：加载该会话历史；会话绑定目录则同步切换全局编程目录。"""
+        info = self.db.session(session_id)
+        if info is None:
+            session_id = "default"
+            info = self.db.session("default")
+        if session_id == self.current_session_id and self.chat_win is not None:
+            self._refresh_sessions()
+            return
+        self.current_session_id = session_id
+        if info and info.get("project_dir"):
+            self.cfg["project_dir"] = info["project_dir"]
+            self.kernel.save_settings(self.cfg)  # 持久化 + config.saved 广播
+        if self.chat_win is not None:
+            self.chat_win.clear()
+            for entry in self.agent.chat_history(session_id=session_id):
+                self.chat_win.add_message(entry["role"], entry["text"], entry.get("time"))
+            self.chat_win.set_project_dir(str(self.cfg.get("project_dir", "") or ""))
+            self._refresh_sessions()
+
+    def _new_session(self):
+        """新建会话（名称带序号），切过去；不绑定目录（选目录时自然绑定）。"""
+        existing = self.db.list_sessions()
+        n = sum(
+            1 for s in existing
+            if (s.get("name") or "").startswith("新对话")
+        ) + 1
+        sid = self.db.create_session(f"新对话 {n}")
+        self._switch_session(sid)
+        self._set_status(f"已新建会话：新对话 {n}")
+
+    def _delete_session(self, session_id):
+        """删除会话（UI 已确认）；删除的是当前会话则切回默认。"""
+        if session_id == "default":
+            return
+        if not self.db.delete_session(session_id):
+            return
+        if self.current_session_id == session_id:
+            self._switch_session("default")
+        else:
+            self._refresh_sessions()
+        self._set_status("会话已删除")
 
     # ---------- 工具确认（子线程 → 主线程弹窗） ----------
 
@@ -481,24 +543,27 @@ class HeartBeatApp:
                     "请先点击聊天窗右上角的 📁 目录，选择要操作的文件夹。"
                 )
                 return
-            if not self.kernel.runtime.trigger("coding", text):
-                self._coding_pending.append(text)
+            if not self.kernel.runtime.trigger("coding", text, self.current_session_id):
+                self._coding_pending.append((text, self.current_session_id))
                 self._set_status("编码任务还在执行，已排队")
+            self._refresh_sessions()
             return
-        if not self.kernel.runtime.trigger("chat", text):
-            self._chat_pending.append(text)
+        if not self.kernel.runtime.trigger("chat", text, self.current_session_id):
+            self._chat_pending.append((text, self.current_session_id))
             self._set_status("上一条还在回复中，已排队")
             return
+        self._refresh_sessions()
 
     def _reply_direct(self, text):
-        """不经过任务队列的直接回复（本地引导提示等）。"""
+        """不经过任务队列的直接回复（本地引导提示等），归属当前会话。"""
+        self.agent.append_chat("assistant", text, session_id=self.current_session_id)
         if self.chat_win:
             self.chat_win.add_message("assistant", text)
             self.chat_win.set_thinking(False)
         self.pet.show_bubble(text.splitlines()[0], seconds=6)
 
-    def _chat_work(self, epoch, text):
-        """聊天任务体（子线程执行）：带工具循环的 LLM 回复。"""
+    def _chat_work(self, epoch, text, session_id="default"):
+        """聊天任务体（子线程执行）：带工具循环的 LLM 回复（归属入队时的会话）。"""
         trace = f"chat_{uuid.uuid4().hex[:8]}"
         self.agent._trace_id = trace
         self.db.log_event(
@@ -507,8 +572,16 @@ class HeartBeatApp:
         t0 = time.time()
         try:
             return self.agent.chat(
-                text, on_delta=lambda t, e=epoch: self._stream_delta(e, t)
+                text,
+                on_delta=lambda t, e=epoch: self._stream_delta(e, t),
+                session_id=session_id,
             )
+        except Exception as exc:
+            # 失败消息归属任务会话（子线程直接落库）；主线程回调只做 UI 提示
+            self.agent.append_chat(
+                "system", f"回复失败：{exc}", session_id=session_id
+            )
+            raise
         finally:
             self.db.log_event(
                 db.EventType.CHAT_FINISHED, "main.chat",
@@ -546,8 +619,8 @@ class HeartBeatApp:
 
     # ---------- Coding 模式（平行路径：见 brain/coding_agent.py） ----------
 
-    def _coding_work(self, epoch, text):
-        """编码任务体（子线程执行）：coding 循环 + 步骤状态回传。"""
+    def _coding_work(self, epoch, text, session_id="default"):
+        """编码任务体（子线程执行）：coding 循环 + 步骤状态回传（回复归属任务会话）。"""
         trace = f"coding_{uuid.uuid4().hex[:8]}"
         self.agent._trace_id = trace
         self.db.log_event(
@@ -555,10 +628,13 @@ class HeartBeatApp:
         )
         t0 = time.time()
         try:
-            return self.agent.coding_task(
+            reply = self.agent.coding_task(
                 text,
                 on_status=self.bridge.coding_status.emit,
+                session_id=session_id,
             )
+            self.agent.append_chat("assistant", reply, session_id=session_id)
+            return reply
         finally:
             self.db.log_event(
                 db.EventType.CHAT_FINISHED, "main.coding",
@@ -605,11 +681,11 @@ class HeartBeatApp:
         self._drain_coding_pending()
 
     def _drain_coding_pending(self):
-        """coding 空闲后取出排队任务（FIFO）。"""
+        """coding 空闲后取出排队任务（FIFO，含会话归属）。"""
         if not self._coding_pending:
             return
-        text = self._coding_pending[0]
-        if self.kernel.runtime.trigger("coding", text):
+        text, session_id = self._coding_pending[0]
+        if self.kernel.runtime.trigger("coding", text, session_id):
             self._coding_pending.pop(0)
             self.pet.play("think")
 
@@ -624,11 +700,10 @@ class HeartBeatApp:
         self._drain_chat_pending()
 
     def _chat_error(self, error):
-        """chat 任务异常（主线程回调）：透出给用户。"""
+        """chat 任务异常（主线程回调）：UI 提示（消息已由任务体落库到任务会话）。"""
         stamp = time.strftime("%H:%M")
         text = f"{stamp} 回复失败：{error}"
         self._set_status("回复失败，请稍后重试")
-        self.agent.append_chat("system", text)
         if self.chat_win:
             self.chat_win.cancel_stream()
             self.chat_win.set_thinking(False)
@@ -636,19 +711,19 @@ class HeartBeatApp:
         self._drain_chat_pending()
 
     def _drain_chat_pending(self):
-        """chat 空闲后取出排队消息（FIFO），避免忙碌时输入被静默丢弃。"""
+        """chat 空闲后取出排队消息（FIFO，含会话归属），避免忙碌时输入被静默丢弃。"""
         if not self._chat_pending:
             return
-        text = self._chat_pending[0]
-        if self.kernel.runtime.trigger("chat", text):
+        text, session_id = self._chat_pending[0]
+        if self.kernel.runtime.trigger("chat", text, session_id):
             self._chat_pending.pop(0)
             self.pet.play("think")
 
     def _clear_chat(self):
-        self.agent.clear_chat_history()
+        self.agent.clear_chat_history(session_id=self.current_session_id)
         if self.chat_win:
             self.chat_win.clear()
-            self._set_status("聊天记录已清空")
+            self._set_status("当前对话记录已清空")
 
     # ---------- 设置 ----------
 

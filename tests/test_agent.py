@@ -73,10 +73,10 @@ def test_agent_chat_history_persist(tmp_path):
     a.append_chat("user", "你好")
     a.append_chat("assistant", "在呀")
     b = _make_agent(tmp_path)
-    assert [m["role"] for m in b.chat_history] == ["user", "assistant"]
+    assert [m["role"] for m in b.chat_history()] == ["user", "assistant"]
     b.clear_chat_history()
     c = _make_agent(tmp_path)
-    assert c.chat_history == []
+    assert c.chat_history() == []
 
 
 # ---------- LLM 模式 ----------
@@ -99,7 +99,7 @@ def test_chat_llm_parses_fact_and_think(monkeypatch, tmp_path):
     assert reply == "好的记住了。"
     assert [i["text"] for i in a.memory.facts()] == ["主人喜欢喝咖啡"]
     assert any("咖啡" in i["text"] for i in a.memory.thoughts())
-    assert [m["role"] for m in a.chat_history] == ["user", "assistant"]
+    assert [m["role"] for m in a.chat_history()] == ["user", "assistant"]
 
 
 def test_chat_llm_empty_body_fallback(monkeypatch, tmp_path):

@@ -126,20 +126,20 @@ class ChatMixin:
         except Exception:
             pass
 
-    def _chat_llm(self, user_text):
-        system, messages, budget = self._build_chat_messages(user_text)
+    def _chat_llm(self, user_text, session_id=None):
+        system, messages, budget = self._build_chat_messages(user_text, session_id=session_id)
         reply = self._parse_agent_reply(
             self.brain.complete(messages, max_tokens=budget)
         )
         return reply or "嗯嗯，我在听。"
 
-    def _chat_llm_tools(self, user_text, on_delta):
+    def _chat_llm_tools(self, user_text, on_delta, session_id=None):
         """聊天路径：带工具调用的 LLM 对话（搜索 / bash 等，最多 8 轮）。
 
         流式模式（on_delta 且 stream 配置开启）下，每轮模型 content 逐块推送，
         工具执行阶段插入 🔧 状态行；接口不支持工具时回退普通流式。
         """
-        system, messages, budget = self._build_chat_messages(user_text)
+        system, messages, budget = self._build_chat_messages(user_text, session_id=session_id)
         decls = tools.tool_declarations(self.cfg)
         use_stream = bool(on_delta) and self.cfg.get("stream", True)
         max_rounds = int(self.cfg.get("tool_max_rounds", self.MAX_TOOL_ROUNDS) or self.MAX_TOOL_ROUNDS)
@@ -250,8 +250,8 @@ class ChatMixin:
             body = body[:max_chars] + "\n…（结果过长已截断）"
         return "工具结果已返回，以下是原始内容摘要：\n" + body
 
-    def _chat_llm_stream(self, user_text, on_delta):
-        system, messages, budget = self._build_chat_messages(user_text)
+    def _chat_llm_stream(self, user_text, on_delta, session_id=None):
+        system, messages, budget = self._build_chat_messages(user_text, session_id=session_id)
         parts = []
 
         def handle(delta):
@@ -290,16 +290,18 @@ class ChatMixin:
         r"好处|坏处|利弊|对比|分析|说明|科普|多少钱|哪个(?:好|更)|选哪个)"
     )
 
-    def _conversation_summary(self, limit):
-        """旧对话滚动摘要：只在上下文超限时生成/刷新，缓存到 agent_state。"""
+    def _conversation_summary(self, limit, session_id=None):
+        """旧对话滚动摘要：只在上下文超限时生成/刷新，按会话缓存到 agent_state。"""
         if not self.cfg.get("conversation_summary_enabled", True):
             return ""
         keep = int(self.cfg.get("keep_recent_messages", 20) or 20)
+        history = self.chat_history(session_id=session_id, limit=100)
         old = [
-            m for m in self.chat_history[:-keep]
+            m for m in history[:-keep]
             if m.get("text", "").strip()
-        ] if len(self.chat_history) > keep else []
-        existing = str(self.state.get("conversation_summary") or "")
+        ] if len(history) > keep else []
+        state_key = "conversation_summary" if session_id is None else f"conversation_summary:{session_id}"
+        existing = str(self.state.get(state_key) or "")
         if not old:
             return existing
         old_tokens = context_mgr.estimate_messages_tokens(
@@ -327,14 +329,14 @@ class ChatMixin:
         except Exception:
             summary = ""
         if summary:
-            self.state["conversation_summary"] = summary
+            self.state[state_key] = summary
             self._save_state()
             return summary
         return existing
 
-    def _build_chat_messages(self, user_text):
+    def _build_chat_messages(self, user_text, session_id=None):
         relevant = self._relevant_memories(user_text, 5)
-        history = self.chat_history
+        history = self.chat_history(session_id=session_id, limit=100)
         if (
             history
             and history[-1].get("role") == "user"
@@ -401,7 +403,7 @@ class ChatMixin:
         keep_recent = int(self.cfg.get("keep_recent_messages", 20) or 20)
         limit = int(max_tokens * ratio)
         if context_mgr.estimate_messages_tokens(messages) > limit:
-            summary = self._conversation_summary(limit)
+            summary = self._conversation_summary(limit, session_id=session_id)
             if summary:
                 system += "\n\n[对话摘要]\n" + summary
                 messages[0]["content"] = system

@@ -110,6 +110,66 @@ def test_coding_status_show_hide():
     assert w.coding_status_label.isHidden()
 
 
+def test_sessions_sidebar_render_and_switch():
+    """会话侧边栏：渲染/高亮/📁 标记；点击非当前会话回调宿主。"""
+    w = _make_window()
+    sessions = [
+        {"id": "default", "name": "默认对话", "project_dir": None},
+        {"id": "abc123", "name": "快排项目", "project_dir": "/tmp/proj"},
+    ]
+    w.set_sessions(sessions, "default")
+    assert w.session_list.count() == 2
+    # 当前会话高亮
+    assert w.session_list.currentItem().text() == "默认对话"
+    # 绑定目录的会话带 📁 前缀
+    texts = [w.session_list.item(i).text() for i in range(2)]
+    assert "📁 快排项目" in texts
+    # 点击另一会话 → 回调宿主并传 sid
+    switched = []
+    w.on_switch_session = lambda sid: switched.append(sid)
+    w.session_list.setCurrentRow(1)
+    w._on_session_clicked(w.session_list.item(1))
+    assert switched == ["abc123"]
+    # 点击当前会话不重复回调
+    w.set_sessions(sessions, "abc123")
+    w._on_session_clicked(w.session_list.item(1))
+    assert switched == ["abc123"]
+
+
+def test_sessions_new_and_delete_callbacks():
+    """➕/🗑 按钮回调宿主；默认会话删除弹信息框（不回调）。"""
+    w = _make_window()
+    new_calls = []
+    del_calls = []
+    w.on_new_session = lambda: new_calls.append(1)
+    w.on_delete_session = lambda sid: del_calls.append(sid)
+    w._on_new_session()
+    assert new_calls == [1]
+    # 默认会话不可删：_on_delete_session 弹 QMessageBox（offscreen 下不阻塞）——
+    # 用 monkeypatch 弹窗返回 Yes 验证回调仍不触发
+    import gui.chat_window as cw
+
+    orig = cw.QMessageBox.question
+    cw.QMessageBox.question = staticmethod(lambda *a, **k: cw.QMessageBox.Yes)
+    try:
+        w._on_delete_session()  # 当前 default → 信息框，无回调
+        assert del_calls == []
+    finally:
+        cw.QMessageBox.question = orig
+    # 非默认会话：确认 Yes → 回调 sid
+    w.set_sessions(
+        [{"id": "default", "name": "默认对话", "project_dir": None},
+         {"id": "xyz", "name": "临时", "project_dir": None}],
+        "xyz",
+    )
+    cw.QMessageBox.question = staticmethod(lambda *a, **k: cw.QMessageBox.Yes)
+    try:
+        w._on_delete_session()
+    finally:
+        cw.QMessageBox.question = orig
+    assert del_calls == ["xyz"]
+
+
 def _run_plain():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

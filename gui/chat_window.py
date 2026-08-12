@@ -8,6 +8,8 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -63,29 +65,68 @@ class ChatInput(QTextEdit):
 
 
 class ChatWindow(QWidget):
-    def __init__(self, pet_name, on_send, on_clear, on_pick_dir=None):
+    def __init__(self, pet_name, on_send, on_clear, on_pick_dir=None,
+                 on_new_session=None, on_switch_session=None, on_delete_session=None):
         super().__init__()
         self.pet_name = pet_name
         self.on_send = on_send
         self.on_clear = on_clear
         self.on_pick_dir = on_pick_dir
+        self.on_new_session = on_new_session
+        self.on_switch_session = on_switch_session
+        self.on_delete_session = on_delete_session
         self.messages = []
         self._last_bubble = None
         self._streaming = False
         self._think_dots = 0
         self._think_timer = None
         self.coding_status_label = None
+        self.current_session_id = "default"
+        self._session_ids = []
 
         self.setWindowTitle(f"和{pet_name}聊天")
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
-        self.resize(420, 600)
-        self.setMinimumSize(340, 420)
+        self.resize(680, 600)
+        self.setMinimumSize(560, 420)
         self._build()
 
     def _build(self):
-        root = QVBoxLayout(self)
+        root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+
+        # 左侧：会话列表（多对话：新增/删除/切换；📁 表示绑定了编程目录）
+        sidebar = QFrame()
+        sidebar.setObjectName("Sidebar")
+        sidebar.setFixedWidth(168)
+        side_layout = QVBoxLayout(sidebar)
+        side_layout.setContentsMargins(8, 8, 8, 8)
+        side_layout.setSpacing(6)
+        side_header = QHBoxLayout()
+        side_title = QLabel("对话")
+        side_title.setObjectName("Hint")
+        new_btn = QPushButton("➕")
+        new_btn.setToolTip("新建对话")
+        new_btn.setFixedWidth(34)
+        new_btn.clicked.connect(self._on_new_session)
+        del_btn = QPushButton("🗑")
+        del_btn.setToolTip("删除选中的对话")
+        del_btn.setFixedWidth(34)
+        del_btn.clicked.connect(self._on_delete_session)
+        side_header.addWidget(side_title)
+        side_header.addStretch(1)
+        side_header.addWidget(new_btn)
+        side_header.addWidget(del_btn)
+        side_layout.addLayout(side_header)
+        self.session_list = QListWidget()
+        self.session_list.setFrameShape(QFrame.NoFrame)
+        self.session_list.itemClicked.connect(self._on_session_clicked)
+        side_layout.addWidget(self.session_list, 1)
+        root.addWidget(sidebar)
+
+        main = QVBoxLayout()
+        main.setContentsMargins(0, 0, 0, 0)
+        main.setSpacing(0)
 
         header = QFrame()
         header.setObjectName("Card")
@@ -100,6 +141,7 @@ class ChatWindow(QWidget):
         self.stats_label = QLabel("")
         self.stats_label.setObjectName("Hint")
         clear_btn = QPushButton("清空记录")
+        clear_btn.setToolTip("清空当前对话的消息")
         clear_btn.clicked.connect(self._confirm_clear)
         # 选择编程项目目录（选目录后，编程任务自然路由到 coding，无需切换模式）
         self.dir_btn = QPushButton("📁 目录")
@@ -112,13 +154,13 @@ class ChatWindow(QWidget):
         row1.addWidget(clear_btn)
         header_layout.addLayout(row1)
         header_layout.addWidget(self.stats_label)
-        root.addWidget(header)
+        main.addWidget(header)
 
         self.coding_status_label = QLabel("")
         self.coding_status_label.setObjectName("CodingStatus")
         self.coding_status_label.setWordWrap(True)
         self.coding_status_label.hide()
-        root.addWidget(self.coding_status_label)
+        main.addWidget(self.coding_status_label)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -129,7 +171,7 @@ class ChatWindow(QWidget):
         self.content_layout.setSpacing(4)
         self.content_layout.addStretch(1)
         self.scroll.setWidget(self.content)
-        root.addWidget(self.scroll, 1)
+        main.addWidget(self.scroll, 1)
 
         bottom = QWidget()
         bottom_layout = QVBoxLayout(bottom)
@@ -142,7 +184,57 @@ class ChatWindow(QWidget):
         input_row.addWidget(self.input_text, 1)
         input_row.addWidget(send_btn)
         bottom_layout.addLayout(input_row)
-        root.addWidget(bottom)
+        main.addWidget(bottom)
+
+        root.addLayout(main, 1)
+
+    # ---------- 会话 ----------
+
+    def set_sessions(self, sessions, current_session_id):
+        """刷新会话列表（宿主 db.list_sessions 结果）；当前会话高亮。"""
+        self.current_session_id = current_session_id
+        self._session_ids = []
+        self.session_list.blockSignals(True)
+        self.session_list.clear()
+        for s in sessions:
+            label = s.get("name") or "会话"
+            if s.get("project_dir"):
+                label = f"📁 {label}"
+            item = QListWidgetItem(label)
+            item.setToolTip(s.get("project_dir") or "未绑定编程目录")
+            self.session_list.addItem(item)
+            self._session_ids.append(s["id"])
+            if s["id"] == current_session_id:
+                self.session_list.setCurrentItem(item)
+        self.session_list.blockSignals(False)
+
+    def _on_session_clicked(self, item):
+        idx = self.session_list.row(item)
+        if 0 <= idx < len(self._session_ids):
+            sid = self._session_ids[idx]
+            if sid != self.current_session_id and self.on_switch_session is not None:
+                self.on_switch_session(sid)
+
+    def _on_new_session(self):
+        if self.on_new_session is not None:
+            self.on_new_session()
+
+    def _on_delete_session(self):
+        item = self.session_list.currentItem()
+        if item is None:
+            return
+        idx = self.session_list.row(item)
+        if not (0 <= idx < len(self._session_ids)):
+            return
+        sid = self._session_ids[idx]
+        if sid == "default":
+            QMessageBox.information(self, "删除对话", "默认对话不能删除")
+            return
+        answer = QMessageBox.question(
+            self, "删除对话", "确定删除该对话及其全部消息吗？"
+        )
+        if answer == QMessageBox.Yes and self.on_delete_session is not None:
+            self.on_delete_session(sid)
 
     # ---------- 消息 ----------
 
@@ -301,7 +393,7 @@ class ChatWindow(QWidget):
 
     def _confirm_clear(self):
         answer = QMessageBox.question(
-            self, "清空记录", "确定清空聊天记录吗？"
+            self, "清空记录", "确定清空当前对话的聊天记录吗？"
         )
         if answer == QMessageBox.Yes:
             self.on_clear()

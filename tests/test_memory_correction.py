@@ -139,7 +139,7 @@ def test_reverse_short_term_guard(tmp_path):
     assert _facts(b) == ["主人喜欢这样的设计"]
 
 
-def test_merge_replace_overlap(db_file):
+def test_merge_replace_overlap():
     """重叠字修复：喝咖啡→喝茶 不产生“喝喝茶”。"""
     assert _merge_replace("主人喜欢喝咖啡", "咖啡", "喝茶") == "主人喜欢喝茶"
     assert _merge_replace("主人持有长江电力", "长江电力", "长电科技") == "主人持有长电科技"

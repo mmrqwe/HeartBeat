@@ -134,7 +134,7 @@ def test_chat_lifecycle_and_stale_delta():
         deltas = []
         hb.bridge.delta.connect(lambda epoch, text: deltas.append((epoch, text)))
 
-        def fake_chat(user_text, on_delta=None):
+        def fake_chat(user_text, on_delta=None, session_id="default"):
             # 模拟流式：正确 epoch 的增量 + 过期线程的增量
             if on_delta:
                 on_delta("你好")
@@ -200,7 +200,7 @@ def test_chat_busy_queues_next_message():
         gate = threading.Event()
         calls = []
 
-        def fake_chat(user_text, on_delta=None):
+        def fake_chat(user_text, on_delta=None, session_id="default"):
             calls.append(user_text)
             if user_text == "first":
                 gate.wait(2)
@@ -212,7 +212,7 @@ def test_chat_busy_queues_next_message():
         assert rt.is_busy("chat")
 
         hb._send_chat("second")
-        assert hb._chat_pending == ["second"]
+        assert hb._chat_pending == [("second", "default")]
         assert "已排队" in hb.pet._status_text
 
         gate.set()
@@ -220,6 +220,45 @@ def test_chat_busy_queues_next_message():
         assert calls == ["first", "second"], calls
         assert hb._chat_pending == []
         assert not rt.is_busy("chat")
+    finally:
+        hb.kernel.stop()
+        tmp.cleanup()
+        core.gather = orig_gather
+
+
+def test_session_switch_and_dir_binding():
+    """多对话编排：目录↔会话一对一；切换会话同步全局编程目录；删除回落默认。"""
+    tmp, hb, orig_gather = _make_app()
+    try:
+        d = hb.db
+        assert hb.current_session_id == "default"
+        # 目录绑定：find → 无则建（一对一）
+        proj = str(Path(tmp.name) / "proj")
+        assert d.find_session_by_project_dir(proj) is None
+        sid = d.create_session("快排项目", project_dir=proj)
+        assert d.find_session_by_project_dir(proj)["id"] == sid
+        # 切换到绑定目录的会话 → 全局编程目录跟随
+        hb._switch_session(sid)
+        assert hb.current_session_id == sid
+        assert hb.cfg["project_dir"] == proj
+        # 会话消息落库后切换加载（无 UI 时只验证数据面）
+        hb.agent.append_chat("user", "写个快排", session_id=sid)
+        hb.agent.append_chat("user", "默认会话消息", session_id="default")
+        hb._switch_session("default")
+        assert hb.current_session_id == "default"
+        assert [m["text"] for m in hb.agent.chat_history(session_id="default")] == ["默认会话消息"]
+        # 新建会话：名称带序号
+        hb._new_session()
+        new_sid = hb.current_session_id
+        assert new_sid != "default" and new_sid != sid
+        assert hb.db.session(new_sid)["name"] == "新对话 1"
+        # 删除当前会话 → 回落默认
+        hb._delete_session(new_sid)
+        assert hb.current_session_id == "default"
+        assert hb.db.session(new_sid) is None
+        # 默认会话不可删
+        hb._delete_session("default")
+        assert hb.db.session("default") is not None
     finally:
         hb.kernel.stop()
         tmp.cleanup()
