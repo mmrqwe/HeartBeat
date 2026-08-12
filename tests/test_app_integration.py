@@ -42,7 +42,9 @@ def _make_app():
     app = QApplication.instance() or QApplication(sys.argv)
     if isinstance(app, QGuiApplication):
         app.setQuitOnLastWindowClosed(False)
-    hb = mainmod.HeartBeatApp(str(cfg_path))
+    # P3：data_dir 显式注入 tmp（Kernel 跳过真实用户目录迁移）——
+    # 每个测试独立数据库/事件表，不再污染真实用户库
+    hb = mainmod.HeartBeatApp(str(cfg_path), data_dir=tmp.name)
     # 屏蔽真实采集与思考（不碰网络/LLM）
     orig_gather = core.gather
     core.gather = lambda *a, **k: {"collections": [], "errors": []}

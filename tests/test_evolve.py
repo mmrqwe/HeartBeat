@@ -80,7 +80,7 @@ def test_evolve_pipeline_success(tmp_path):
     P2 拆包：evolve('planner') 升级独立版本单元（<data>/brain/planner/），
     不重建 brain 包（Policy 级升级不触发 Brain 包重建）。
     """
-    ev = _make_evolver(tmp_path, FakeBrain([PLANNER_EVOLVED]))
+    ev = _make_evolver(tmp_path, FakeBrain(["FULL_REWRITE", PLANNER_EVOLVED]))
     version = ev.evolve("planner", "每天上午9点提醒我喝水")
     assert version == "v1.1"
     assert ev.updater.active_version("planner") == "v1.1"
@@ -99,7 +99,7 @@ def test_evolve_pipeline_success(tmp_path):
 def test_evolve_rejects_dangerous_import(tmp_path):
     """候选代码含禁止 import（os）→ 重试耗尽后失败，版本未安装。"""
     bad = "import os\n" + PLANNER_SRC
-    ev = _make_evolver(tmp_path, FakeBrain([bad, bad, bad]))
+    ev = _make_evolver(tmp_path, FakeBrain(["FULL_REWRITE", bad, bad, bad]))
     try:
         ev.evolve("planner", "任意需求")
     except ValueError as exc:
@@ -135,12 +135,12 @@ def test_check_safety_blocks_pathlib_io():
 
 def test_evolve_retry_with_feedback(tmp_path):
     """首次生成语法错误 → 带反馈重试 → 第二次成功。"""
-    fake = FakeBrain([BAD_SRC, PLANNER_EVOLVED])
+    fake = FakeBrain(["FULL_REWRITE", BAD_SRC, PLANNER_EVOLVED])
     ev = _make_evolver(tmp_path, fake)
     version = ev.evolve("planner", "每天上午9点提醒我喝水")
     assert version == "v1.1"
-    # 第二次请求带上了上次失败反馈
-    assert "验证失败" in fake.prompts[1][-1]["content"]
+    # 第二次请求带上了上次失败反馈（prompts[0]=Step1 选靶，[1]=首次完整生成）
+    assert "验证失败" in fake.prompts[2][-1]["content"]
 
 
 def test_evolve_rejects_non_evolvable_module(tmp_path):
@@ -514,3 +514,74 @@ if __name__ == "__main__":
                 patch.restore()
     print("ALL TESTS PASSED" if failed == 0 else f"{failed} FAILED")
     sys.exit(1 if failed else 0)
+
+
+# ---------- P3：函数级局部重写（两步流水线） ----------
+
+NEW_GREETING = '    def greeting(self, now):\n        return "今天也要元气满满！"\n'
+
+
+def test_evolve_local_rewrite_success(tmp_path):
+    """两步局部重写：Step1 TARGET → Step2 新函数 → AST 替换 → 独立安装 v1.1。"""
+    fake = FakeBrain([
+        "TARGET: greeting",
+        f"```python\n{NEW_GREETING}\n```",
+    ])
+    ev = _make_evolver(tmp_path, fake)
+    version = ev.evolve("planner", "问候语更活泼一点")
+    assert version == "v1.1"
+    assert ev.updater.active_version("planner") == "v1.1"
+    assert ev.updater.active_version("brain") == "v1.0"  # brain 包不受影响
+    # Step1 prompt 含结构摘要，Step2 prompt 含目标函数源码
+    assert "模块结构摘要" in fake.prompts[0][-1]["content"]
+    assert "当前完整源码" in fake.prompts[1][-1]["content"]
+    # 替换生效：新问候语真实可用（Agent 组合加载）
+    ag = _make_agent(tmp_path, with_updater=True)
+    assert ag.planner.greeting(ag.clock()) == "今天也要元气满满！"
+    # 候选目录已清理
+    assert not list(ev.candidate_root.glob("*"))
+
+
+def test_evolve_local_fallback_full(tmp_path):
+    """Step1 TARGET 不存在 → 回退完整文件生成（带失败原因反馈）。"""
+    fake = FakeBrain([
+        "TARGET: no_such_func",
+        PLANNER_EVOLVED,
+    ])
+    ev = _make_evolver(tmp_path, fake)
+    version = ev.evolve("planner", "每天上午9点提醒我喝水")
+    assert version == "v1.1"
+    assert ev.updater.active_version("planner") == "v1.1"
+    module = ev.updater.load("planner")
+    assert hasattr(getattr(module, "Planner"), "drink_reminder")
+
+
+def test_evolve_local_bad_code_fallback_full(tmp_path):
+    """Step2 新函数语法错误 → 回退完整文件生成。"""
+    fake = FakeBrain([
+        "TARGET: greeting",
+        "```python\ndef greeting(self, now):\n    return (\n```",
+        PLANNER_EVOLVED,
+    ])
+    ev = _make_evolver(tmp_path, fake)
+    version = ev.evolve("planner", "每天上午9点提醒我喝水")
+    assert version == "v1.1"
+    assert ev.updater.active_version("planner") == "v1.1"
+    module = ev.updater.load("planner")
+    assert hasattr(getattr(module, "Planner"), "drink_reminder")
+
+
+def test_evolve_local_validate_failure_fallback_full(tmp_path):
+    """局部替换后 L2 冒烟失败（rules_think 改签名 → TypeError）→ 回退完整文件生成。"""
+    fake = FakeBrain([
+        "TARGET: rules_think",
+        "```python\n    def rules_think(self, ctx):\n        return None\n```",
+        PLANNER_EVOLVED,
+    ])
+    ev = _make_evolver(tmp_path, fake)
+    version = ev.evolve("planner", "每天上午9点提醒我喝水")
+    assert version == "v1.1"
+    assert ev.updater.active_version("planner") == "v1.1"
+    # 回退后的完整生成带上了局部失败反馈
+    assert any("L2 冒烟" in p[-1]["content"] or "局部" in p[-1]["content"]
+               for p in fake.prompts)

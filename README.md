@@ -25,14 +25,14 @@
 ## 项目结构
 
 - `main.py` / `cli.py` —— 入口（GUI / 命令行）
-- `core.py` `db.py` `rag.py` `search.py` `tools.py` `agent.py` —— 核心逻辑（配置/HTTP/数据库/向量/搜索/工具/Agent）
-- `kernel/` —— 引导、插件管理、运行时、事件总线、权限与 Shell 工具、自进化更新器
-- `brain/` —— Agent 拆分包（memory / planner / agent）
+- `core.py` `db.py` `rag.py` `search.py` `tools.py` `agent.py` —— 核心逻辑（配置/HTTP/数据库/向量/搜索/工具/Agent；`agent.py` 是兼容 shim，实体在 `brain/`）
+- `kernel/` —— 最小内核：引导与数据迁移（boot）、插件管理（module）、权限分级与 Shell 工具（permission/toolsafety）、运行时线程池与看门狗（runtime）、事件总线（eventbus）、自进化版本管理（updater）、运行期健康监控（monitor）、异步向量队列（embedqueue）
+- `brain/` —— 可进化层：Agent 控制流（agent.py + agent_chat.py + agent_think.py 混入）、记忆（memory.py）、规则决策（planner.py）、技能元数据（skills.py）、进化引擎（evolver.py）、进化辅助（ast_summarizer/func_replacer）、L2 冒烟（smoke.py）
 - `gui/` —— 皮肤、主题与桌宠/聊天/设置/搜索窗口
 - `plugins/` —— 内容源插件（天气/RSS/行情/百科等）
 - `tests/` —— 单元测试（`python -m tests.test_xxx`）
 - `assets/` —— 图标与界面截图
-- `build_mac.sh` / `build.bat` / `build-release.command` —— 打包脚本
+- `build_mac.sh` / `build.bat` / `build-release.command` / `HeartBeat.spec` —— 打包脚本
 
 ## 运行
 
@@ -107,12 +107,12 @@ py -3.12 main.py --cli selfcheck
 
 ### Agent 的“自己的想法”
 
-- **长期记忆**：你聊天时说的重要事情会被记住（如“我叫小明”“我喜欢喝咖啡”“明天要开会”），LLM 模式由模型自己判断并写 `[FACT]`，规则模式用关键词提取，存在 `memory.json`
+- **长期记忆**：你聊天时说的重要事情会被记住（如“我叫小明”“我喜欢喝咖啡”“明天要开会”），LLM 模式由模型自己判断并写 `[FACT]`，规则模式用关键词提取，存在 `heartbeat.db` 的 `memory` 表
 - **想法日记**：每次主动思考即使不说话，也可能把当天看到的东西记成一条想法（`[THINK]` / 规则模式随机记）
 - **主动关心**：你之前说过要考试/开会/面试/加班，过一段时间它会主动问进展
 - **作息节律**：深夜（默认 23:00–7:00）进入睡眠、不主动思考；心情会随天气和时间变化（晴→开心、下雨→有点蔫、深夜→困了）
 - **体力驱动**：主动思考和说话由每日体力（LLM 调用次数）和当前情绪决定，不设固定发言间隔
-- 这些数据都保存在 exe/源码目录旁的 `memory.json`、`state.json`、`chat_history.json`
+- 所有动态数据（记忆/状态/聊天/统计）都存 SQLite（见下文“数据与记忆”），重装不丢
 
 ### 聊天窗口
 
@@ -232,7 +232,7 @@ py -3.12 -m PyInstaller --noconfirm --clean --workpath "$env:LOCALAPPDATA\Temp\H
 
 桌宠右键 → “搜索…”打开搜索窗口，支持七类：
 
-- 综合：网页搜索，依次尝试 Bing / DuckDuckGo / Mojeek（标题/摘要/链接，双击或点按钮在浏览器打开）
+- 综合：网页搜索，依次尝试 Bing / DuckDuckGo（HTML 轻量版）（标题/摘要/链接，双击或点按钮在浏览器打开）
 - 新闻：Bing 新闻 RSS，失败自动回退 Google News RSS
 - 热点：Google News 中文头条
 - 股票：腾讯行情（A 股/港股）+ 新浪兜底（含美股），支持代码或名称/拼音，例如 `600519`、`sh600519`、`hk00700`、`AAPL`、`长电科技`、`gzmt`
@@ -266,10 +266,20 @@ py -3.12 -m PyInstaller --noconfirm --clean --workpath "$env:LOCALAPPDATA\Temp\H
 
 ### 自我进化（除最小核心外都可自升级）
 
-桌宠可以在对话里主动升级自己，除最小核心（内核安全边界 kernel/、进化器自身 brain/evolver.py、LLM 封装 core.py、工具分发 tools.py）锁定外，**策略层与控制流全部可进化**。进化在后台异步执行：说“进化 planner：每天上午9点提醒我喝水”后立即收到确认，完成后结果追加到聊天窗口——不占用聊天看门狗（120s），也不会被运行期监控误判失速。单次 LLM 请求超时 10 分钟（完整重写 8000 token 慢模型可达 5-10 分钟）、整体等待上限 30 分钟，超时只放弃等待结果、不中断任务；同一时刻只允许一个进化任务。
+桌宠可以在对话里主动升级自己，除最小核心（内核安全边界 kernel/、进化器自身 brain/evolver.py、LLM 封装 core.py、工具分发 tools.py）锁定外，**策略层与控制流全部可进化**。进化在后台异步执行：说“进化 planner：每天上午9点提醒我喝水”后立即收到确认，完成后结果追加到聊天窗口——不占用聊天看门狗（120s），也不会被运行期监控误判失速。单次 LLM 请求超时 10 分钟、整体等待上限 30 分钟，超时只放弃等待结果、不中断任务；同一时刻只允许一个进化任务。
 
-- **策略层**：说“进化 planner：每天上午9点提醒我喝水”“升级记忆：多记住一些日程”——LLM 生成新版本模块 → 安全扫描 → 语法/接口契约/冒烟验证 → 原子切换 → 热加载，失败自动回滚。
-- **控制流（brain 包）**：说“进化 brain：agent_chat.py 的 _chat_rules 里……”“升级记忆：多记住一些日程”——整个 brain 以包形式版本化（`<用户数据目录>/brain/brain/vN/`，含 agent.py 主类 / agent_chat.py 聊天链路 / agent_think.py 自主思考 / memory.py / planner.py），LLM 可选择一个子模块整文件重写（TARGET 声明或需求里直接写文件名），其余文件从 active 包拷贝组装成新包版本。升级候选必须通过：
+**三级进化粒度**（P2 拆包）：
+
+- **Skill（能力层）**：`<用户数据目录>/tools/<名称>/vN/`——LLM 生成新工具（受限沙箱 + ctx 原语），聊天里立刻可用；见下方“能力层（工具）”。
+- **Policy（策略层）**：`<用户数据目录>/brain/memory/`、`brain/planner/`——独立版本单元，进化只动对应目录，**不触碰 brain 包**（升级/回滚粒度独立，失败不影响控制流）。
+- **Brain（控制流）**：`<用户数据目录>/brain/brain/`——包整体版本化，只含 agent.py 主类 / agent_chat.py 聊天链路 / agent_think.py 自主思考 / skills.py 技能元数据。
+
+**进化流水线**（P3 两步局部重写）：
+
+- 策略层进化默认走**函数级局部重写**：宿主先做 AST 结构摘要 + 调用关系分析 → Step 1 让 LLM 从摘要选目标函数（`TARGET: 函数名`）→ Step 2 只给目标函数源码让 LLM 输出新函数 → 宿主 AST 定位替换 → 生成完整候选走验证流水线。prompt 从“整个文件 15-17K 字符”缩到“摘要 1-2K + 目标函数 2-4K”，绕开大模型对超长完整重写返回空的服务端限制。
+- 需要改多个函数 / 新增删除函数 / 模块级结构调整时，LLM 输出 `FULL_REWRITE` 信号，或局部重写任一步失败（无法定位 / 语法错误 / 验证不通过）——自动回退**完整文件生成**（带失败原因反馈）。
+- **策略层**：说“进化 planner：每天上午9点提醒我喝水”“升级记忆：多记住一些日程”——新版本经安全扫描 → 语法/接口契约/冒烟验证 → 原子切换 → 热加载，失败自动回滚。
+- **控制流（brain 包）**：说“进化 brain：agent_chat.py 的 _chat_rules 里……”“升级记忆：多记住一些日程”——LLM 选择一个子模块整文件重写（TARGET 声明或需求里直接写文件名），其余文件从 active 包拷贝组装成新包版本。升级候选必须通过：
   - L0 逐文件语法 + 包加载；L1 契约（内核维护的类/方法清单 + `_contract.py` 布局校验，防候选自我验收）；L2 冒烟——**mock LLM replay 5 场景**（单工具/多轮/流式中断/工具异常隔离/问候）+ **headless 3 轮对话与心跳**，坏 agent（chat 直接崩溃）在冒烟层被拦截；
   - 安装后立即重载生效（准热切换），启动时 active 损坏自动回滚/重建。
 - **运行期安全网（Monitor）**：`kernel/monitor.py` 监控 tick 心跳（连续失败）与 chat 异常（窗口内累计），超阈值自动回滚 brain 包到上一可用版本（单次运行最多一次，防循环），阈值可用 `<用户数据目录>/monitor.json` 覆盖（损坏回退默认），动作写入 `updates.log` 审计；启动时自测回滚链路。
@@ -297,17 +307,16 @@ py -3.12 -m PyInstaller --noconfirm --clean --workpath "$env:LOCALAPPDATA\Temp\H
 
 ## 测试
 
-```powershell
-python -m py_compile main.py core.py agent.py tools.py gui\*.py tests\test_*.py plugins\weather.py plugins\rss_news.py plugins\quote.py
-python -m tests.test_core
-python -m tests.test_agent
-python -m tests.test_tools
-python -m tests.test_stats
-python -m tests.test_db
-python -m tests.test_skins
-python -m tests.test_search
-py -3.12 -m tests.test_db   # 带 sqlite-vec 环境，会执行向量检索测试
+```bash
+# 全量回归（21 个套件，无 GUI/无网络依赖，需项目 .venv）
+for t in tests/test_*.py; do
+  python -m "${t%.py}" || break
+done
+# GUI 集成套件需 offscreen 平台（macOS 无显示器环境）
+QT_QPA_PLATFORM=offscreen HB_NO_MAC_TRAY=1 python -m tests.test_app_integration
 ```
+
+单套件：`python -m tests.test_updater`（自进化/迁移）、`python -m tests.test_evolve`（进化流水线）、`python -m tests.test_evolve_local`（函数级重写工具链）、`python -m tests.test_tools`（Shell 工具安全分级）等。Windows 用 `py -3.12 -m tests.test_xxx`。
 
 ## 下一步可以加
 

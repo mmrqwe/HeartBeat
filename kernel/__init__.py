@@ -19,9 +19,15 @@ from . import boot, module, permission  # noqa: F401
 class Kernel:
     """最小内核门面：启动配置、模块发现、运行时调度、权限边界。"""
 
-    def __init__(self, config_path=None):
-        # 旧数据迁移（源码目录 / app bundle → 用户数据目录）
-        self.data_dir = boot.migrate_legacy_data(boot.legacy_data_dirs())
+    def __init__(self, config_path=None, data_dir=None):
+        if data_dir is not None:
+            # 显式注入（测试隔离 / 嵌入式场景）：跳过旧数据迁移，
+            # 直接使用注入目录（与 config_path 正交——config 决定配置位置）
+            self.data_dir = Path(data_dir)
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            # 旧数据迁移（源码目录 / app bundle → 用户数据目录）
+            self.data_dir = boot.migrate_legacy_data(boot.legacy_data_dirs())
         self.config_path = (
             Path(config_path) if config_path else boot.default_config_path()
         )

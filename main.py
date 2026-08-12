@@ -47,9 +47,9 @@ class Bridge(QObject):
 
 
 class HeartBeatApp:
-    def __init__(self, config_path=None):
+    def __init__(self, config_path=None, data_dir=None):
         # 内核：迁移/配置/插件发现/运行时调度（Kernel 门面）
-        self.kernel = kernel.Kernel(config_path)
+        self.kernel = kernel.Kernel(config_path, data_dir=data_dir)
         self.cfg = self.kernel.cfg
         self.plugins = self.kernel.plugins
         self.data_dir = self.kernel.data_dir

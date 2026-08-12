@@ -21,6 +21,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .ast_summarizer import build_call_graph, build_module_summary, format_calls
+from .func_replacer import ReplacementError, find_function, replace_function
+
 # 允许的 import 根：stdlib 安全子集 + 项目内模块（planner/memory 现有用法全覆盖）。
 # 进化候选只允许在这里面 import；os/sys/subprocess/socket/网络/文件写入一律拒绝。
 ALLOWED_IMPORTS = {
@@ -63,6 +66,13 @@ _REQUIREMENT_RE = re.compile(r"[：:，,。！!？?\s]+$")
 _UPGRADE_RE = re.compile(r"^升级\s*([A-Za-z_][A-Za-z0-9_]*)[：:，,]?\s*(.*)$")
 # 技能需求检测：涉及已安装技能时强制要求 ctx.skill_* 原语
 _SKILL_REQ_RE = re.compile(r"技能|skill|zhihu|知乎|热榜|直答", re.IGNORECASE)
+# 两步局部重写（P3）：Step1 选靶输出
+LOCAL_TARGET_RE = re.compile(
+    r"TARGET\s*[:：]\s*([A-Za-z_][A-Za-z0-9_]*"
+    r"(?:\.[A-Za-z_][A-Za-z0-9_]*)?)",
+    re.IGNORECASE,
+)
+FULL_REWRITE_MARK = "FULL_REWRITE"
 
 
 class Evolver:
@@ -313,8 +323,9 @@ class Evolver:
     def evolve(self, name, requirement, on_status=None):
         """生成 → 安全检查 → updater 验证（L0/L1/L2）→ 原子安装。
 
-        返回新版本号（如 v1.1）。验证失败带错误反馈重试（最多 MAX_ATTEMPTS 次），
-        仍失败抛 ValueError（不安装任何东西）。安装后 updater 广播 brain.switched，
+        P3 两步流水线：memory/planner 先函数级局部重写（选靶 + 重写目标函数），
+        失败/多函数需求回退完整文件生成；brain 包级走完整生成（子模块重写）。
+        返回新版本号（如 v1.1）。安装后 updater 广播 brain.switched，
         宿主（main.py 热切换订阅）会自动重载领域模块。
         """
         def status(msg):
@@ -330,7 +341,22 @@ class Evolver:
         requirement = _REQUIREMENT_RE.sub("", requirement).strip()
         if len(requirement) < 4:
             raise ValueError("需求描述太短，请具体说明要加什么功能")
-        feedback = ""
+        if name == "brain":
+            return self._evolve_full(name, requirement, status)
+        # memory/planner：先函数级局部重写（两步，prompt 小），
+        # 失败（模型输出/定位/验证）→ 回退完整文件生成（带失败反馈）
+        local_version, reason = self._try_evolve_local(name, requirement, status)
+        if local_version is not None:
+            return local_version
+        status(f"局部重写不可用（{reason}），回退完整文件重写…")
+        return self._evolve_full(name, requirement, status, feedback=reason)
+
+    def _evolve_full(self, name, requirement, status, feedback=""):
+        """完整文件生成（现有流水线；局部路径的回退分支）。
+
+        验证失败带错误反馈重试（最多 MAX_ATTEMPTS 次），仍失败抛 ValueError
+        （不安装任何东西）。
+        """
         for attempt in range(1, MAX_ATTEMPTS + 2):
             status(f"生成候选代码（第 {attempt} 次尝试）…")
             candidate_dir, generated = self.generate_candidate(name, requirement, feedback)
@@ -341,8 +367,6 @@ class Evolver:
                     feedback = "；".join(errors)
                     continue
                 status("运行验证（语法/接口契约/冒烟）…")
-                # P2 拆包：memory/planner 单文件独立版本（install_name=name），
-                # brain 包级候选走包分支（updater 按 PACKAGE_MODULES 自动分流）
                 ok, v_errors = self.updater.validate_candidate(name, candidate_dir)
                 if ok:
                     status("验证通过，安装中…")
@@ -354,6 +378,118 @@ class Evolver:
         raise ValueError(
             f"生成 {MAX_ATTEMPTS + 1} 次均未通过验证，已放弃：{feedback}"
         )
+
+    # ---------- 函数级局部重写（P3 两步流水线） ----------
+
+    def _build_target_prompt(self, name, requirement, summary):
+        """Step 1：结构摘要 → LLM 选靶（TARGET: 函数名 或 FULL_REWRITE）。"""
+        system = (
+            "你是桌宠「小跳」的自我进化引擎。用户要求修改某个模块，你需要先定位"
+            "要修改的【单个函数或方法】。\n"
+            "模块结构摘要如下（只含签名与常量，不含函数体）。\n"
+            "输出（严格一行，不要解释）：\n"
+            "- TARGET: <函数名> 或 <类名.方法名>（需求聚焦在单个现有函数时）\n"
+            f"- {FULL_REWRITE_MARK}（需求要改多个函数/新增或删除函数/改模块级结构时）"
+        )
+        user = f"模块：{name}\n升级需求：{requirement}\n\n模块结构摘要：\n{summary}"
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+    def _build_rewrite_prompt(self, name, requirement, target, func_src, call_text, allowed):
+        """Step 2：目标函数源码 + 调用关系 → LLM 输出新函数定义。"""
+        system = (
+            "你是桌宠「小跳」的自我进化引擎。用户要求修改模块里的一个函数/方法。\n"
+            "你会拿到该函数的当前完整源码与调用关系，请输出【新版本的完整函数定义】"
+            "（def 行开始到函数体结束，不要输出函数外的任何代码）。\n"
+            "硬性要求：\n"
+            f"1. 函数名必须保持 {target.split('.')[-1]}（签名可调整，调用方兼容性由验证兜底）；\n"
+            "2. 只允许 import 白名单：" + allowed + "；"
+            "函数内不要新增 import（模块头已有依赖直接用）；\n"
+            "3. 保持返回类型与调用语义兼容（调用关系见下，静态分析可能不完整）；\n"
+            "4. 只输出纯 Python 函数定义（可用 ```python 围栏包裹），不要任何解释文字。"
+        )
+        user = (
+            f"模块：{name}\n目标：{target}\n升级需求：{requirement}\n\n"
+            f"当前完整源码：\n```python\n{func_src}\n```\n\n{call_text}"
+        )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+    @staticmethod
+    def _extract_func_code(text):
+        """从模型输出提取新函数定义：围栏优先；否则从第一个 def/async def 截取。"""
+        if not text:
+            return ""
+        fences = _CODE_FENCE.findall(text)
+        if fences:
+            code = max(fences, key=len).strip()
+            if code:
+                return code
+        idx = text.find("def ")
+        aidx = text.find("async def ")
+        pos = aidx if aidx != -1 and (idx == -1 or aidx < idx) else idx
+        if pos == -1:
+            return ""
+        return text[pos:].strip()
+
+    def _try_evolve_local(self, name, requirement, status):
+        """函数级局部重写（两步）。成功返回 (版本号, "")；失败返回 (None, 原因)
+        由调用方回退完整文件生成。任何异常都被兜底捕获（不中断会话）。"""
+        candidate_dir = None
+        try:
+            source = self.current_source(name)
+            summary = build_module_summary(source, name)
+            calls = build_call_graph(source)
+            status("局部重写：定位目标函数…")
+            raw1 = self.brain.complete(
+                self._build_target_prompt(name, requirement, summary),
+                max_tokens=256, timeout=EVOLVE_REQUEST_TIMEOUT,
+            ) or ""
+            if FULL_REWRITE_MARK in raw1.upper():
+                return None, "需求需整体重写（模型输出 FULL_REWRITE）"
+            m = LOCAL_TARGET_RE.search(raw1)
+            if not m:
+                return None, "未定位到目标函数（Step1 输出无法解析）"
+            target = m.group(1)
+            try:
+                _, func_src = find_function(source, target)
+            except ReplacementError as exc:
+                return None, str(exc)
+            status(f"局部重写：重写 {target}…")
+            allowed = ", ".join(sorted(ALLOWED_IMPORTS))
+            raw2 = self.brain.complete(
+                self._build_rewrite_prompt(
+                    name, requirement, target, func_src,
+                    format_calls(calls, target), allowed,
+                ),
+                max_tokens=MAX_GEN_TOKENS, timeout=EVOLVE_REQUEST_TIMEOUT,
+            ) or ""
+            new_func = self._extract_func_code(raw2)
+            if not new_func:
+                return None, "模型未返回函数代码（Step2）"
+            new_source = replace_function(source, target, new_func)
+            status("局部重写完成，运行验证（语法/接口契约/冒烟）…")
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            candidate_dir = self.candidate_root / f"{name}_{stamp}"
+            candidate_dir.mkdir(parents=True, exist_ok=True)
+            (candidate_dir / f"{name}.py").write_text(new_source, encoding="utf-8")
+            errors = self._check_candidate_safety(candidate_dir, [f"{name}.py"])
+            if errors:
+                return None, "；".join(errors)
+            ok, v_errors = self.updater.validate_candidate(name, candidate_dir)
+            if not ok:
+                return None, "；".join(v_errors)
+            version = self.updater.install_candidate(name, candidate_dir)
+            return version, ""
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+        finally:
+            if candidate_dir is not None:
+                shutil.rmtree(candidate_dir, ignore_errors=True)
 
     # ---------- 进化工具（能力层：<data>/tools/，受限沙箱） ----------
 
