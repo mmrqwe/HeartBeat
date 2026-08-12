@@ -21,7 +21,6 @@ DEFAULT_CONFIG = {
     "speaking_style": "",
     "example_lines": "",
     "interval_minutes": 10,
-    "proactive_gap_minutes": 30,
     "quiet_start": 23,
     "quiet_end": 7,
     "embedding_enabled": True,

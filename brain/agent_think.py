@@ -145,6 +145,33 @@ class ThinkMixin:
             self._save_state()
         return reply or None
 
+    def greet(self):
+        """用户主动打招呼/摸摸头时，用角色语气回应一句（计入体力）。"""
+        owner = core.owner_title(self.cfg)
+        system = core.build_persona(self.cfg) + (
+            "\n\n用户刚刚主动跟你打招呼/摸摸头。用你的角色语气回应一句，"
+            "要有情绪、像活物，不要汇报新闻，不超过40字。"
+        )
+        try:
+            raw = self.brain.complete(
+                [
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"现在时间：{time.strftime('%Y-%m-%d %H:%M')}；"
+                            f"当前情绪：{self.state.get('mood', '平静')}。"
+                            f"回应{owner}的招呼。"
+                        ),
+                    },
+                ],
+                max_tokens=80,
+            ) or ""
+            reply = self._parse_agent_reply(raw).strip()
+        except Exception:
+            reply = ""
+        return reply or "我在呀～想我了？"
+
     def _inner_thought(self, ctx, now):
         """内心思考：输出想说的话 / 想做的事 / 私下的想法 / 保持安静。"""
         owner = core.owner_title(self.cfg)

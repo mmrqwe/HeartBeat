@@ -1,4 +1,4 @@
-"""HeartBeatApp × kernel.runtime 接线集成测试：tick（巡视）与 chat（聊天）全链路。
+"""HeartBeatApp × kernel.runtime 接线集成测试：tick（主动思考）与 chat（聊天）全链路。
 
 覆盖：
 - tick：触发 → runtime.trigger → 子线程 work → on_result 回主线程 → busy/状态流转；
@@ -60,7 +60,7 @@ def test_tick_lifecycle():
         QTimer.singleShot(50, hb._autonomy_tick)
         wait(150)
         assert rt.is_busy("tick"), "tick 应处于忙碌状态"
-        assert hb.pet._status_text == "巡视中…", f"状态应为‘巡视中…’，实际：{hb.pet._status_text}"
+        assert hb.pet._status_text == "思考中…", f"状态应为‘思考中…’，实际：{hb.pet._status_text}"
 
         # busy 保护：忙碌中再次触发 epoch 不递增
         started = rt.current_epoch("tick")
@@ -69,7 +69,7 @@ def test_tick_lifecycle():
 
         wait(800)
         assert not rt.is_busy("tick"), "tick 完成后应复位 busy"
-        assert hb.pet._status_text.endswith("巡视完，暂无新事"), f"状态应为完成提示，实际：{hb.pet._status_text}"
+        assert hb.pet._status_text.endswith("想了一圈，暂无新事"), f"状态应为完成提示，实际：{hb.pet._status_text}"
     finally:
         hb.kernel.stop()
         tmp.cleanup()

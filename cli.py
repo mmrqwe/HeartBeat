@@ -72,7 +72,7 @@ def _make_parser():
     p_chat.add_argument("text", help="用户说的话")
     p_chat.add_argument("--no-stream", action="store_true", help="关闭流式输出")
 
-    sub.add_parser("tick", help="跑一次完整巡视（采集 + 思考）")
+    sub.add_parser("tick", help="跑一次完整生活循环（采集 + 主动思考）")
 
     p_search = sub.add_parser("search", help="搜索网络/新闻/股票/天气等")
     p_search.add_argument("query")

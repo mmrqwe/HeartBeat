@@ -249,8 +249,8 @@ class PetWindow(QWidget):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
-        menu.addAction("立即巡视", self.tick_requested.emit)
-        menu.addAction("跟我说句话", self.say_requested.emit)
+        menu.addAction("主动思考一下", self.tick_requested.emit)
+        menu.addAction("打声招呼", self.say_requested.emit)
         menu.addAction("设置…", self.settings_requested.emit)
         menu.addAction("搜索…", self.search_requested.emit)
         menu.addSeparator()

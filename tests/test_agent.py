@@ -1345,6 +1345,19 @@ def test_live_wake_greeting_once(tmp_path):
     assert a.live({"collections": []}) is None  # 唤醒只一次，内心思考无有效输出
 
 
+def test_greet_user_initiated(tmp_path):
+    cfg = _cfg()
+    cfg["api"]["api_key"] = "test-key"
+    a = _make_agent(tmp_path, cfg=cfg)
+
+    class FakeBrain:
+        def complete(self, messages, max_tokens=None, **kw):
+            return "喵～你终于来找我啦！"
+
+    a.brain = FakeBrain()
+    assert a.greet() == "喵～你终于来找我啦！"
+
+
 def test_live_inner_thought_speak(tmp_path):
     cfg = _cfg()
     cfg["api"]["api_key"] = "test-key"

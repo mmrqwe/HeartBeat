@@ -117,8 +117,7 @@ class SettingsWindow(QDialog):
         add_text("role", "自我认知（角色）")
         add_text("personality", "性格底色")
         add_text("speaking_style", "说话方式（可选，留空跟随皮肤）")
-        add_spin("interval_minutes", "巡视间隔（分钟）", 1, 1440)
-        add_spin("proactive_gap_minutes", "主动发言间隔（分钟）", 10, 1440)
+        add_spin("interval_minutes", "生活循环间隔（分钟）", 1, 1440)
         add_spin("daily_energy_budget", "每日体力（LLM 调用次数）", 1, 1000000)
         add_spin("proactive_energy_daily_cap", "主动思考每日上限", 0, 1000000)
         add_spin("max_context_tokens", "上下文上限（token）", 1000, 1000000)
@@ -356,7 +355,7 @@ class SettingsWindow(QDialog):
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(14, 12, 14, 12)
         hint = QLabel(
-            "桌宠在聊天和巡视中自动记住的关于你的事。"
+            "桌宠在聊天和生活中自动记住的关于你的事。"
             "记住得越多，它主动说话时越有话题。可删除单条。"
         )
         hint.setWordWrap(True)
@@ -505,7 +504,7 @@ class SettingsWindow(QDialog):
         layout.addWidget(QLabel("近 7 天"))
         self.stats_days_table = QTableWidget(0, 6)
         self.stats_days_table.setHorizontalHeaderLabels(
-            ["日期", "模型调用", "总 Token", "对话条数", "巡视", "信息条数"]
+            ["日期", "模型调用", "总 Token", "对话条数", "思考", "信息条数"]
         )
         self.stats_days_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.stats_days_table, 1)
@@ -525,9 +524,9 @@ class SettingsWindow(QDialog):
             f"LLM：调用 {today['llm_calls']} 次（错误 {today['llm_errors']}）｜"
             f"输入 {prompt:,} token｜输出 {today['completion_tokens']:,}｜"
             f"缓存 {cached:,}（缓存率 {llm_rate:.1f}%）\n"
-            f"行为：聊天 {today['chat_messages']} 条｜主动发言 {today['proactive_messages']} 次｜"
+            f"行为：聊天 {today['chat_messages']} 条｜主动说话 {today['proactive_messages']} 次｜"
             f"想法 {today['thoughts']} 条｜记住事实 {today['facts']} 条｜"
-            f"巡视 {today['ticks']} 次｜调用工具 {today.get('tool_calls', 0)} 次\n"
+            f"主动思考 {today['ticks']} 次｜调用工具 {today.get('tool_calls', 0)} 次\n"
             f"采集：共 {total_entries} 条 / {total_chars:,} 字｜"
             f"在线 {uptime // 3600} 小时 {uptime % 3600 // 60} 分钟"
         )
@@ -575,7 +574,7 @@ class SettingsWindow(QDialog):
         try:
             for key in ("pet_name", "role", "personality", "speaking_style"):
                 cfg[key] = self._basic[key].text().strip() or cfg[key]
-            for key in ("interval_minutes", "proactive_gap_minutes", "quiet_start", "quiet_end"):
+            for key in ("interval_minutes", "quiet_start", "quiet_end"):
                 cfg[key] = self._basic[key].value()
             api = cfg["api"]
             api["base_url"] = self._basic["base_url"].text().strip() or api["base_url"]

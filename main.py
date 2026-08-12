@@ -37,6 +37,8 @@ class Bridge(QObject):
     status = Signal(str)
     # 自我进化进度/结果（agent 后台线程 → 主线程，自动 QueuedConnection）
     evolve_status = Signal(str)
+    # 主动打招呼回复（后台线程生成 → 主线程气泡）
+    greet_reply = Signal(str)
     # 工具确认：cmdline, event, result_holder（子线程 emit 后阻塞等 event）
     tool_confirm = Signal(str, object, object)
 
@@ -73,6 +75,7 @@ class HeartBeatApp:
         self.bridge.delta.connect(self._apply_stream_delta)
         self.bridge.status.connect(self._set_status)
         self.bridge.evolve_status.connect(self._on_evolve_status)
+        self.bridge.greet_reply.connect(self._show_greet_reply)
         self.bridge.tool_confirm.connect(self._on_tool_confirm)
         self._setup_runtime()
         # 注入工具确认回调：confirm 档写命令由主线程弹窗决定（60s 超时拒绝）
@@ -83,9 +86,7 @@ class HeartBeatApp:
         self.pet = PetWindow(self.cfg)
         self.pet.open_chat_requested.connect(self._open_chat)
         self.pet.tick_requested.connect(self._autonomy_tick)
-        self.pet.say_requested.connect(
-            lambda: self.pet.show_bubble("我在呀～想我了？", animation="wave")
-        )
+        self.pet.say_requested.connect(self._on_greet_requested)
         self.pet.settings_requested.connect(self._open_settings)
         self.pet.search_requested.connect(self._open_search)
         self.pet.quit_requested.connect(QApplication.instance().quit)
@@ -182,7 +183,7 @@ class HeartBeatApp:
         menu = NSMenu.alloc().init()
         for title, selector in [
             ("显示 / 隐藏桌宠", "toggle:"),
-            ("立即巡视", "tick:"),
+            ("主动思考一下", "tick:"),
             ("设置…", "settings:"),
             ("搜索…", "search:"),
             (None, None),
@@ -213,7 +214,7 @@ class HeartBeatApp:
         self._tray_toggle_action.setCheckable(True)
         self._tray_toggle_action.triggered.connect(self._toggle_pet)
         menu.addAction(self._tray_toggle_action)
-        menu.addAction("立即巡视", self._autonomy_tick)
+        menu.addAction("主动思考一下", self._autonomy_tick)
         menu.addAction("设置…", self._open_settings)
         menu.addAction("搜索…", self._open_search)
         menu.addSeparator()
@@ -277,7 +278,7 @@ class HeartBeatApp:
         return max(1, int(self.cfg["interval_minutes"])) * 60 * 1000
 
     def _setup_runtime(self):
-        """注册内核任务：tick（自主巡视）与 chat（聊天）。
+        """注册内核任务：tick（主动思考/生活循环）与 chat（聊天）。
 
         定时调度 / 看门狗超时 / 线程提交 / epoch 竞态保护全部由
         kernel.runtime 管理，这里只提供任务体与结果回调。
@@ -289,7 +290,7 @@ class HeartBeatApp:
             work=self._tick_work,
             on_result=self._show_tick_result,
             on_timeout=self._tick_timeout,
-            # 定时到点走 _autonomy_tick：重排 + busy 检查 + “巡视中…”状态提示
+            # 定时到点走 _autonomy_tick：重排 + busy 检查 + “思考中…”状态提示
             # （与原版 QTimer 直接连 _autonomy_tick 的语义逐行等价）
             on_timer=self._autonomy_tick,
         )
@@ -300,7 +301,7 @@ class HeartBeatApp:
             on_result=self._show_reply,
             on_timeout=self._chat_timeout,
         )
-        # 启动后 15 秒首次巡视
+        # 启动后 15 秒首次主动思考
         QTimer.singleShot(15_000, self._autonomy_tick)
 
     def _schedule_next(self):
@@ -310,10 +311,10 @@ class HeartBeatApp:
         self._schedule_next()
         if not self.kernel.runtime.trigger("tick"):
             return
-        self._set_status("巡视中…")
+        self._set_status("思考中…")
 
     def _tick_work(self, epoch):
-        """巡视任务体（子线程执行）：采集 + 思考。返回 (message, errors)。"""
+        """主动思考任务体（子线程执行）：采集 + 生活循环。返回 (message, errors)。"""
         try:
             ctx = core.gather(
                 self.plugins,
@@ -340,18 +341,32 @@ class HeartBeatApp:
             self.pet.show_bubble(message, seconds=15, animation="happy")
         elif errors:
             self._set_status(f"{stamp} 采集异常，下次再试")
-            self.agent.append_chat("system", f"{stamp} 巡视异常：{errors}")
+            self.agent.append_chat("system", f"{stamp} 思考异常：{errors}")
             if self.chat_win:
-                self.chat_win.add_message("system", f"{stamp} 巡视异常：{errors}")
+                self.chat_win.add_message("system", f"{stamp} 思考异常：{errors}")
         else:
-            self._set_status(f"{stamp} 巡视完，暂无新事")
+            self._set_status(f"{stamp} 想了一圈，暂无新事")
         self._update_chat_stats()
 
     def _tick_timeout(self):
-        self._set_status("巡视超时，已重置，稍后自动重试")
+        self._set_status("思考超时，已重置，稍后自动重试")
 
     def _set_status(self, text):
         self.pet.set_status(text)
+
+    def _on_greet_requested(self):
+        """用户主动打招呼：后台生成角色回应，避免卡 UI。"""
+        threading.Thread(target=self._greet_worker, daemon=True).start()
+
+    def _greet_worker(self):
+        try:
+            text = self.agent.greet()
+        except Exception:
+            text = "我在呀～想我了？"
+        self.bridge.greet_reply.emit(text or "我在呀～想我了？")
+
+    def _show_greet_reply(self, text):
+        self.pet.show_bubble(text, seconds=6, animation="wave")
 
     def _on_brain_switched(self, payload):
         """updater 热切换回调：重载领域模块（失败保持旧模块，不中断会话）。"""
