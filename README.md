@@ -26,8 +26,8 @@
 
 - `main.py` / `cli.py` —— 入口（GUI / 命令行）
 - `core.py` `db.py` `rag.py` `search.py` `tools.py` `agent.py` —— 核心逻辑（配置/HTTP/数据库/向量/搜索/工具/Agent；`agent.py` 是兼容 shim，实体在 `brain/`）
-- `kernel/` —— 最小内核：引导与数据迁移（boot）、插件管理（module）、权限分级与 Shell 工具（permission/toolsafety）、运行时线程池与看门狗（runtime）、事件总线（eventbus）、自进化版本管理（updater）、运行期健康监控（monitor）、异步向量队列（embedqueue）
-- `brain/` —— 可进化层：Agent 控制流（agent.py + agent_chat.py + agent_think.py 混入）、记忆（memory.py）、规则决策（planner.py）、技能元数据（skills.py）、进化引擎（evolver.py）、进化辅助（ast_summarizer/func_replacer）、L2 冒烟（smoke.py）
+- `kernel/` —— 最小内核：引导与数据迁移（boot）、插件管理（module）、权限分级与 Shell 工具（permission/toolsafety）、运行时线程池与看门狗（runtime）、事件总线（eventbus）、异步向量队列（embedqueue）
+- `brain/` —— 智能层：Agent 控制流（agent.py + agent_chat.py + agent_think.py 混入）、记忆（memory.py）、规则决策（planner.py）、技能元数据（skills.py）、编码协作（coding_agent.py）
 - `gui/` —— 皮肤、主题与桌宠/聊天/设置/搜索窗口
 - `plugins/` —— 内容源插件（天气/RSS/行情/百科等）
 - `tests/` —— 单元测试（`python -m tests.test_xxx`）
@@ -261,35 +261,20 @@ py -3.12 -m PyInstaller --noconfirm --clean --workpath "$env:LOCALAPPDATA\Temp\H
 - **下载**：说“下载 https://…/xxx.zip”，桌宠会先把下载地址弹窗给你确认（60 秒超时自动拒绝），确认后保存到 `<用户数据目录>/downloads/`。仅支持 http/https、大小上限 200MB，并阻断内网/元数据地址。
 - **安装**：说“把下载的 xxx.zip 装上”，确认后解压到 `<用户数据目录>/skills/`。只允许安装下载目录里的 zip，解压带 zip-slip / 符号链接 / 膨胀上限防护，目标目录已存在时自动备份为 `.old`。
 - **安装即生效**：装好后桌宠聊天的上下文会自动带上技能清单（仅 SKILL.md 的 name/description 元数据，外部文本不进入提示词），它会知道“装了知乎技能”，需要细节时自己 `cat` 技能文档细读——获得新能力不需要改代码，装个技能包就行。
-- **技能初始化（自升级）**：内核提供 `skill_status` / `skill_setup` / `skill_auth` 三个 ctx 原语（不直接暴露给 LLM），桌宠可用 `--cli evolve tool “给 zhihu 技能增加管理工具…”` 自升级生成对应的用户工具；CLI 也可直接 `--cli skill status/setup/auth` 操作。初始化/认证会先经你确认，Secret 不回显。
+- **技能初始化**：内核提供 `skill_status` / `skill_setup` / `skill_auth` 三个 ctx 原语（不直接暴露给 LLM），CLI 用 `--cli skill status/setup/auth` 操作。初始化/认证会先经你确认，Secret 不回显。
 - 主动思考触发时下载/安装会被直接拒绝（写操作必须用户确认）；`off` / `readonly` 档位不可用。
 
-### 自我进化（除最小核心外都可自升级）
+### 编码协作（选择目录，自然语言操作）
 
-桌宠可以在对话里主动升级自己，除最小核心（内核安全边界 kernel/、进化器自身 brain/evolver.py、LLM 封装 core.py、工具分发 tools.py）锁定外，**策略层与控制流全部可进化**。进化在后台异步执行：说“进化 planner：每天上午9点提醒我喝水”后立即收到确认，完成后结果追加到聊天窗口——不占用聊天看门狗（120s），也不会被运行期监控误判失速。单次 LLM 请求超时 10 分钟、整体等待上限 30 分钟，超时只放弃等待结果、不中断任务；同一时刻只允许一个进化任务。
+桌宠可以在你指定的真实项目目录里完成编程任务（读代码、改文件、跑构建与测试）。不需要手动切换任何模式：
 
-**三级进化粒度**（P2 拆包）：
+- 点击聊天窗右上角 **📁 目录** 选择一个文件夹（或设置 → 基本 → 编码项目目录）；
+- 选好后，发“写一个 html 快速排序页面”“把背景改成蓝色”“修改 src/main.py 的 bug”这类消息，桌宠自动识别为编程任务并在该目录里执行；
+- 未选目录时发编程任务，会提示你先选目录；普通闲聊不受影响；
+- 写文件/执行命令前会弹窗经你确认；长命令自动放后台执行并轮询结果。
 
-- **Skill（能力层）**：`<用户数据目录>/tools/<名称>/vN/`——LLM 生成新工具（受限沙箱 + ctx 原语），聊天里立刻可用；见下方“能力层（工具）”。
-- **Policy（策略层）**：`<用户数据目录>/brain/memory/`、`brain/planner/`——独立版本单元，进化只动对应目录，**不触碰 brain 包**（升级/回滚粒度独立，失败不影响控制流）。
-- **Brain（控制流）**：`<用户数据目录>/brain/brain/`——包整体版本化，只含 agent.py 主类 / agent_chat.py 聊天链路 / agent_think.py 自主思考 / skills.py 技能元数据。
+CLI 方式：`python main.py --cli coding "编写一个 html 快速排序实例" --project-dir /path/to/dir --mode full`（`--mode` 可选 off/readonly/confirm/full）。
 
-**进化流水线**（P3 两步局部重写）：
-
-- 策略层进化默认走**函数级局部重写**：宿主先做 AST 结构摘要 + 调用关系分析 → Step 1 让 LLM 从摘要选目标函数（`TARGET: 函数名`）→ Step 2 只给目标函数源码让 LLM 输出新函数 → 宿主 AST 定位替换 → 生成完整候选走验证流水线。prompt 从“整个文件 15-17K 字符”缩到“摘要 1-2K + 目标函数 2-4K”，绕开大模型对超长完整重写返回空的服务端限制。
-- 需要改多个函数 / 新增删除函数 / 模块级结构调整时，LLM 输出 `FULL_REWRITE` 信号，或局部重写任一步失败（无法定位 / 语法错误 / 验证不通过）——自动回退**完整文件生成**（带失败原因反馈）。
-- **策略层**：说“进化 planner：每天上午9点提醒我喝水”“升级记忆：多记住一些日程”——新版本经安全扫描 → 语法/接口契约/冒烟验证 → 原子切换 → 热加载，失败自动回滚。
-- **控制流（brain 包）**：说“进化 brain：agent_chat.py 的 _chat_rules 里……”“升级记忆：多记住一些日程”——LLM 选择一个子模块整文件重写（TARGET 声明或需求里直接写文件名），其余文件从 active 包拷贝组装成新包版本。升级候选必须通过：
-  - L0 逐文件语法 + 包加载；L1 契约（内核维护的类/方法清单 + `_contract.py` 布局校验，防候选自我验收）；L2 冒烟——**mock LLM replay 5 场景**（单工具/多轮/流式中断/工具异常隔离/问候）+ **headless 3 轮对话与心跳**，坏 agent（chat 直接崩溃）在冒烟层被拦截；
-  - 安装后立即重载生效（准热切换），启动时 active 损坏自动回滚/重建。
-- **运行期安全网（Monitor）**：`kernel/monitor.py` 监控 tick 心跳（连续失败）与 chat 异常（窗口内累计），超阈值自动回滚 brain 包到上一可用版本（单次运行最多一次，防循环），阈值可用 `<用户数据目录>/monitor.json` 覆盖（损坏回退默认），动作写入 `updates.log` 审计；启动时自测回滚链路。
-- **能力层（工具）**：说“进化工具：查快递物流”“给自己加个功能：定时清理下载目录”——LLM 生成新工具模块，安装到 `<用户数据目录>/tools/`，聊天里立刻可用（下次对话 LLM 自动看到新工具声明）。工具运行在受限沙箱：
-  - 只能 import 纯逻辑标准库（json/re/datetime 等），系统/项目模块全禁；
-  - 网络、文件、命令只能通过受控原语 `ctx.*`（搜索/HTTP/run_bash/下载/安装），原语自带权限（写操作仍弹窗确认）；
-  - 三层防御：AST 静态检查（禁 dunder 属性访问/元编程内置）+ 受限 `__builtins__` 执行 + ctx 只读代理；
-  - 安装前用假 ctx 冒烟（原语全部 no-op，死循环会超时拒绝），全程审计。
-- **工具升级**：说“升级 ping_check：支持超时参数”（工具名开头即可，无需“工具”字样）——LLM 以当前 active 源码为基准生成 vN+1，必须保留工具名（改名拒绝），验证失败自动重试后放弃、不破坏现有版本。新增与升级冲突时明确报错，不会误覆盖。
-- **管理**：`python main.py --cli updater status` 查看模块与工具版本；`--cli updater validate/install tool <候选目录> [--upgrade-of <工具名>]` 手动验证/安装工具候选；`--cli updater switch/rollback <模块或工具名> [版本]` 切换/回滚；`--cli evolve tool “需求”` 或 `--cli evolve tool “升级 ping_check：需求”` 走 LLM 全流程（跳过确认弹窗）。
 - **技能包**：`python main.py --cli skill download <zip 地址>` 下载到 `<数据目录>/downloads`，`--cli skill install <zip 路径>` 安装到 `<数据目录>/skills`，`--cli skill list` 查看已发现技能；初始化执行 `--cli skill status <技能名>` / `--cli skill setup <技能名>`，认证用 `--cli skill auth <技能名>`（Access Secret 从 stdin 传入，不回显）。编译版用 `HeartBeat.app/Contents/MacOS/HeartBeat --cli …` 同样可用。
 
 **Shell 工具（`run_bash`）**：桌宠可以在你授权后执行本机命令，安全性分 4 档（设置 → 基本 → Shell 工具）：
@@ -316,7 +301,7 @@ done
 QT_QPA_PLATFORM=offscreen HB_NO_MAC_TRAY=1 python -m tests.test_app_integration
 ```
 
-单套件：`python -m tests.test_updater`（自进化/迁移）、`python -m tests.test_evolve`（进化流水线）、`python -m tests.test_evolve_local`（函数级重写工具链）、`python -m tests.test_tools`（Shell 工具安全分级）等。Windows 用 `py -3.12 -m tests.test_xxx`。
+单套件：`python -m tests.test_coding`（编码协作工具链）、`python -m tests.test_memory_correction`（记忆纠错）、`python -m tests.test_tools`（Shell 工具安全分级）等。Windows 用 `py -3.12 -m tests.test_xxx`。
 
 ## 下一步可以加
 

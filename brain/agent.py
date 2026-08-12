@@ -1,12 +1,11 @@
 """Agent：桌宠的记忆、想法、自主行为。记忆/聊天/状态全部存 SQLite。
 
-阶段2（2026-08-12）包化拆分：本文件保留 Agent 主类（构造/状态/入口/
+阶段2（2026-08-12）拆分：本文件保留 Agent 主类（构造/状态/入口/
 委托壳/回复解析），聊天链路在 agent_chat.py（ChatMixin），自主思考在
-agent_think.py（ThinkMixin）——单文件 ≤500 行，LLM 可整体重写。
+agent_think.py（ThinkMixin）。
 
-包模式：数据目录 <data>/brain/brain/vN/ 存在时，本类（或其拷贝）经
-brain_loader 从包加载；memory/planner 是独立版本单元（P2 拆包：
-<data>/brain/<name>/active），经 loader.create 动态加载，不随包版本漂移。
+2026-08-13 移除自进化：brain 层全部静态内置（直接 import 内置
+memory/planner），不再支持版本目录/动态加载/自我改写。
 """
 
 import random
@@ -23,12 +22,7 @@ from db import Database, Memory
 
 from .agent_chat import ChatMixin
 from .agent_think import ThinkMixin
-# 进化引擎自身是核心锁定集（不可进化），绝对导入宿主实现——
-# 包内 Agent 的进化能力永远跟随宿主内核，不随包版本漂移。
-from brain.evolver import Evolver
-# memory/planner 内置实现（宿主源码）。P2 拆包后它们独立版本化，
-# 控制流不再静态绑定包内 policy：运行时经 _load_brain_modules 加载
-# 独立版本单元（<data>/brain/<name>/active），无 loader 时用内置实现。
+# memory/planner 内置实现（自进化已移除：静态绑定内置实现）。
 from brain.memory import MemoryModule
 from brain.planner import Planner
 
@@ -36,7 +30,7 @@ from brain.planner import Planner
 class Agent(ChatMixin, ThinkMixin):
     """桌宠的自主层：SQLite 记忆 + 向量检索 + 想法 + 主动行为。"""
 
-    def __init__(self, cfg, plugins=None, data_dir=None, clock=None, stats=None, db=None, brain_loader=None, embed_queue=None):
+    def __init__(self, cfg, plugins=None, data_dir=None, clock=None, stats=None, db=None, embed_queue=None):
         self.cfg = cfg
         self.plugins = plugins or {}
         self.data_dir = Path(data_dir) if data_dir else Path(".")
@@ -50,7 +44,6 @@ class Agent(ChatMixin, ThinkMixin):
         # 向量索引异步队列（kernel.embedqueue，GUI 注入）：embedding 不再同步
         # 阻塞聊天/记忆写入；None（测试/CLI 直连）时保持同步旧行为
         self.embed_queue = embed_queue
-        self.brain_loader = brain_loader  # 自进化加载器（kernel.updater），None=用内置实现
         self.memory = Memory(self.db)
         self.chat_history = self.db.chat_items(100)
         self.state: dict = self._load_state()
@@ -59,31 +52,9 @@ class Agent(ChatMixin, ThinkMixin):
         self.brain = core.Brain(
             cfg, self.plugins, stats, energy_cb=self._consume_energy
         )
-        # 领域模块（组合）：记忆 / 规划 —— brain 层可独立升级的进化单元。
-        # 包模式（brain 包 active）优先从包取三件套（Agent/Memory/Planner）；
-        # 否则按 active 单文件版本动态加载；未注入 loader（测试/CLI 直连）
-        # 时 fallback 内置实现。
-        self.memory_module, self.planner = self._load_brain_modules()
-        # 自我进化引擎（LLM 生成 → updater 验证安装）：无 brain_loader 时不可用
-        self.evolver = (
-            Evolver(self.brain, self.brain_loader) if self.brain_loader is not None else None
-        )
-
-    def _load_brain_modules(self):
-        """组合领域模块（P2 拆包后两条正交路径）：
-        memory/planner 是独立版本单元（<data>/brain/<name>/active），
-        经 loader.create 动态加载（Agent 类本身由 create_agent 从包取）；
-        无 loader → 内置实现。失败回退内置（升级失败不破坏运行）。"""
-        loader = self.brain_loader
-        if loader is not None:
-            try:
-                return (
-                    loader.create("memory", self),
-                    loader.create("planner", self),
-                )
-            except Exception:
-                pass
-        return MemoryModule(self), Planner(self)
+        # 领域模块（组合）：记忆 / 规划 —— 静态内置实现（自进化已移除）。
+        self.memory_module = MemoryModule(self)
+        self.planner = Planner(self)
 
     # ---------- 状态 ----------
 
@@ -210,23 +181,6 @@ class Agent(ChatMixin, ThinkMixin):
             self._sync_embed_model()
         # 补索引挪到后台线程执行（reindex_async），避免保存设置卡 UI
         self._reindex_pending = True
-        # 领域模块重载：updater 切换版本后 reload 即生效（准热切换）；
-        # 加载失败保持旧模块（升级不破坏运行中会话）
-        if self.brain_loader is not None:
-            try:
-                self.memory_module, self.planner = self._load_brain_modules()
-            except Exception:
-                pass
-
-    def reload_brain_modules(self):
-        """重载领域模块（updater 热切换后调用）。失败保持旧模块，返回是否成功。"""
-        if self.brain_loader is None:
-            return False
-        try:
-            self.memory_module, self.planner = self._load_brain_modules()
-            return True
-        except Exception:
-            return False
 
     def reindex_async(self):
         """后台补向量索引（保存设置后调用，不阻塞 UI）。"""
@@ -270,8 +224,6 @@ class Agent(ChatMixin, ThinkMixin):
         self.state["fact_scan_id"] = entry["id"]
         self._save_state()
         reply = self._try_search_intent(user_text)
-        if reply is None:
-            reply = self._try_evolve_intent(user_text)
         if reply is not None:
             if on_delta:
                 on_delta(reply)
@@ -462,12 +414,7 @@ class Agent(ChatMixin, ThinkMixin):
         安全基座在 kernel（pathguard/processpool/权限判定），控制循环在
         brain.coding_agent（策略层）。工具以 SOURCE_USER 执行——写操作
         走 confirm 档用户确认，与聊天路径的 confirm_cb 共用同一弹窗。
-
-        宿主委托层：本方法不在 REQUIRED_METHODS 契约内；旧包快照无此
-        方法时由宿主工厂 agent._inject_host_delegates 注入等价实现。
         """
-        # 绝对导入（与 Evolver 同理）：brain 包化安装时包内只有控制流
-        # 四件套，coding_agent 始终来自宿主源码——宿主缺失时会直接报错。
         from brain.coding_agent import run_coding_task
 
         def run(name, arguments):

@@ -16,7 +16,7 @@ import agent
 import core
 import db
 import kernel
-from brain.smoke import smoke_test_module
+from brain.coding_agent import is_coding_intent
 from gui import skins, theme
 from gui.chat_window import ChatWindow
 from gui.pet_window import PetWindow
@@ -39,8 +39,6 @@ class Bridge(QObject):
 
     delta = Signal(object, str)
     status = Signal(str)
-    # 自我进化进度/结果（agent 后台线程 → 主线程，自动 QueuedConnection）
-    evolve_status = Signal(str)
     # 主动打招呼回复（后台线程生成 → 主线程气泡）
     greet_reply = Signal(str)
     # Coding 任务步骤进度（agent 子线程 → 主线程状态行）
@@ -67,33 +65,21 @@ class HeartBeatApp:
             self.data_dir,
             stats=self.stats,
             db=self.db,
-            brain_loader=self.kernel.updater,
             embed_queue=self.embed_queue,
         )
         self.embed_queue.set_worker(self._embed_worker)
         # 事件总线注入：agent 工具执行 → tool.executed 旁路通知（异步回主线程）
         self.agent.eventbus = self.kernel.eventbus
-        # 运行期健康监控（kernel.monitor）：tick/chat 心跳 + 超阈值自动回滚
-        self.monitor = self.kernel.monitor
-        # 自进化注入：updater 的 L2 冒烟 runner（候选模块真实 Agent 实测）
-        self.kernel.updater.smoke_runner = smoke_test_module
-        # 热切换订阅：updater 切换 brain 版本 → 主线程重载领域模块。
-        # async_=True 保证 handler 经 Qt QueuedConnection 回主线程执行——
-        # 未来 agent 在子线程触发升级时不会与 chat/think 线程竞态。
-        self.kernel.eventbus.subscribe("brain.switched", self._on_brain_switched, async_=True)
 
         self.bridge = Bridge()
         self.bridge.delta.connect(self._apply_stream_delta)
         self.bridge.status.connect(self._set_status)
-        self.bridge.evolve_status.connect(self._on_evolve_status)
         self.bridge.greet_reply.connect(self._show_greet_reply)
         self.bridge.coding_status.connect(self._on_coding_status)
         self.bridge.tool_confirm.connect(self._on_tool_confirm)
         self._setup_runtime()
         # 注入工具确认回调：confirm 档写命令由主线程弹窗决定（60s 超时拒绝）
         self.agent.tool_confirm_cb = self._confirm_tool
-        # 注入自我进化状态回调：后台线程 emit → 信号桥回主线程（跨线程安全）
-        self.agent.evolve_status_cb = self.bridge.evolve_status.emit
 
         self.pet = PetWindow(self.cfg)
         self.pet.open_chat_requested.connect(self._open_chat)
@@ -361,7 +347,6 @@ class HeartBeatApp:
 
     def _show_tick_result(self, result):
         """主线程回调（kernel.runtime 已过滤过期 epoch）。"""
-        self.monitor.record_tick(True)
         message, errors = result
         stamp = time.strftime("%H:%M")
         if message:
@@ -381,18 +366,10 @@ class HeartBeatApp:
         self._update_chat_stats()
 
     def _tick_timeout(self):
-        self.monitor.record_tick(False, failure="timeout")
         self._set_status("思考超时，已重置，稍后自动重试")
 
     def _tick_error(self, error):
-        """tick 任务异常（主线程回调）：按故障域计入 Monitor 心跳并透出给用户。
-
-        P0 错误分类：网络/provider 等基础设施故障只审计不累计回滚，
-        避免“LLM/网络挂了 → 误判 brain 坏了 → 自动回滚”。
-        """
-        self.monitor.record_tick(
-            False, failure=self.monitor.classify_failure(error), exc=error
-        )
+        """tick 任务异常（主线程回调）：透出给用户。"""
         stamp = time.strftime("%H:%M")
         text = f"{stamp} 思考异常：{error}"
         self._set_status(text)
@@ -418,20 +395,6 @@ class HeartBeatApp:
     def _show_greet_reply(self, text):
         self.pet.show_bubble(text, seconds=6, animation="wave")
 
-    def _on_brain_switched(self, payload):
-        """updater 热切换回调：重载领域模块（失败保持旧模块，不中断会话）。"""
-        module_name, version = payload
-        # P1 事件时间线：brain.updated（rollback 详情在 updates.log 审计）
-        self.db.log_event(
-            db.EventType.BRAIN_UPDATED, "updater",
-            {"module": module_name, "version": version},
-        )
-        ok = self.agent.reload_brain_modules()
-        self._set_status(
-            f"大脑模块 {module_name} 已切换到 {version}"
-            + ("" if ok else "（重载失败，保持旧模块）")
-        )
-
     # ---------- 聊天 ----------
 
     def _open_chat(self):
@@ -440,14 +403,32 @@ class HeartBeatApp:
                 self.cfg["pet_name"],
                 on_send=self._send_chat,
                 on_clear=self._clear_chat,
+                on_pick_dir=self._pick_project_dir,
             )
             for entry in self.agent.chat_history:
                 self.chat_win.add_message(entry["role"], entry["text"], entry.get("time"))
             self.chat_win.set_mood(self.agent.state.get("mood", "平静"))
+            self.chat_win.set_project_dir(str(self.cfg.get("project_dir", "") or ""))
         self.chat_win.set_daily_stats(self._daily_stats_text())
         self.chat_win.show()
         self.chat_win.raise_()
         self.chat_win.activateWindow()
+
+    def _pick_project_dir(self):
+        """目录按钮：选择编程项目目录（选好后编程任务自然路由，无需切换模式）。"""
+        from PySide6.QtWidgets import QFileDialog
+
+        current = str(self.cfg.get("project_dir", "") or "")
+        path = QFileDialog.getExistingDirectory(
+            self.chat_win, "选择编程项目目录", current or str(Path.home())
+        )
+        if not path:
+            return
+        self.cfg["project_dir"] = path
+        self.kernel.save_settings(self.cfg)  # 持久化 + config.saved 广播
+        if self.chat_win:
+            self.chat_win.set_project_dir(path)
+        self._set_status(f"编程目录：{path}")
 
     # ---------- 工具确认（子线程 → 主线程弹窗） ----------
 
@@ -491,7 +472,15 @@ class HeartBeatApp:
 
     def _send_chat(self, text):
         self.pet.play("think")
-        if self.chat_win is not None and self.chat_win.coding_mode:
+        # 编程任务自然路由（自进化已移除）：强信号关键词命中即走 coding；
+        # 未选项目目录时给出引导，不静默降级为闲聊。
+        if is_coding_intent(text):
+            if not str(self.cfg.get("project_dir", "") or "").strip():
+                self._reply_direct(
+                    "这是编程任务，但我还不知道项目目录在哪～\n"
+                    "请先点击聊天窗右上角的 📁 目录，选择要操作的文件夹。"
+                )
+                return
             if not self.kernel.runtime.trigger("coding", text):
                 self._coding_pending.append(text)
                 self._set_status("编码任务还在执行，已排队")
@@ -500,6 +489,13 @@ class HeartBeatApp:
             self._chat_pending.append(text)
             self._set_status("上一条还在回复中，已排队")
             return
+
+    def _reply_direct(self, text):
+        """不经过任务队列的直接回复（本地引导提示等）。"""
+        if self.chat_win:
+            self.chat_win.add_message("assistant", text)
+            self.chat_win.set_thinking(False)
+        self.pet.show_bubble(text.splitlines()[0], seconds=6)
 
     def _chat_work(self, epoch, text):
         """聊天任务体（子线程执行）：带工具循环的 LLM 回复。"""
@@ -535,7 +531,6 @@ class HeartBeatApp:
 
     def _show_reply(self, reply):
         """主线程回调（kernel.runtime 已过滤过期 epoch）。"""
-        self.monitor.record_chat(True)
         self.pet.play("talk", 1600)
         if self.chat_win:
             if self.chat_win.is_streaming():
@@ -548,14 +543,6 @@ class HeartBeatApp:
             self.chat_win.set_daily_stats(self._daily_stats_text())
         self._set_status("陪我聊天中")
         self._drain_chat_pending()
-
-    def _on_evolve_status(self, text):
-        """自我进化进度/结果（agent 后台线程 → 信号桥 → 主线程）。"""
-        if self.chat_win:
-            self.chat_win.add_message("assistant", text)
-        self.pet.play("talk", 1600)
-        preview = text if len(text) <= 16 else text[:15] + "…"
-        self._set_status(preview)
 
     # ---------- Coding 模式（平行路径：见 brain/coding_agent.py） ----------
 
@@ -628,7 +615,6 @@ class HeartBeatApp:
 
     def _chat_timeout(self):
         self._set_status("回复超时，已停止等待")
-        self.monitor.record_chat(False, failure="timeout")  # 超时归基础设施故障：留痕不累计回滚
         if self.chat_win:
             self.chat_win.cancel_stream()  # 清理流式占位气泡，避免影响下次回复
             self.chat_win.set_thinking(False)
@@ -638,14 +624,7 @@ class HeartBeatApp:
         self._drain_chat_pending()
 
     def _chat_error(self, error):
-        """chat 任务异常（主线程回调）：按故障域计入 Monitor 窗口并透出给用户。
-
-        P0 错误分类：LLM 服务商网络故障/429/key 失效等基础设施故障只审计
-        不累计——不会因服务端问题误判 brain 失速而自动回滚。
-        """
-        self.monitor.record_chat(
-            False, failure=self.monitor.classify_failure(error), exc=error
-        )
+        """chat 任务异常（主线程回调）：透出给用户。"""
         stamp = time.strftime("%H:%M")
         text = f"{stamp} 回复失败：{error}"
         self._set_status("回复失败，请稍后重试")

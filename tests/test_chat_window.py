@@ -11,9 +11,11 @@ from PySide6.QtWidgets import QApplication
 from gui import chat_window
 
 
-def _make_window():
+def _make_window(on_pick_dir=None):
     app = QApplication.instance() or QApplication(sys.argv)
-    w = chat_window.ChatWindow("测试", on_send=lambda *a: None, on_clear=lambda: None)
+    w = chat_window.ChatWindow(
+        "测试", on_send=lambda *a: None, on_clear=lambda: None, on_pick_dir=on_pick_dir
+    )
     return w
 
 
@@ -81,17 +83,20 @@ def test_super_long_word_capped():
     assert _bubble_width(w, 0) == chat_window.BUBBLE_MAX_W
 
 
-def test_coding_toggle_mode_and_placeholder():
-    """编码开关：切换 coding_mode 与输入框提示文案。"""
-    w = _make_window()
-    assert w.coding_mode is False
-    assert "编码" not in w.input_text.placeholderText()
-    w.coding_btn.click()
-    assert w.coding_mode is True
-    assert "编程任务" in w.input_text.placeholderText()
-    w.coding_btn.click()
-    assert w.coding_mode is False
-    assert "说点什么" in w.input_text.placeholderText()
+def test_dir_button_picks_and_shows():
+    """目录按钮：点击回调宿主选择器；set_project_dir 更新按钮提示与状态行。"""
+    picked = []
+    w = _make_window(on_pick_dir=lambda: picked.append(1))
+    w.dir_btn.click()
+    assert picked == [1]
+    assert w.coding_status_label.isHidden()
+    w.set_project_dir("/tmp/proj")
+    assert not w.coding_status_label.isHidden()
+    assert "编程目录：/tmp/proj" in w.coding_status_label.text()
+    assert "/tmp/proj" in w.dir_btn.toolTip()
+    w.set_project_dir("")
+    assert w.coding_status_label.isHidden()
+    assert "选择编程项目目录" in w.dir_btn.toolTip()
 
 
 def test_coding_status_show_hide():

@@ -12,6 +12,7 @@ Coding 的长任务/宽上下文/后台进程需求冲突，必须平行路径�
 """
 
 import os
+import re
 
 import core
 import tools
@@ -149,3 +150,49 @@ def run_coding_task(brain, cfg, user_request, run_tool,
     if on_status:
         on_status(f"⚠️ 已达 {max_rounds} 轮上限，正在收尾总结")
     return _final_summary(brain, messages)
+
+
+# ---------- 编程意图识别（GUI 聊天路由：选目录后自然语言操作） ----------
+
+_CODING_VERBS = frozenset({
+    "写", "创建", "新建", "实现", "编写", "开发", "制作", "生成", "构建",
+    "修改", "改", "重构", "修复", "优化", "调整", "更新", "添加", "加",
+    "删除", "删", "运行", "测试", "调试", "部署", "打包", "启动",
+})
+
+_CODING_OBJECTS = frozenset({
+    # 编程产物
+    "代码", "文件", "页面", "网页", "网站", "脚本", "函数", "类", "组件",
+    "接口", "程序", "应用", "项目", "模块", "爬虫", "工具", "功能",
+    "demo", "示例", "实例", "文档", "配置", "环境", "依赖", "测试用例",
+    # 语言/格式
+    "html", "css", "js", "ts", "python", "java", "go", "rust", "sql",
+    "markdown", "json",
+    # 页面/界面元素（延续性弱信号："把背景改成蓝色"）
+    "背景", "颜色", "字体", "样式", "布局", "按钮", "标题", "内容", "数据",
+    "效果", "动画", "速度", "大小", "图片", "链接", "菜单", "界面", "ui",
+})
+
+_FILENAME_RE = re.compile(
+    r"[A-Za-z0-9_\-\.]+\.(?:html?|py|jsx?|tsx?|css|json|md|txt|sh|bat|ps1|"
+    r"java|c|cpp|go|rs|vue|sql|toml|ya?ml)\b",
+    re.IGNORECASE,
+)
+
+
+def is_coding_intent(text):
+    """判断聊天消息是否为编程任务（强信号关键词，零 LLM 成本）。
+
+    命中即由 GUI 路由到 coding_task；闲聊（"帮我写首诗"）不命中
+    对象词，正常走聊天。文件名（xxx.html）出现即视为编程意图。
+    """
+    if not text or not str(text).strip():
+        return False
+    t = str(text).strip()
+    low = t.lower()
+    if _FILENAME_RE.search(t):
+        return True
+    has_verb = any(v in t for v in _CODING_VERBS)
+    has_obj = any(o in low for o in _CODING_OBJECTS)
+    return has_verb and has_obj
+

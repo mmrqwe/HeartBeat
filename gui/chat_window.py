@@ -63,17 +63,17 @@ class ChatInput(QTextEdit):
 
 
 class ChatWindow(QWidget):
-    def __init__(self, pet_name, on_send, on_clear):
+    def __init__(self, pet_name, on_send, on_clear, on_pick_dir=None):
         super().__init__()
         self.pet_name = pet_name
         self.on_send = on_send
         self.on_clear = on_clear
+        self.on_pick_dir = on_pick_dir
         self.messages = []
         self._last_bubble = None
         self._streaming = False
         self._think_dots = 0
         self._think_timer = None
-        self.coding_mode = False
         self.coding_status_label = None
 
         self.setWindowTitle(f"和{pet_name}聊天")
@@ -101,14 +101,14 @@ class ChatWindow(QWidget):
         self.stats_label.setObjectName("Hint")
         clear_btn = QPushButton("清空记录")
         clear_btn.clicked.connect(self._confirm_clear)
-        self.coding_btn = QPushButton("🔨 编码")
-        self.coding_btn.setCheckable(True)
-        self.coding_btn.setToolTip("开启后，消息将作为编程任务在项目目录里执行")
-        self.coding_btn.toggled.connect(self._on_coding_toggled)
+        # 选择编程项目目录（选目录后，编程任务自然路由到 coding，无需切换模式）
+        self.dir_btn = QPushButton("📁 目录")
+        self.dir_btn.setToolTip("选择编程项目目录；选好后，编程任务会自动在该目录里执行")
+        self.dir_btn.clicked.connect(self._on_pick_dir)
         row1.addWidget(name_label)
         row1.addWidget(self.status_label)
         row1.addStretch(1)
-        row1.addWidget(self.coding_btn)
+        row1.addWidget(self.dir_btn)
         row1.addWidget(clear_btn)
         header_layout.addLayout(row1)
         header_layout.addWidget(self.stats_label)
@@ -317,21 +317,19 @@ class ChatWindow(QWidget):
         self.set_thinking(True)
         self.on_send(text)
 
-    def _on_coding_toggled(self, checked):
-        self.coding_mode = bool(checked)
-        self.coding_btn.setText("🔨 编码中" if checked else "🔨 编码")
-        if checked:
-            self.set_coding_status(
-                "编码模式已开启：下一条消息将作为编程任务执行。"
-                "请在设置里确认项目目录（project_dir）。"
-            )
-        else:
+    def _on_pick_dir(self):
+        """点击目录按钮 → 回调宿主弹目录选择器。"""
+        if self.on_pick_dir is not None:
+            self.on_pick_dir()
+
+    def set_project_dir(self, path):
+        """宿主设置项目目录后回传：更新按钮提示与状态行。"""
+        if not path:
+            self.dir_btn.setToolTip("选择编程项目目录；选好后，编程任务会自动在该目录里执行")
             self.set_coding_status("")
-        self.input_text.setPlaceholderText(
-            "描述要完成的编程任务…（Enter 发送）"
-            if checked
-            else "说点什么…（Enter 发送 / Shift+Enter 换行）"
-        )
+            return
+        self.dir_btn.setToolTip(f"编程目录：{path}\n编程任务会自动在该目录里执行（点击更换）")
+        self.set_coding_status(f"编程目录：{path}")
 
     def set_coding_status(self, text):
         """编码任务状态行（步骤进度 / 完成提示）；空文本隐藏。"""

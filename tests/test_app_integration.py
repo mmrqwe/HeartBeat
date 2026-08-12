@@ -51,15 +51,14 @@ def _make_app():
     return tmp, hb, orig_gather
 
 
-def test_coding_task_registered_and_routed():
-    """coding 运行时任务注册 + 编码模式消息路由（无 project_dir → 立即返回提示）。"""
+def test_coding_intent_routing():
+    """自然语言编程意图路由：无 project_dir → 引导提示；有目录 → coding 任务；闲聊 → chat。"""
     tmp, hb, orig_gather = _make_app()
     try:
         rt = hb.kernel.runtime
         assert "coding" in rt._tasks, "coding 任务未注册"
 
         class _Stub:
-            coding_mode = True
             received = []
 
             def add_message(self, role, text, time_str=None):
@@ -72,14 +71,25 @@ def test_coding_task_registered_and_routed():
                 pass
 
         hb.chat_win = _Stub()
+        # 1) 编程意图 + 未选目录 → 本地引导提示，不进入任何任务
         hb._send_chat("帮我把代码改一下")
-        # 编码模式下消息走 coding 任务：忙碌或已完成（任务体很快返回）
+        assert any("项目目录" in text for _, text in hb.chat_win.received), (
+            f"应提示选择项目目录，实际：{hb.chat_win.received}"
+        )
+        assert not rt.is_busy("coding")
+        # 2) 选中目录后，编程意图消息自然路由到 coding 任务
+        hb.cfg["project_dir"] = str(Path(tmp.name) / "proj")
+        hb.chat_win.received.clear()
+        hb._send_chat("写一个 html 页面")
         deadline = time.time() + 3
         while time.time() < deadline and rt.is_busy("coding"):
             wait(50)
-        assert any("项目目录" in text for _, text in hb.chat_win.received), (
-            f"应提示配置项目目录，实际：{hb.chat_win.received}"
-        )
+        assert not rt.is_busy("coding")
+        # 3) 闲聊消息不触发 coding（走 chat）
+        hb._send_chat("今天天气不错")
+        deadline = time.time() + 3
+        while time.time() < deadline and rt.is_busy("chat"):
+            wait(50)
         assert not rt.is_busy("coding")
     finally:
         hb.kernel.stop()
@@ -147,42 +157,6 @@ def test_chat_lifecycle_and_stale_delta():
         core.gather = orig_gather
 
 
-def test_monitor_wired_to_tick_and_chat():
-    """Monitor 必须看到 tick/chat 的成功、异常与超时（防止自动回滚空转）。"""
-    tmp, hb, orig_gather = _make_app()
-    try:
-        calls = []
-        hb.monitor.record_tick = lambda ok, failure=None, exc=None, elapsed=0.0: calls.append(("tick", ok))
-        hb.monitor.record_chat = lambda ok, failure=None, exc=None, elapsed=0.0: calls.append(("chat", ok))
-        hb.agent.live = lambda ctx: None
-        hb.agent.chat = lambda user_text, on_delta=None: "ok"
-
-        QTimer.singleShot(0, hb._autonomy_tick)
-        wait(300)
-        assert ("tick", True) in calls, calls
-
-        hb._send_chat("hi")
-        wait(300)
-        assert ("chat", True) in calls, calls
-
-        def boom_chat(user_text, on_delta=None):
-            raise RuntimeError("boom")
-
-        hb.agent.chat = boom_chat
-        hb._send_chat("hi2")
-        wait(400)
-        assert ("chat", False) in calls, calls
-
-        rt = hb.kernel.runtime
-        rt._tasks["tick"]["timeout_ms"] = 60
-        hb.agent.live = lambda ctx: time.sleep(0.4) or None
-        QTimer.singleShot(0, hb._autonomy_tick)
-        wait(300)
-        assert ("tick", False) in calls, calls
-    finally:
-        hb.kernel.stop()
-        tmp.cleanup()
-        core.gather = orig_gather
 
 
 def test_events_written_for_chat_and_tick():

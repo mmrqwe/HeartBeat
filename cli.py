@@ -41,16 +41,9 @@ def _load(config_path=None):
     database = db.Database(data_dir / "heartbeat.db")
     stats = core.Stats(database)
     plugins = core.discover_plugins()
-    # 注入 updater 作 brain_loader：CLI 与 GUI 一致，updater 切换的 brain
-    # 版本在 chat/tick 中同样生效（未注入时 Agent 用内置实现）
-    from brain.smoke import smoke_test_module
-    from kernel.updater import Updater
-
-    updater = Updater(data_dir)
-    updater.smoke_runner = smoke_test_module
-    updater.ensure_installed()
+    # brain 层静态内置（自进化已移除）：直接实例化内置 Agent
     ag = agent.create_agent(
-        cfg, plugins, data_dir, stats=stats, db=database, brain_loader=updater
+        cfg, plugins, data_dir, stats=stats, db=database
     )
     return cfg_path, cfg, database, stats, plugins, ag
 
@@ -116,34 +109,6 @@ def _make_parser():
     p_embed.add_argument("text")
 
     sub.add_parser("selfcheck", help="逐项测试全部核心功能")
-
-    p_probe = sub.add_parser(
-        "probe", help="frozen 环境自检：外部 .py 动态加载（updater 技术前提）"
-    )
-    p_probe.add_argument("--clean", action="store_true", help="先清理旧探针文件")
-
-    p_updater = sub.add_parser("updater", help="自进化：模块/工具版本管理（memory/planner/tool）")
-    upd_sub = p_updater.add_subparsers(dest="upd_cmd", required=True)
-    upd_sub.add_parser("status", help="查看模块与工具已安装版本与 active 指针")
-    p_upd_validate = upd_sub.add_parser("validate", help="验证候选（L0 语法 + L1 接口/契约 + L2 冒烟/安全检查）")
-    p_upd_validate.add_argument("module", help="memory / planner / tool（tool 时候选目录含 tool.py）")
-    p_upd_validate.add_argument("candidate_dir", help="候选版本目录")
-    p_upd_validate.add_argument("--upgrade-of", default=None, help="工具升级：指定现有工具名（候选 TOOL_NAME 必须一致）")
-    p_upd_install = upd_sub.add_parser("install", help="验证并安装候选（自动切换 active，立即生效）")
-    p_upd_install.add_argument("module", help="memory / planner / tool（tool 时候选目录含 tool.py）")
-    p_upd_install.add_argument("candidate_dir")
-    p_upd_install.add_argument("--upgrade-of", default=None, help="工具升级：指定现有工具名（候选 TOOL_NAME 必须一致，装为 vN+1）")
-    p_upd_switch = upd_sub.add_parser("switch", help="显式切换 active 版本（memory/planner/工具名）")
-    p_upd_switch.add_argument("module", help="memory / planner / 工具名（如 ping_check）")
-    p_upd_switch.add_argument("version")
-    p_upd_rollback = upd_sub.add_parser("rollback", help="回滚 active 到最近可用旧版本（memory/planner/工具名）")
-    p_upd_rollback.add_argument("module", help="memory / planner / 工具名（如 ping_check）")
-
-    p_evolve = sub.add_parser(
-        "evolve", help="自我进化：LLM 生成新版本 → 安全/契约/冒烟验证 → 原子安装（memory/planner/tool）"
-    )
-    p_evolve.add_argument("module", choices=["memory", "planner", "brain", "tool"])
-    p_evolve.add_argument("requirement", help="功能需求描述，如：每天上午9点提醒我喝水 / 查快递物流 / 升级 ping_check：支持超时参数")
 
     p_skill = sub.add_parser("skill", help="技能包：下载 / 安装 / 查看 / 状态 / 初始化（如 zhihu-cli）")
     skill_sub = p_skill.add_subparsers(dest="skill_cmd", required=True)
@@ -293,15 +258,6 @@ def _run(argv, default_config=None):
     if cmd == "selfcheck":
         return _selfcheck(config)
 
-    if cmd == "probe":
-        return _probe(config, clean=args.clean)
-
-    if cmd == "updater":
-        return _updater_cmd(args)
-
-    if cmd == "evolve":
-        return _evolve_cmd(args)
-
     if cmd == "skill":
         return _skill_cmd(args)
 
@@ -365,100 +321,6 @@ def _memory_cmd(config, args):
         print(f"exported {len(items)} memories -> {args.path}")
         return 0
     return 2
-
-
-def _updater_cmd(args):
-    """自进化版本管理：status / validate / install / switch / rollback（模块与工具）。"""
-    from brain.smoke import smoke_test_module
-    from kernel.updater import BUILTIN_MODULES, Updater
-
-    upd = Updater(core.user_data_dir())
-    upd.smoke_runner = smoke_test_module
-    upd.ensure_installed()  # 幂等：CLI 下也保证基线版本存在
-
-    if args.upd_cmd == "status":
-        for name in BUILTIN_MODULES:
-            versions = upd.list_versions(name)
-            active = upd.active_version(name)
-            print(f"{name}: active={active or '-'} 已装版本={','.join(versions) or '-'}")
-        for name in upd.list_tools():
-            versions = upd.list_versions(name)
-            active = upd.active_version(name)
-            print(f"tool/{name}: active={active or '-'} 已装版本={','.join(versions) or '-'}")
-        return 0
-
-    if args.upd_cmd == "validate":
-        ok, errors = upd.validate_candidate(
-            args.module, args.candidate_dir, upgrade_of=args.upgrade_of
-        )
-        if not ok:
-            print(f"验证失败：{args.module} {args.candidate_dir}")
-            for err in errors:
-                print("  -", err)
-            return 1
-        label = "L0 语法 + L1 接口 + L2 冒烟"
-        if args.module == "tool":
-            label = "L0 受限加载 + L1 契约 + L2 AST 安全 + 冒烟"
-        extra = f"（升级 {args.upgrade_of}）" if args.upgrade_of else ""
-        print(f"验证通过：{args.module} {args.candidate_dir} {extra}（{label}）")
-        return 0
-
-    if args.upd_cmd == "install":
-        try:
-            version = upd.install_candidate(
-                args.module, args.candidate_dir, upgrade_of=args.upgrade_of
-            )
-        except ValueError as exc:
-            print(f"安装失败：{exc}")
-            return 1
-        extra = f"（升级 {args.upgrade_of}）" if args.upgrade_of else ""
-        print(f"已安装 {args.module} {version} 并激活 {extra}（立即生效）")
-        return 0
-
-    if args.upd_cmd == "switch":
-        try:
-            upd.switch(args.module, args.version)
-        except ValueError as exc:
-            print(f"切换失败：{exc}")
-            return 1
-        print(f"已切换 {args.module} -> {args.version}（立即生效）")
-        return 0
-
-    if args.upd_cmd == "rollback":
-        version = upd.rollback(args.module)
-        if version is None:
-            print(f"无可回滚版本（当前 {upd.active_version(args.module) or '无'}）")
-            return 1
-        print(f"已回滚 {args.module} -> {version}")
-        return 0
-
-    print(f"unknown updater cmd: {args.upd_cmd}")
-    return 2
-
-
-def _evolve_cmd(args):
-    """自我进化：LLM 生成新版本 → 安全/契约/冒烟验证 → 原子安装。
-
-    CLI 直跑（跳过确认弹窗）：调用方（运维/测试）已显式下达命令。
-    进度经 on_status 打印，便于观察生成/验证/安装各阶段。
-    """
-    _, _, _, _, _, ag = _load(args.config)
-    if ag.evolver is None:
-        print("进化引擎不可用（brain_loader 未注入）")
-        return 1
-    try:
-        version = ag.evolver.evolve(
-            args.module, args.requirement, on_status=lambda m: print("  -", m)
-        )
-    except ValueError as exc:
-        print(f"进化失败：{exc}")
-        return 1
-    if args.module == "tool":
-        tool_name, _, ver = version.partition("@")
-        print(f"进化成功：工具「{tool_name}」{ver}（已安装，聊天里直接可用）")
-        return 0
-    print(f"进化成功：{args.module} -> {version}（已热加载生效）")
-    return 0
 
 
 def _skill_auth(name, binary=None):
@@ -539,55 +401,6 @@ def _skill_cmd(args):
 
     print(f"unknown skill cmd: {args.skill_cmd}")
     return 2
-
-
-def _probe(config_path=None, clean=False):
-    """frozen 环境自检：验证外部 .py 动态加载（updater 的技术前提）。
-
-    updater（自进化）需要在打包后的 .app 里从用户数据目录加载外部模块，
-    本命令验证 spec_from_file_location 在 frozen 解释器下可用：
-    在 user_data_dir/.probe 写入探针模块 → 动态加载 → 调用函数 → 输出 JSON。
-    """
-    import importlib.util
-    import json
-
-    report = {
-        "frozen": bool(getattr(sys, "frozen", False)),
-        "executable": sys.executable,
-        "probe_dir": "",
-        "loaded": False,
-        "answer": None,
-        "error": None,
-    }
-    try:
-        probe_dir = core.user_data_dir() / ".probe"
-        probe_dir.mkdir(parents=True, exist_ok=True)
-        report["probe_dir"] = str(probe_dir)
-        if clean:
-            for old in probe_dir.glob("*.py"):
-                old.unlink(missing_ok=True)
-        probe_file = probe_dir / "probe_mod.py"
-        probe_file.write_text(
-            "import core\n"
-            "def answer():\n"
-            "    return 'probe-ok:' + __file__\n"
-            "def uses_packed():\n"
-            "    # 外部模块 import 打包内模块（updater 生成模块的核心约束）\n"
-            "    return bool(core.user_data_dir())\n",
-            encoding="utf-8",
-        )
-        spec = importlib.util.spec_from_file_location("heartbeat_probe", probe_file)
-        if spec is None or spec.loader is None:
-            raise RuntimeError("spec_from_file_location returned None")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        report["answer"] = mod.answer()
-        report["uses_packed"] = bool(mod.uses_packed())
-        report["loaded"] = True
-    except Exception as exc:
-        report["error"] = f"{type(exc).__name__}: {exc}"
-    print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 0 if report["loaded"] else 1
 
 
 def _web_search_selfcheck():

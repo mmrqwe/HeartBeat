@@ -268,110 +268,6 @@ def test_execute_unknown_tool():
     assert "未知工具" in result
 
 
-# ---------- 进化工具分发（<data>/tools/ 自进化能力层） ----------
-
-TOOL_SRC = '''\
-TOOL_NAME = "ping_check"
-TOOL_DESCRIPTION = "检查网络连通性（示例进化工具）"
-TOOL_PARAMETERS = {
-    "type": "object",
-    "properties": {"host": {"type": "string"}},
-    "required": ["host"],
-}
-
-
-def handler(args, ctx):
-    host = str(args.get("host", "")).strip()
-    if not host:
-        return "缺少 host 参数"
-    try:
-        text = ctx.web_search(host + " 状态", limit=1)
-        return "查询结果：" + text
-    except Exception as exc:
-        return "查询失败：" + str(exc)
-'''
-
-
-def _install_tool(tmp, src=TOOL_SRC):
-    """在临时目录手写安装一个进化工具（v0.1 + active 指针）。"""
-    base = Path(tmp) / "ping_check"
-    (base / "v0.1").mkdir(parents=True)
-    (base / "v0.1" / "ping_check.py").write_text(src, encoding="utf-8")
-    (base / "active").write_text("v0.1\n", encoding="utf-8")
-    tools._TOOL_CACHE.clear()  # Windows 上 mtime 可能相同，避免跨用例复用旧模块
-    return base
-
-
-def test_execute_evolved_tool_dispatch():
-    with TemporaryDirectory() as d:
-        _install_tool(d)
-        patch = _Patch()
-        try:
-            patch.setattr(tools, "_tools_dir", lambda: Path(d))
-            result = tools.execute("ping_check", "{}", mode="confirm",
-                                   source=tools.SOURCE_USER, confirm_cb=lambda desc: True)
-            assert "缺少 host 参数" in result
-        finally:
-            patch.restore()
-
-
-def test_execute_evolved_tool_ctx_primitive():
-    with TemporaryDirectory() as d:
-        _install_tool(d)
-        patch = _Patch()
-        try:
-            patch.setattr(tools, "_tools_dir", lambda: Path(d))
-            patch.setattr(search, "search_all",
-                          lambda q, kind, limit=6: [{"title": "结果X", "url": "https://x", "snippet": "S"}])
-            patch.setattr(search, "format_results",
-                          lambda entries, label: "格式化:" + entries[0]["title"])
-            result = tools.execute("ping_check", '{"host": "example.com"}',
-                                   mode="confirm", source=tools.SOURCE_USER,
-                                   confirm_cb=lambda desc: True)
-            assert "格式化:结果X" in result
-        finally:
-            patch.restore()
-
-
-def test_execute_evolved_tool_audit():
-    with TemporaryDirectory() as d:
-        _install_tool(d)
-        logs = []
-        patch = _Patch()
-        try:
-            patch.setattr(tools, "_tools_dir", lambda: Path(d))
-            tools.execute("ping_check", "{}", mode="confirm", source=tools.SOURCE_USER,
-                          confirm_cb=lambda desc: True, audit=lambda *a: logs.append(a))
-            assert logs and logs[0][1] == "ping_check" and logs[0][4] is True
-        finally:
-            patch.restore()
-
-
-def test_execute_evolved_tool_failure():
-    with TemporaryDirectory() as d:
-        _install_tool(d, TOOL_SRC.replace('return "缺少 host 参数"', 'raise RuntimeError("boom")'))
-        patch = _Patch()
-        try:
-            patch.setattr(tools, "_tools_dir", lambda: Path(d))
-            result = tools.execute("ping_check", "{}", mode="confirm",
-                                   source=tools.SOURCE_USER, confirm_cb=lambda desc: True)
-            assert "工具执行失败" in result and "boom" in result
-        finally:
-            patch.restore()
-
-
-def test_declarations_include_evolved_tool():
-    with TemporaryDirectory() as d:
-        _install_tool(d)
-        patch = _Patch()
-        try:
-            patch.setattr(tools, "_tools_dir", lambda: Path(d))
-            decls = tools.tool_declarations(_cfg("confirm"))
-            names = [x["function"]["name"] for x in decls]
-            assert "ping_check" in names
-            assert len(decls) == 14  # 13 内置 + 1 进化
-        finally:
-            patch.restore()
 
 
 # ---------- 下载/安装门控（download_file / install_skill） ----------
@@ -692,11 +588,6 @@ def test_sandbox_read_write_list_run_and_policy():
             patch.restore()
 
 
-def test_evolved_tool_ctx_http_blocks_ssrf():
-    """进化工具 ctx.http_text/http_json 与下载通道共用 SSRF 校验。"""
-    ctx = tools._make_tool_ctx("confirm", tools.SOURCE_USER, None, None, None)
-    assert "请求被拒绝" in ctx.http_text("http://127.0.0.1/secret")
-    assert "请求被拒绝" in ctx.http_json("http://169.254.169.254/latest/meta-data/")
 
 
 # ---------- 声明生成 ----------

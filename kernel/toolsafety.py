@@ -22,7 +22,7 @@
 （原语自身带权限：run_bash/download/install 内部有分级确认与审计）。
 网络/文件/进程能力不可能凭空获得。
 
-依赖方向：仅标准库；kernel.updater 与 brain 层 tools.py 共用。
+依赖方向：仅标准库；brain 层 tools.py 共用（自进化已移除，无版本边界）。
 """
 
 import ast

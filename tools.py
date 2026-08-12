@@ -1206,142 +1206,6 @@ def _coding_declarations():
     ]
 
 
-# ---------- 进化工具（能力层自进化：<data>/tools/） ----------
-
-_TOOL_CACHE = {}  # name -> (active_mtime, src_mtime, module)
-
-
-def _tools_dir():
-    """进化工具目录：<用户数据目录>/tools。"""
-    return Path(user_data_dir()) / "tools"
-
-
-def _evolved_tool_names():
-    """已安装进化工具名（目录存在 active 指针且名字合法）。"""
-    root = _tools_dir()
-    if not root.is_dir():
-        return []
-    return sorted(
-        d.name for d in root.glob("*")
-        if d.is_dir() and (d / "active").is_file()
-        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", d.name)
-    )
-
-
-def _load_evolved_tool(name):
-    """加载进化工具 active 版本（受限沙箱执行）。失败返回 None（调用方降级）。"""
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-        return None
-    base = _tools_dir() / name
-    active = base / "active"
-    if not active.is_file():
-        return None
-    try:
-        active_mtime = active.stat().st_mtime
-        version = active.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    if not version:
-        return None
-    src = base / version / f"{name}.py"
-    if not src.is_file():
-        return None
-    try:
-        src_mtime = src.stat().st_mtime
-    except OSError:
-        return None
-    cached = _TOOL_CACHE.get(name)
-    if cached and cached[0] == active_mtime and cached[1] == src_mtime:
-        return cached[2]
-    try:
-        mod = toolsafety.run_sandboxed(
-            src.read_text(encoding="utf-8"), f"hb_tool_{name}"
-        )
-    except Exception:
-        return None
-    if getattr(mod, "TOOL_NAME", None) != name:
-        return None
-    if not callable(getattr(mod, "handler", None)):
-        return None
-    _TOOL_CACHE[name] = (active_mtime, src_mtime, mod)
-    return mod
-
-
-def _search_primitive(kind, label, default_limit):
-    def fn(query, limit=default_limit):
-        entries = search.search_all(str(query), kind, limit)
-        return search.format_results(entries, label)
-
-    return fn
-
-
-def _safe_http_text(url, timeout=10):
-    """进化工具 ctx 的 HTTP 读通道：与下载通道同款 SSRF 校验。"""
-    try:
-        kdownload.validate_http_target(url)
-    except kdownload.DownloadError as exc:
-        return f"请求被拒绝：{exc}"
-    return core.http_text(url, timeout=timeout)
-
-
-def _safe_http_json(url, timeout=10):
-    try:
-        kdownload.validate_http_target(url)
-    except kdownload.DownloadError as exc:
-        return f"请求被拒绝：{exc}"
-    return core.http_json(url, timeout=timeout)
-
-
-def _make_tool_ctx(mode, source, confirm_cb, audit, cwd):
-    """进化工具 handler 的 ctx：原语绑定真实实现，权限与内置工具完全一致
-    （run_bash/download/install 原语内部自带分级确认与审计）。"""
-    prims = {
-        "web_search": _search_primitive("web", "搜索", 6),
-        "news_search": _search_primitive("news", "新闻", 6),
-        "stock_quote": _search_primitive("stock", "股票", 1),
-        "weather": _search_primitive("weather", "天气", 1),
-        "wiki_search": _search_primitive("wiki", "百科", 5),
-        "arxiv_search": _search_primitive("arxiv", "学术", 5),
-        "http_text": _safe_http_text,
-        "http_json": _safe_http_json,
-        "run_bash": lambda command: _exec_bash(
-            {"command": str(command)}, source, confirm_cb, audit, mode, cwd
-        ),
-        "download_file": lambda url, filename=None: _exec_download(
-            {"url": str(url), "filename": filename}, source, confirm_cb, audit, mode
-        ),
-        "install_skill": lambda zip_path: _exec_install(
-            {"zip_path": str(zip_path)}, source, confirm_cb, audit, mode
-        ),
-        "skill_status": lambda name: _exec_skill_status(
-            {"name": str(name)}, source, confirm_cb, audit, mode
-        ),
-        "skill_setup": lambda name: _exec_skill_setup(
-            {"name": str(name)}, source, confirm_cb, audit, mode
-        ),
-        "skill_auth": lambda name, secret: _exec_skill_auth(
-            {"name": str(name), "secret": str(secret)}, source, confirm_cb, audit, mode
-        ),
-        "skill_exec": lambda name, args: _exec_skill_exec(
-            {"name": str(name), "args": list(args)}, source, confirm_cb, audit, mode
-        ),
-        "sandbox_read": lambda path: _exec_sandbox_read(
-            {"path": str(path)}, source, confirm_cb, audit, mode
-        ),
-        "sandbox_write": lambda path, content: _exec_sandbox_write(
-            {"path": str(path), "content": str(content)}, source, confirm_cb, audit, mode
-        ),
-        "sandbox_list": lambda path=".": _exec_sandbox_list(
-            {"path": str(path)}, source, confirm_cb, audit, mode
-        ),
-        "sandbox_run": lambda command: _exec_sandbox_run(
-            {"command": str(command)}, source, confirm_cb, audit, mode
-        ),
-        "now": datetime.now,
-    }
-    return toolsafety.CtxProxy(prims)
-
-
 def _exec_bash(args, source, confirm_cb, audit, mode, cwd):
     """run_bash 统一执行（内置工具与进化工具 ctx 原语共用同一权限路径）。"""
     cmdline = str(args.get("command", "")).strip()
@@ -1513,19 +1377,6 @@ def tool_declarations(cfg):
         # Coding 工具（配置了 project_dir 才声明；聊天路径与 coding 路径共用）
         if str(cfg.get("project_dir", "") or "").strip():
             decls.extend(_coding_declarations())
-        # 进化工具声明（<data>/tools/，AST+受限执行，随聊天实时扫描）
-        for tname in _evolved_tool_names():
-            mod = _load_evolved_tool(tname)
-            if mod is None:
-                continue
-            decls.append({
-                "type": "function",
-                "function": {
-                    "name": mod.TOOL_NAME,
-                    "description": str(mod.TOOL_DESCRIPTION),
-                    "parameters": dict(mod.TOOL_PARAMETERS),
-                },
-            })
     return decls
 
 
@@ -1592,22 +1443,4 @@ def execute(name, arguments, *, mode, source, confirm_cb=None, cwd=None, audit=N
             return _exec_bg_check(args, source, audit, mode)
         if name == "bg_cancel":
             return _exec_bg_cancel(args, source, audit, mode)
-    # 进化工具（能力层自进化：<data>/tools/，AST+受限执行+ctx 原语白名单）
-    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-        mod = _load_evolved_tool(name)
-        if mod is not None:
-            try:
-                ctx = _make_tool_ctx(mode, source, confirm_cb, audit, cwd)
-                text = mod.handler(args, ctx)
-            except Exception as exc:
-                if audit:
-                    audit(SOURCE_USER if source == SOURCE_USER else SOURCE_AUTO,
-                          name, arguments, "tool", True, False, str(exc)[:200])
-                return f"工具执行失败：{exc}"
-            if not isinstance(text, str):
-                text = str(text)
-            if audit:
-                audit(SOURCE_USER if source == SOURCE_USER else SOURCE_AUTO,
-                      name, arguments, "tool", True, True, text[:200])
-            return text
     return f"未知工具：{name}"

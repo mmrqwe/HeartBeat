@@ -5,7 +5,7 @@
 LLM）/ LLM 巡视（含工具调用）/ 工具执行与审计。
 
 约束（与 agent.py 一致）：
-- 不 import kernel（依赖方向红线），经 self.brain_loader 访问版本管理
+- 不 import kernel（依赖方向红线）；自进化已移除（2026-08-13），无版本管理
 - 共享状态经 self（Agent 主类实例）访问
 """
 

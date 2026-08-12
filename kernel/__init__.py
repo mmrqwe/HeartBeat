@@ -1,14 +1,14 @@
 """kernel：最小内核（AI Runtime OS 底座）。
 
-职责（只做这六件事，不包含 LLM / 记忆 / 规划）：
+职责（只做这四件事，不包含 LLM / 记忆 / 规划）：
 - boot：      启动路径、数据迁移、配置加载/保存
 - module：    模块生命周期（发现 / 加载 / 卸载 / 重载）
 - permission：安全边界（shell 命令分级、敏感过滤、硬边界执行）
 - runtime：   事件循环上的任务调度（定时 / 看门狗 / 线程 / epoch 保护）
 - eventbus：  发布/订阅事件总线（kernel 系统事件与 brain 旁路通知）
-- updater：   自进化（brain 模块版本管理：验证 / 切换 / 回滚 / 加载）
 
 依赖方向：kernel 不 import brain / plugins / ui 的任何模块。
+自进化已于 2026-08-13 移除（updater/monitor 随同删除）。
 """
 
 from pathlib import Path
@@ -46,17 +46,6 @@ class Kernel:
 
         self.runtime = Runtime()
         self.eventbus = EventBus()
-        # 自进化（brain 版本管理）：首启安装内置 v1.0 + 启动级回滚
-        from .updater import Updater
-
-        self.updater = Updater(self.data_dir)
-        self.updater.eventbus = self.eventbus  # 切换广播 → 运行中 Agent 热切换
-        self.updater.ensure_installed()
-        # 运行期健康监控（阶段4）：tick/chat 指标 + 超阈值自动回滚。
-        # 依赖 updater（回滚执行器），自身零业务依赖。
-        from .monitor import Monitor
-
-        self.monitor = Monitor(self.data_dir, updater=self.updater)
 
     def save_settings(self, cfg):
         """保存配置并更新内存副本（由 UI / CLI 调用）。发布 config.saved 事件。"""
