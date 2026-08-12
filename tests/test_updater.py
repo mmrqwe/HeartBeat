@@ -411,6 +411,8 @@ _PACKAGE_FILES = {
         "class Agent:\n"
         "    def chat(self, text):\n        return 'pkg:' + str(text)\n"
         "    def think(self, *a, **k):\n        return None\n"
+        "    def live(self, *a, **k):\n        return None\n"
+        "    def greet(self, *a, **k):\n        return 'hi'\n"
         "    def tick(self, *a, **k):\n        return None\n"
         "    def reload(self, *a, **k):\n        return None\n"
         "    def reload_brain_modules(self, *a, **k):\n        return True\n"

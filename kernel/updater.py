@@ -60,7 +60,7 @@ REQUIRED_METHODS = {
     # brain 包内 agent.py 的 Agent 类（控制流契约 = 宿主调用面：
     # main.py/runtime/UI 直接调用的公开方法；阶段3 冒烟再扩展）
     "Agent": {
-        "chat", "think", "reload", "reload_brain_modules",
+        "chat", "think", "live", "greet", "reload", "reload_brain_modules",
         "append_chat", "clear_chat_history", "reindex_async", "patrol_topics",
     },
     "MemoryModule": {
