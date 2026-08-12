@@ -27,7 +27,7 @@ def smoke_test_module(module_name, module):
     if module_name == "brain":
         return _smoke_brain_package(module)
     cls = getattr(module, _CLASS_NAMES[module_name])
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         cfg = core.load_config(Path(tmp) / "config.json")
         cfg["api"]["api_key"] = ""
         cfg["embedding_enabled"] = False
@@ -52,6 +52,7 @@ def smoke_test_module(module_name, module):
             inst.greeting(ag.clock())
             inst.patrol_topics()
             inst.rules_think({"collections": []}, ag.clock())
+        database.close()
     return True
 
 
@@ -133,7 +134,7 @@ def _smoke_agent_deep(agent_cls):
     import tempfile
     import db as dbmod
 
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         cfg = core.load_config(Path(tmp) / "config.json")
         cfg["api"]["api_key"] = "mock"
         cfg["embedding_enabled"] = False
@@ -195,4 +196,5 @@ def _smoke_agent_deep(agent_cls):
             assert isinstance(r, str) and r, f"L2c 第 {text} 轮回复为空"
         heartbeat = ag.think({"collections": []})
         assert heartbeat is None or isinstance(heartbeat, str), "L2c 心跳异常"
+        database.close()
         return True

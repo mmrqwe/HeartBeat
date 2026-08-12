@@ -552,6 +552,62 @@ def test_parse_agent_reply_structured(tmp_path):
     assert thoughts[0]["importance"] == 2
 
 
+def test_extract_facts_remember_keyword(tmp_path):
+    """显式“记住”指令也能规则入库（不依赖 LLM 输出 [FACT]）。"""
+    a = _make_agent(tmp_path)
+    a._extract_facts_rule("你记住，看热榜要带完整标题和摘要")
+    texts = [i["text"] for i in a.memory.facts()]
+    assert any("看热榜要带完整标题和摘要" in t for t in texts), texts
+
+
+def test_memory_analyzer_saves_llm_fact(tmp_path):
+    """LLM 自主记忆分析：模型说值得记就入库，密钥类内容拒绝。"""
+    a = _make_agent(tmp_path)
+    a.cfg["api"]["api_key"] = "sk-test"
+
+    class FakeBrain:
+        def complete(self, messages, max_tokens=None, **kw):
+            return "[FACT:finance] 主人最近买了新能源股票\n[FACT] access secret 不要记\n[NONE]"
+
+    a.brain = FakeBrain()
+    a.stats = None
+    saved = a.memory_module.analyze_and_remember("我最近买了点新能源股票", "那要多关注")
+    assert saved == 1
+    texts = [i["text"] for i in a.memory.facts()]
+    assert any("新能源股票" in t for t in texts)
+    assert not any("secret" in t.lower() for t in texts)
+
+
+def test_chat_llm_tools_exhaustion_final_reply_keeps_context(tmp_path):
+    """工具轮次耗尽后兜底回复必须保留工具结果，而不是重开一轮无工具对话。"""
+    a = _make_agent(tmp_path)
+    calls = []
+
+    class FakeBrain:
+        def complete_tools(self, messages, decls):
+            calls.append(("tools", messages))
+            return "继续", [{
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "web_search", "arguments": '{"query": "x"}'},
+            }]
+
+        def complete(self, messages, max_tokens=None, **kw):
+            calls.append(("final", messages))
+            return "最终答复：拿到结果"
+
+    a.brain = FakeBrain()
+    a._run_tool = lambda *a, **k: "结果X"
+    a.stats = None
+    reply = a._chat_llm_tools("测试", None)
+    assert reply == "最终答复：拿到结果"
+    assert calls[-1][0] == "final"
+    final_msgs = calls[-1][1]
+    assert any("工具返回" in m.get("content", "") for m in final_msgs)
+    assert any(m.get("role") == "user" and "基于以上工具结果" in m.get("content", "")
+               for m in final_msgs)
+
+
 def test_think_rules_schedule_reminder(tmp_path):
     """规则模式：临近日程自动提醒（每天最多一次）。"""
     a = _make_agent(tmp_path)

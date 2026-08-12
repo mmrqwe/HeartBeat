@@ -184,7 +184,7 @@ class Agent(ChatMixin, ThinkMixin):
     def chat(self, user_text, on_delta=None):
         user_text = user_text.strip()
         entry = self.append_chat("user", user_text)
-        # 两种大脑模式统一采集事实（规则提取，零 API 成本）
+        # 规则提取作为零成本兜底；有 LLM 时主路径是 analyze_and_remember
         self._extract_facts_rule(user_text)
         self.state["fact_scan_id"] = entry["id"]
         self._save_state()
@@ -204,6 +204,12 @@ class Agent(ChatMixin, ThinkMixin):
         else:
             reply = self._chat_rules(user_text)
         self.append_chat("assistant", reply)
+        if (self.cfg.get("api") or {}).get("api_key"):
+            # 有 LLM 时由 Agent 自己分析该记住什么（不依赖写死规则）
+            try:
+                self.memory_module.analyze_and_remember(user_text, reply)
+            except Exception:
+                pass
         if self.stats:
             self.stats.record_chat(2)
         return reply

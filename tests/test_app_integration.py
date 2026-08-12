@@ -16,6 +16,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from PySide6.QtCore import QTimer
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 
 import core
@@ -38,65 +39,73 @@ def _make_app():
     cfg["interval_minutes"] = 1
     cfg_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
     app = QApplication.instance() or QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False)
+    if isinstance(app, QGuiApplication):
+        app.setQuitOnLastWindowClosed(False)
     hb = mainmod.HeartBeatApp(str(cfg_path))
     # 屏蔽真实采集与思考（不碰网络/LLM）
+    orig_gather = core.gather
     core.gather = lambda *a, **k: {"collections": [], "errors": []}
-    return tmp, hb
+    return tmp, hb, orig_gather
 
 
 def test_tick_lifecycle():
     """一次完整 tick：触发 → 忙碌 + 状态 → 完成复位 + 结果提示。"""
-    tmp, hb = _make_app()
-    rt = hb.kernel.runtime
-    assert "tick" in rt._tasks and "chat" in rt._tasks, "tick/chat 任务未注册"
+    tmp, hb, orig_gather = _make_app()
+    try:
+        rt = hb.kernel.runtime
+        assert "tick" in rt._tasks and "chat" in rt._tasks, "tick/chat 任务未注册"
 
-    # 慢任务制造 busy 窗口
-    hb.agent.think = lambda ctx: time.sleep(0.3) or None
-    QTimer.singleShot(50, hb._autonomy_tick)
-    wait(150)
-    assert rt.is_busy("tick"), "tick 应处于忙碌状态"
-    assert hb.pet._status_text == "巡视中…", f"状态应为‘巡视中…’，实际：{hb.pet._status_text}"
+        # 慢任务制造 busy 窗口
+        hb.agent.think = lambda ctx: time.sleep(0.3) or None
+        QTimer.singleShot(50, hb._autonomy_tick)
+        wait(150)
+        assert rt.is_busy("tick"), "tick 应处于忙碌状态"
+        assert hb.pet._status_text == "巡视中…", f"状态应为‘巡视中…’，实际：{hb.pet._status_text}"
 
-    # busy 保护：忙碌中再次触发 epoch 不递增
-    started = rt.current_epoch("tick")
-    hb._autonomy_tick()
-    assert rt.current_epoch("tick") == started, "busy 中重复触发不应递增 epoch"
+        # busy 保护：忙碌中再次触发 epoch 不递增
+        started = rt.current_epoch("tick")
+        hb._autonomy_tick()
+        assert rt.current_epoch("tick") == started, "busy 中重复触发不应递增 epoch"
 
-    wait(800)
-    assert not rt.is_busy("tick"), "tick 完成后应复位 busy"
-    assert hb.pet._status_text.endswith("巡视完，暂无新事"), f"状态应为完成提示，实际：{hb.pet._status_text}"
-    hb.kernel.stop()
-    tmp.cleanup()
+        wait(800)
+        assert not rt.is_busy("tick"), "tick 完成后应复位 busy"
+        assert hb.pet._status_text.endswith("巡视完，暂无新事"), f"状态应为完成提示，实际：{hb.pet._status_text}"
+    finally:
+        hb.kernel.stop()
+        tmp.cleanup()
+        core.gather = orig_gather
 
 
 def test_chat_lifecycle_and_stale_delta():
     """聊天全链路：触发 → 流式 delta（过期 epoch 被过滤）→ 回复 → 状态流转。"""
-    tmp, hb = _make_app()
-    rt = hb.kernel.runtime
+    tmp, hb, orig_gather = _make_app()
+    try:
+        rt = hb.kernel.runtime
 
-    deltas = []
-    hb.bridge.delta.connect(lambda epoch, text: deltas.append((epoch, text)))
+        deltas = []
+        hb.bridge.delta.connect(lambda epoch, text: deltas.append((epoch, text)))
 
-    def fake_chat(user_text, on_delta=None):
-        # 模拟流式：正确 epoch 的增量 + 过期线程的增量
-        if on_delta:
-            on_delta("你好")
-            hb._stream_delta(999, "过期增量")  # 模拟旧线程（epoch 不匹配）
-        return "你好呀，我在！"
+        def fake_chat(user_text, on_delta=None):
+            # 模拟流式：正确 epoch 的增量 + 过期线程的增量
+            if on_delta:
+                on_delta("你好")
+                hb._stream_delta(999, "过期增量")  # 模拟旧线程（epoch 不匹配）
+            return "你好呀，我在！"
 
-    hb.agent.chat = fake_chat
-    hb._send_chat("你好")
-    wait(300)
+        hb.agent.chat = fake_chat
+        hb._send_chat("你好")
+        wait(300)
 
-    # 流式增量：只保留最新 epoch
-    assert any(e == 1 for e, _ in deltas), f"正确 epoch 的 delta 缺失：{deltas}"
-    assert all(e != 999 for e, _ in deltas), f"过期 epoch 的 delta 泄漏：{deltas}"
-    # 完成：busy 复位 + 状态流转
-    assert not rt.is_busy("chat"), "chat 完成后应复位 busy"
-    assert hb.pet._status_text == "陪我聊天中", f"状态应为‘陪我聊天中’，实际：{hb.pet._status_text}"
-    hb.kernel.stop()
-    tmp.cleanup()
+        # 流式增量：只保留最新 epoch
+        assert any(e == 1 for e, _ in deltas), f"正确 epoch 的 delta 缺失：{deltas}"
+        assert all(e != 999 for e, _ in deltas), f"过期 epoch 的 delta 泄漏：{deltas}"
+        # 完成：busy 复位 + 状态流转
+        assert not rt.is_busy("chat"), "chat 完成后应复位 busy"
+        assert hb.pet._status_text == "陪我聊天中", f"状态应为‘陪我聊天中’，实际：{hb.pet._status_text}"
+    finally:
+        hb.kernel.stop()
+        tmp.cleanup()
+        core.gather = orig_gather
 
 
 def _run_all():

@@ -36,8 +36,9 @@ def parse_skill_frontmatter(text):
             data["name"] = re.sub(r"[\x00-\x1f\x7f]", "", value.strip())[:SKILL_NAME_MAX]
         elif key == "description":
             in_desc = True
-            if value.strip():
-                desc_parts.append(value.strip())
+            val = value.strip()
+            if val not in (">-", ">", "|-", "|") and val:
+                desc_parts.append(val)
     if desc_parts:
         desc = re.sub(r"[\x00-\x1f\x7f]", "", " ".join(desc_parts)).strip()
         if desc:

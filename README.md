@@ -149,7 +149,7 @@ py -3.12 main.py --cli selfcheck
 向量检索：
 
 - 嵌入模型默认 `BAAI/bge-small-zh-v1.5`（512 维，中文效果好，ONNX 约 95MB）
-- 首次使用时自动从 Hugging Face 下载到 `models/` 目录（exe 旁边），之后离线可用
+- 打包机已预下载（`models/fastembed/`，HF 缓存布局）时，`build.bat` 会把它打进 `_internal\models\fastembed`，用户首启自动注入 `%APPDATA%\HeartBeat\models\`，无需联网；未预下载则首次使用时自动从 Hugging Face 下载
 - 模型未下载、下载失败或未启用时自动降级为“最近记忆”，不影响聊天
 - 每次记住事实/想法、收到用户消息时自动生成向量入库；旧数据在设置保存后自动补索引
 - 聊天和自主思考时，会用当前问题做向量检索，把相关记忆带进上下文
@@ -214,11 +214,11 @@ def suggest(settings, entries, state):
 双击 `build.bat`，或手动执行：
 
 ```powershell
-py -3.12 -m pip install pyinstaller
-py -3.12 -m PyInstaller --noconfirm --clean --onefile --windowed --name HeartBeat --icon HeartBeat.ico --add-data "plugins;plugins" main.py
+py -3.12 -m pip install -r requirements.txt pyinstaller pillow
+py -3.12 -m PyInstaller --noconfirm --clean --workpath "$env:LOCALAPPDATA\Temp\HeartBeat-build" --distpath "dist" HeartBeat.spec
 ```
 
-产物在 `dist\HeartBeat.exe`（约 100MB，已内置 PySide6、ONNX 运行时和 sqlite-vec）。内置插件会被打进 exe；exe 旁边的 `plugins\` 目录优先级更高，可随时加新插件。首次启用向量记忆时会自动下载模型。
+产物在 `dist\HeartBeat\HeartBeat.exe`（目录版，已内置 PySide6、ONNX 运行时和 sqlite-vec）。内置插件会被打进 `_internal\plugins`；exe 旁边的 `plugins\` 目录优先级更高，可随时加新插件。首次启用向量记忆时会自动下载模型。
 
 ### 界面
 
@@ -261,6 +261,7 @@ py -3.12 -m PyInstaller --noconfirm --clean --onefile --windowed --name HeartBea
 - **下载**：说“下载 https://…/xxx.zip”，桌宠会先把下载地址弹窗给你确认（60 秒超时自动拒绝），确认后保存到 `<用户数据目录>/downloads/`。仅支持 http/https、大小上限 200MB，并阻断内网/元数据地址。
 - **安装**：说“把下载的 xxx.zip 装上”，确认后解压到 `<用户数据目录>/skills/`。只允许安装下载目录里的 zip，解压带 zip-slip / 符号链接 / 膨胀上限防护，目标目录已存在时自动备份为 `.old`。
 - **安装即生效**：装好后桌宠聊天的上下文会自动带上技能清单（仅 SKILL.md 的 name/description 元数据，外部文本不进入提示词），它会知道“装了知乎技能”，需要细节时自己 `cat` 技能文档细读——获得新能力不需要改代码，装个技能包就行。
+- **技能初始化（自升级）**：内核提供 `skill_status` / `skill_setup` / `skill_auth` 三个 ctx 原语（不直接暴露给 LLM），桌宠可用 `--cli evolve tool “给 zhihu 技能增加管理工具…”` 自升级生成对应的用户工具；CLI 也可直接 `--cli skill status/setup/auth` 操作。初始化/认证会先经你确认，Secret 不回显。
 - 自主巡视触发时下载/安装会被直接拒绝（写操作必须主人确认）；`off` / `readonly` 档位不可用。
 
 ### 自我进化（除最小核心外都可自升级）
@@ -278,7 +279,8 @@ py -3.12 -m PyInstaller --noconfirm --clean --onefile --windowed --name HeartBea
   - 三层防御：AST 静态检查（禁 dunder 属性访问/元编程内置）+ 受限 `__builtins__` 执行 + ctx 只读代理；
   - 安装前用假 ctx 冒烟（原语全部 no-op，死循环会超时拒绝），全程审计。
 - **工具升级**：说“升级 ping_check：支持超时参数”（工具名开头即可，无需“工具”字样）——LLM 以当前 active 源码为基准生成 vN+1，必须保留工具名（改名拒绝），验证失败自动重试后放弃、不破坏现有版本。新增与升级冲突时明确报错，不会误覆盖。
-- **管理**：`python main.py --cli updater status` 查看模块与工具版本；`--cli updater validate/install tool <候选目录> [--upgrade-of <工具名>]` 手动验证/安装工具候选；`--cli updater switch/rollback <模块或工具名> [版本]` 切换/回滚；`--cli evolve tool “需求”` 或 `--cli evolve tool “升级 ping_check：需求”` 走 LLM 全流程（跳过确认弹窗）。编译版用 `HeartBeat.app/Contents/MacOS/HeartBeat --cli …` 同样可用。
+- **管理**：`python main.py --cli updater status` 查看模块与工具版本；`--cli updater validate/install tool <候选目录> [--upgrade-of <工具名>]` 手动验证/安装工具候选；`--cli updater switch/rollback <模块或工具名> [版本]` 切换/回滚；`--cli evolve tool “需求”` 或 `--cli evolve tool “升级 ping_check：需求”` 走 LLM 全流程（跳过确认弹窗）。
+- **技能包**：`python main.py --cli skill download <zip 地址>` 下载到 `<数据目录>/downloads`，`--cli skill install <zip 路径>` 安装到 `<数据目录>/skills`，`--cli skill list` 查看已发现技能；初始化执行 `--cli skill status <技能名>` / `--cli skill setup <技能名>`，认证用 `--cli skill auth <技能名>`（Access Secret 从 stdin 传入，不回显）。编译版用 `HeartBeat.app/Contents/MacOS/HeartBeat --cli …` 同样可用。
 
 **Shell 工具（`run_bash`）**：桌宠可以在你授权后执行本机命令，安全性分 4 档（设置 → 基本 → Shell 工具）：
 

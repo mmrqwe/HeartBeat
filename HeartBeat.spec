@@ -1,10 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
+import sys
 from PyInstaller.utils.hooks import collect_all
 
 ROOT = os.path.abspath(SPECPATH)  # spec 所在目录（项目根），避免硬编码本机路径
+APP_ICON = os.path.join(ROOT, 'assets', 'HeartBeat.icns')
+if sys.platform == 'win32':
+    APP_ICON = os.path.join(ROOT, 'assets', 'HeartBeat.ico')
 
 datas = [(os.path.join(ROOT, 'plugins'), 'plugins'), (os.path.join(ROOT, 'brain'), 'brain')]
+# 离线嵌入模型（可选）：存在才打包；首启由 rag._ensure_bundled_model 注入用户目录
+MODELS_DIR = os.path.join(ROOT, 'models', 'fastembed')
+if os.path.isdir(MODELS_DIR):
+    datas.append((MODELS_DIR, os.path.join('models', 'fastembed')))
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('fastembed')
@@ -46,7 +54,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=[os.path.join(ROOT, 'assets', 'HeartBeat.icns')],
+    icon=[APP_ICON],
 )
 coll = COLLECT(
     exe,
@@ -60,6 +68,6 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='HeartBeat.app',
-    icon=os.path.join(ROOT, 'assets', 'HeartBeat.icns'),
+    icon=APP_ICON,
     bundle_identifier=None,
 )

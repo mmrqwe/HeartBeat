@@ -372,6 +372,14 @@ class Evolver:
             "ctx.run_bash(command) 执行 shell 命令（写操作需主人确认）\n"
             "ctx.download_file(url, filename=None) 下载文件（需主人确认）\n"
             "ctx.install_skill(zip_path) 安装技能包（需主人确认）\n"
+            "ctx.skill_status(name) 检查已安装技能状态（只读）\n"
+            "ctx.skill_setup(name) 运行技能初始化脚本（安装官方 CLI，需主人确认）\n"
+            "ctx.skill_auth(name, secret) 用 Access Secret 配置技能认证（需主人确认，不回显 secret）\n"
+            "ctx.skill_exec(name, args) 调用已安装技能 CLI 的只读命令（如 zhihu 的 hot/search/answer，args 为字符串列表）\n"
+            "ctx.sandbox_read(path) 读取沙盒工作区文件\n"
+            "ctx.sandbox_write(path, content) 写入沙盒工作区文件（需主人确认）\n"
+            "ctx.sandbox_list(path='.') 列出沙盒工作区目录\n"
+            "ctx.sandbox_run(command) 在沙盒工作区执行完整 shell 命令（需主人确认）\n"
             "ctx.now 当前时间（datetime）"
         )
         system = (

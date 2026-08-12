@@ -378,7 +378,7 @@ class SettingsWindow(QDialog):
         if agent is None:
             return
         try:
-            items = agent.memory.facts(80)
+            items = agent.memory.recent(100)
         except Exception:
             items = []
         if not items:
@@ -392,8 +392,9 @@ class SettingsWindow(QDialog):
             "misc": "其他",
         }
         for it in items:
+            role_label = "想法" if it.get("role") == "thought" else "记忆"
             cat = category_names.get(it.get("category") or "misc", it.get("category") or "其他")
-            self.memory_list.addItem(f"[{cat}] {it['text']}")
+            self.memory_list.addItem(f"[{role_label}·{cat}] {it['text']}")
             self._memory_ids.append(it["id"])
 
     def _delete_selected_memory(self):

@@ -352,14 +352,26 @@ def test_user_data_dir_windows():
 
 
 def test_user_data_dir_linux():
+    class _FakePath(str):
+        @staticmethod
+        def home():
+            return _FakePath("/home/test")
+
+        def __truediv__(self, other):
+            return _FakePath(str(self) + "/" + str(other))
+
+    class _FakeOS:
+        name = "posix"
+        environ = {"XDG_DATA_HOME": "/tmp/xdg"}
+
     patch = _Patch()
     try:
         patch.setattr(kernel.boot.sys, "platform", "linux")
-        patch.setattr(kernel.boot.os, "name", "posix")
-        patch.setattr(kernel.boot.os, "environ", {"XDG_DATA_HOME": "/tmp/xdg"})
-        assert core.user_data_dir() == Path("/tmp/xdg/HeartBeat")
-        patch.setattr(kernel.boot.os, "environ", {})
-        assert core.user_data_dir() == Path.home() / ".local" / "share" / "HeartBeat"
+        patch.setattr(kernel.boot, "os", _FakeOS())
+        patch.setattr(kernel.boot, "Path", _FakePath)
+        assert str(core.user_data_dir()) == "/tmp/xdg/HeartBeat"
+        _FakeOS.environ = {}
+        assert str(core.user_data_dir()) == "/home/test/.local/share/HeartBeat"
     finally:
         patch.restore()
 
@@ -655,6 +667,7 @@ def test_parse_skill_frontmatter_zhihu_style():
     meta = core.parse_skill_frontmatter(text)
     assert meta["name"] == "zhihu"
     assert "搜索知乎" in meta["description"]
+    assert ">-" not in meta["description"]
     assert "正文" not in json.dumps(meta)
 
 

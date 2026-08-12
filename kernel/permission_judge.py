@@ -86,29 +86,49 @@ SENSITIVE_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDEN
 
 
 def classify(cmdline, mode, source):
-    """返回 (decision, reason)。decision ∈ {AUTO, CONFIRM, REJECT}。"""
+    """返回 (decision, reason)。decision ∈ {AUTO, CONFIRM, REJECT}。
+
+    简单只读命令自动执行；写命令/复合命令/未知命令不再硬拒，
+    交给用户确认（自主触发仍拒绝）。
+    """
     if mode == SHELL_MODE_OFF:
         return REJECT, "shell 工具已关闭"
+    cmdline = (cmdline or "").strip()
+    if not cmdline:
+        return REJECT, "空命令"
     try:
         parts = shlex.split(cmdline)
     except ValueError:
         return REJECT, "命令解析失败"
-    if not parts:
-        return REJECT, "空命令"
-    # 纵深防御：任何 token 含 shell 元字符即拒绝（防止管道/重定向/复合命令伪装）
-    if any(any(c in tok for c in "|;&><`$(){})") for tok in parts):
-        return REJECT, "命令包含 shell 元字符，仅支持单条简单命令"
-    cmd = os.path.basename(parts[0])
+    first = cmdline.split(None, 1)[0]
+    cmd = os.path.basename(first.replace("\\", "/")).lower()
     if cmd in HARD_BLOCK_COMMANDS:
         return REJECT, f"禁止命令：{cmd}"
-    if _args_contain_sensitive_path(parts):
+    if any(marker in cmdline.lower() for marker in SENSITIVE_PATH_MARKERS):
         return REJECT, "命令涉及敏感路径（密钥/凭据/隐私文件），已拒绝"
-    risk, reason = _command_risk(parts)
-    if risk == "block":
-        return REJECT, reason
-    if risk == "readonly":
+    has_meta = any(c in cmdline for c in "|;&><`$(){})")
+    if cmd == "find" and FIND_DANGEROUS_ARGS.intersection(parts[1:]):
+        return REJECT, "find 危险参数：" + "、".join(sorted(FIND_DANGEROUS_ARGS.intersection(parts[1:])))
+    if cmd == "git":
+        sub = parts[1] if len(parts) > 1 else ""
+        if sub in READONLY_GIT_SUBCOMMANDS:
+            return AUTO, ""
+        if sub in WRITE_GIT_SUBCOMMANDS or not sub:
+            return _write_decision("git 写操作", mode, source)
+        return REJECT, f"git 未授权子命令：{sub}"
+    if not has_meta and cmd in READONLY_COMMANDS:
         return AUTO, ""
-    # 写操作
+    if not has_meta and cmd in WRITE_COMMANDS:
+        return _write_decision(f"写命令：{cmd}", mode, source)
+    # 复合命令 / 未知命令：用户在场可确认，不再硬拒
+    if source == SOURCE_AUTO:
+        return REJECT, "自主触发不允许执行非只读命令"
+    if mode == SHELL_MODE_READONLY:
+        return REJECT, "readonly 档只允许只读命令"
+    return CONFIRM, ("复合命令，需确认" if has_meta else f"未授权命令：{cmd}")
+
+
+def _write_decision(reason, mode, source):
     if mode == SHELL_MODE_READONLY:
         return REJECT, f"{reason}（readonly 档拒绝写操作）"
     if mode == SHELL_MODE_CONFIRM:
@@ -116,33 +136,3 @@ def classify(cmdline, mode, source):
             return REJECT, f"{reason}（自主触发不允许写操作）"
         return CONFIRM, reason
     return AUTO, reason  # full 档
-
-
-def _args_contain_sensitive_path(parts):
-    """参数中是否包含敏感路径标记（展开 ~ 后子串匹配，保守拒绝）。"""
-    for tok in parts[1:]:
-        low = os.path.expanduser(tok).lower()
-        if any(marker in low for marker in SENSITIVE_PATH_MARKERS):
-            return True
-    return False
-
-
-def _command_risk(parts):
-    """返回 (risk, reason)，risk ∈ {readonly, write, block}。"""
-    cmd = os.path.basename(parts[0])
-    if cmd == "git":
-        sub = parts[1] if len(parts) > 1 else ""
-        if sub in READONLY_GIT_SUBCOMMANDS:
-            return "readonly", ""
-        if sub in WRITE_GIT_SUBCOMMANDS or not sub:
-            return "write", "git 写操作"
-        return "block", f"git 未授权子命令：{sub}"
-    if cmd == "find":
-        dangerous = FIND_DANGEROUS_ARGS.intersection(parts[1:])
-        if dangerous:
-            return "block", f"find 危险参数：{' '.join(sorted(dangerous))}"
-    if cmd in READONLY_COMMANDS:
-        return "readonly", ""
-    if cmd in WRITE_COMMANDS:
-        return "write", f"写命令：{cmd}"
-    return "block", f"未授权命令：{cmd}"

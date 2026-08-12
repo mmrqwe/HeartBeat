@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 from gui import theme
 
 
-BUBBLE_MIN_W = 120   # 气泡最小宽度（短消息也不会太窄）
+BUBBLE_MIN_W = 72    # 气泡最小宽度（短消息窄气泡，按内容自适应）
 BUBBLE_MAX_W = 380   # 气泡最大宽度（超过后换行，受窗口宽度约束）
 BUBBLE_MARGIN = 10   # 气泡内边距（与 documentMargin 一致）
 
@@ -246,6 +246,7 @@ class ChatWindow(QWidget):
         real = bubble.document().size().height()
         if real > 0:
             bubble.setFixedHeight(max(int(real) + 4, 24))
+            self._scroll_to_bottom()
         else:
             QTimer.singleShot(0, lambda: self._fix_bubble_height(bubble))
 
@@ -330,6 +331,7 @@ class ChatWindow(QWidget):
     def _scroll_to_bottom(self):
         bar = self.scroll.verticalScrollBar()
         QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
+        QTimer.singleShot(50, lambda: bar.setValue(bar.maximum()))
 
     def closeEvent(self, event):
         if self._think_timer:

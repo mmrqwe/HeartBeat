@@ -69,7 +69,8 @@ FORBIDDEN_CALLS = frozenset({
 CTX_ALLOWED = frozenset({
     "web_search", "news_search", "stock_quote", "weather", "wiki_search",
     "arxiv_search", "http_text", "http_json", "run_bash", "download_file",
-    "install_skill", "now",
+    "install_skill", "skill_status", "skill_setup", "skill_auth", "skill_exec",
+    "sandbox_read", "sandbox_write", "sandbox_list", "sandbox_run", "now",
 })
 
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")

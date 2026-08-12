@@ -9,7 +9,10 @@
 """
 
 import json
+import locale
+import os
 import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -44,6 +47,7 @@ from kernel.permission import (  # noqa: F401
     WRITE_GIT_SUBCOMMANDS,
     classify,
     human_brief,
+    run_process,
     resolve_workdir,
     run_bash,
 )
@@ -197,14 +201,14 @@ def _exec_install(args, source, confirm_cb, audit, mode):
             audit(SOURCE_USER, "install_skill", zip_path, mode, True, False, str(exc)[:200])
         return f"安装失败：{exc}"
     version = ""
-    mf = next((f for f in files if f.endswith("/manifest.json")), None)
+    mf = next((f for f in files if f == "manifest.json" or f.endswith("/manifest.json")), None)
     if mf:
         try:
             data = json.loads(kdownload.read_zip_text(p, mf) or "{}")
             version = str(data.get("version", ""))
         except Exception:
             pass
-    skill_md = next((f for f in files if f.endswith("SKILL.md")), None)
+    skill_md = next((f for f in files if f == "SKILL.md" or f.endswith("/SKILL.md")), None)
     text = f"安装完成：{target}（{len(files)} 个文件）"
     if version:
         text += f"，版本 {version}"
@@ -212,6 +216,398 @@ def _exec_install(args, source, confirm_cb, audit, mode):
         text += f"\n技能说明文档：{target / skill_md}"
     if audit:
         audit(SOURCE_USER, "install_skill", zip_path, mode, True, True, text[:200])
+    return text
+
+
+# ---------- 技能生命周期（zhihu-cli 等：状态 / 初始化 / 认证） ----------
+
+
+def find_skill_dir(name):
+    """按目录名或 SKILL.md frontmatter name 定位已安装技能目录。"""
+    root = _skills_dir()
+    direct = root / name
+    if direct.is_dir():
+        return direct
+    if root.is_dir():
+        for folder in sorted(root.iterdir()):
+            md = folder / "SKILL.md"
+            if md.is_file():
+                try:
+                    meta = core.parse_skill_frontmatter(
+                        md.read_text(encoding="utf-8", errors="replace")
+                    )
+                except OSError:
+                    continue
+                if meta.get("name") == name:
+                    return folder
+    return None
+
+
+def run_skill_script(name, script_name, args=(), timeout=180):
+    """运行已安装技能的 scripts/<script_name>，返回 (returncode, text)。
+
+    Windows 下自动给 UTF-8 无 BOM 的 .ps1 补 BOM：Windows PowerShell 5.1
+    按 ANSI 读取无 BOM 脚本，中文注释会导致解析失败。
+    """
+    skill_dir = find_skill_dir(name)
+    if skill_dir is None:
+        return 1, f"技能不存在：{name}"
+    script = skill_dir / "scripts" / script_name
+    if not script.is_file():
+        return 1, f"技能缺少脚本：{script}"
+    if os.name == "nt":
+        if script.suffix.lower() == ".ps1":
+            raw = script.read_bytes()
+            if not raw.startswith(b"\xef\xbb\xbf") and any(b >= 0x80 for b in raw):
+                script.write_bytes(b"\xef\xbb\xbf" + raw)
+        argv = [
+            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", str(script), *args,
+        ]
+        enc = locale.getpreferredencoding(False)
+    else:
+        argv = ["bash", str(script), *args]
+        enc = "utf-8"
+    try:
+        proc = run_process(argv, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 1, "技能脚本超时（180 秒）"
+    raw = proc.stdout + proc.stderr
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode(enc, errors="replace")
+    return proc.returncode, text
+
+
+def _default_cli_binary():
+    if os.name == "nt":
+        cli_home = os.environ.get("ZHIHU_CLI_HOME") or (
+            Path(os.environ.get("LOCALAPPDATA", "")) / "ZhihuCLI"
+        )
+        return str(Path(cli_home) / "current" / "zhihu-cli.exe")
+    return str(Path.home() / ".local" / "share" / "zhihu-cli" / "current" / "zhihu-cli")
+
+
+SKILL_CLI_READONLY = frozenset({
+    "hot", "search", "answer", "me", "capabilities", "version", "help",
+})
+
+
+def _resolve_skill_binary(name):
+    """优先从技能 status JSON 的 cli.binary_path 取，找不到回退默认路径。"""
+    if find_skill_dir(name) is None:
+        return None
+    script = "run.ps1" if os.name == "nt" else "run.sh"
+    rc, text = run_skill_script(name, script, ["status"], timeout=30)
+    if rc == 0:
+        try:
+            data = json.loads(text)
+            path = str(data.get("cli", {}).get("binary_path", "") or "")
+            if path and Path(path).is_file():
+                return Path(path)
+        except Exception:
+            pass
+    fallback = _default_cli_binary()
+    return Path(fallback) if Path(fallback).is_file() else None
+
+
+def run_skill_cli(name, args, timeout=90, max_output=8192):
+    """运行已安装技能的 CLI，返回 (returncode, text)。
+
+    args 必须是字符串列表，直接作为 argv 传入，不经过 shell。
+    是否自动执行由调用方（_exec_skill_exec）按只读白名单 + 确认门控决定。
+    """
+    args = [str(a) for a in (args or [])]
+    if not args:
+        return 1, "CLI 参数为空"
+    binary = _resolve_skill_binary(name)
+    if binary is None:
+        return 1, f"找不到技能 {name} 的 CLI（先运行 skill_setup）"
+    try:
+        proc = run_process([str(binary)] + args, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 1, "技能 CLI 超时"
+    raw = proc.stdout + proc.stderr
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        enc = locale.getpreferredencoding(False) if os.name == "nt" else "utf-8"
+        text = raw.decode(enc, errors="replace")
+    text = text[:max_output]
+    return proc.returncode, text
+
+
+def configure_skill_auth(name, secret, binary=None, timeout=90):
+    """配置技能 CLI 认证：auth set（stdin 传 Secret）→ verify → 最小本人读取。
+
+    返回 (returncode, 输出文本)；任一步失败即停。Secret 不回显。
+    """
+    bin_path = Path(binary or _default_cli_binary())
+    if not bin_path.is_file():
+        return 1, f"CLI 不存在：{bin_path}（先运行 skill_setup）"
+    steps = [
+        (["auth", "set", "--secret-stdin"], (secret + "\n").encode("utf-8")),
+        (["auth", "status", "--verify"], None),
+        (["me", "contents", "--type", "all", "--limit", "1"], None),
+    ]
+    parts = []
+    for cmd, data in steps:
+        try:
+            proc = run_process(
+                [str(bin_path)] + cmd, input=data, capture_output=True, timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
+            return 1, "认证命令超时：" + " ".join(cmd)
+        raw = proc.stdout + proc.stderr
+        try:
+            text = raw.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            enc = locale.getpreferredencoding(False) if os.name == "nt" else "utf-8"
+            text = raw.decode(enc, errors="replace").strip()
+        parts.append(f"$ {bin_path} {' '.join(cmd)}\n{text or '(无输出)'}")
+        if proc.returncode != 0:
+            return proc.returncode, "\n".join(parts)
+    return 0, "\n".join(parts) + "\n初始化完成：认证验证通过，本人内容读取成功。"
+
+
+def _exec_skill_status(args, source, confirm_cb, audit, mode):
+    name = str(args.get("name", "") or "").strip()
+    if not name:
+        return "缺少技能名（name）"
+    if mode == SHELL_MODE_OFF:
+        return _deny(audit, source, "skill_status", name, mode, "shell 工具已关闭")
+    rc, text = run_skill_script(
+        name, "run.ps1" if os.name == "nt" else "run.sh", ["status"]
+    )
+    if audit:
+        audit(SOURCE_USER if source == SOURCE_USER else SOURCE_AUTO,
+              "skill_status", name, mode, True, rc == 0, text[:200])
+    if rc != 0:
+        return f"技能状态检查失败（exit={rc}）：\n{text}"
+    return text.strip() or "(无输出)"
+
+
+def _exec_skill_setup(args, source, confirm_cb, audit, mode):
+    name = str(args.get("name", "") or "").strip()
+    if not name:
+        return "缺少技能名（name）"
+    if source != SOURCE_USER:
+        return _deny(audit, source, "skill_setup", name, mode,
+                     "自主触发不允许初始化技能（需要主人确认）")
+    if mode in (SHELL_MODE_OFF, SHELL_MODE_READONLY):
+        return _deny(audit, source, "skill_setup", name, mode,
+                     f"当前工具档位（{mode}）不允许初始化技能")
+    desc = f"初始化技能：{name} → 运行 scripts/setup.*（下载并安装官方 CLI 到用户目录）"
+    approved, denied = _confirm(desc, confirm_cb, audit, source,
+                                "skill_setup", name, mode)
+    if not approved:
+        return denied
+    rc, text = run_skill_script(
+        name, "setup.ps1" if os.name == "nt" else "setup.sh", []
+    )
+    if audit:
+        audit(SOURCE_USER, "skill_setup", name, mode, True, rc == 0, text[:200])
+    if rc != 0:
+        return f"技能初始化失败（exit={rc}）：\n{text}"
+    return text.strip() or "(初始化完成，无输出)"
+
+
+def _exec_skill_auth(args, source, confirm_cb, audit, mode):
+    name = str(args.get("name", "") or "").strip()
+    secret = str(args.get("secret", "") or "").strip()
+    binary = str(args.get("binary", "") or "").strip() or None
+    if not name:
+        return "缺少技能名（name）"
+    if not secret:
+        return "缺少 Access Secret（secret）"
+    if source != SOURCE_USER:
+        return _deny(audit, source, "skill_auth", name, mode,
+                     "自主触发不允许配置认证（需要主人确认）")
+    if mode in (SHELL_MODE_OFF, SHELL_MODE_READONLY):
+        return _deny(audit, source, "skill_auth", name, mode,
+                     f"当前工具档位（{mode}）不允许配置认证")
+    desc = f"配置技能 {name} 的 Access Secret（写入本机 CLI 凭证，不回显内容）"
+    approved, denied = _confirm(desc, confirm_cb, audit, source,
+                                "skill_auth", name, mode)
+    if not approved:
+        return denied
+    rc, text = configure_skill_auth(name, secret, binary)
+    if audit:
+        audit(SOURCE_USER, "skill_auth", name, mode, True, rc == 0, text[:200])
+    return text
+
+
+def _exec_skill_exec(args, source, confirm_cb, audit, mode):
+    name = str(args.get("name", "") or "").strip()
+    cmd_args = args.get("args") or []
+    if not name:
+        return "缺少技能名（name）"
+    if not isinstance(cmd_args, list) or not cmd_args:
+        return "缺少 CLI 参数（args，字符串列表）"
+    if mode == SHELL_MODE_OFF:
+        return _deny(audit, source, "skill_exec", name, mode, "shell 工具已关闭")
+    if source != SOURCE_USER:
+        return _deny(audit, source, "skill_exec", name, mode,
+                     "自主触发不允许调用技能 CLI（需要主人在场）")
+    cmd_args = [str(a) for a in cmd_args]
+    auto = bool(cmd_args) and cmd_args[0] in SKILL_CLI_READONLY
+    if not auto:
+        if mode == SHELL_MODE_READONLY:
+            return _deny(audit, source, "skill_exec", name + " " + " ".join(cmd_args),
+                         mode, "只读档不允许调用技能 CLI 写命令")
+        desc = f"调用技能 {name} CLI：{' '.join(cmd_args)}"
+        approved, denied = _confirm(desc, confirm_cb, audit, source,
+                                    "skill_exec", name + " " + " ".join(cmd_args), mode)
+        if not approved:
+            return denied
+    rc, text = run_skill_cli(name, cmd_args)
+    if audit:
+        audit(SOURCE_USER, "skill_exec",
+              name + " " + " ".join(cmd_args),
+              mode, True, rc == 0, text[:200])
+    if rc != 0:
+        return f"技能 CLI 执行失败（exit={rc}）：\n{text}"
+    return text.strip() or "(无输出)"
+
+
+# ---------- 沙盒（Agent 可读可写可执行的工作区） ----------
+
+
+def _sandbox_root():
+    root = Path(user_data_dir()) / "sandbox"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return root
+
+
+def _resolve_sandbox_path(rel):
+    """把相对/绝对路径解析到沙盒内；越界抛 ValueError。"""
+    root = _sandbox_root().resolve()
+    p = Path(rel)
+    if not p.is_absolute():
+        p = root / p
+    p = p.resolve()
+    if not p.is_relative_to(root):
+        raise ValueError(f"路径越出沙盒：{rel}")
+    return p
+
+
+def sandbox_read(rel, max_bytes=65536):
+    p = _resolve_sandbox_path(rel)
+    if not p.is_file():
+        return f"文件不存在：{p}"
+    data = p.read_bytes()[:max_bytes]
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("utf-8", errors="replace")
+
+
+def sandbox_write(rel, content):
+    p = _resolve_sandbox_path(rel)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    text = str(content)
+    p.write_text(text, encoding="utf-8")
+    return f"已写入：{p}（{len(text)} 字符）"
+
+
+def sandbox_list(rel="."):
+    p = _resolve_sandbox_path(rel)
+    if not p.is_dir():
+        return f"目录不存在：{p}"
+    lines = []
+    for child in sorted(p.iterdir()):
+        lines.append(("DIR  " if child.is_dir() else "FILE ") + child.name)
+    return "\n".join(lines) or "(空目录)"
+
+
+def sandbox_run(command, timeout=60, max_output=8192):
+    """在沙盒根目录执行一条完整 shell 命令（允许管道/重定向/脚本语法）。"""
+    # 唯一执行引擎：复用 run_bash（完整 shell + 隐藏窗口 + 环境过滤）
+    return run_bash(str(command), cwd=str(_sandbox_root()), timeout=timeout, max_output=max_output)
+
+
+def _exec_sandbox_read(args, source, confirm_cb, audit, mode):
+    path = str(args.get("path", "") or "").strip()
+    if not path:
+        return "缺少路径（path）"
+    if mode == SHELL_MODE_OFF:
+        return _deny(audit, source, "sandbox_read", path, mode, "shell 工具已关闭")
+    if source != SOURCE_USER:
+        return _deny(audit, source, "sandbox_read", path, mode,
+                     "自主触发不允许读写沙盒（需要主人在场）")
+    try:
+        text = sandbox_read(path)
+    except ValueError as exc:
+        return f"读取失败：{exc}"
+    if audit:
+        audit(SOURCE_USER, "sandbox_read", path, mode, True, True, text[:200])
+    return text
+
+
+def _exec_sandbox_list(args, source, confirm_cb, audit, mode):
+    path = str(args.get("path", "") or ".").strip() or "."
+    if mode == SHELL_MODE_OFF:
+        return _deny(audit, source, "sandbox_list", path, mode, "shell 工具已关闭")
+    if source != SOURCE_USER:
+        return _deny(audit, source, "sandbox_list", path, mode,
+                     "自主触发不允许读写沙盒（需要主人在场）")
+    try:
+        text = sandbox_list(path)
+    except ValueError as exc:
+        return f"列出失败：{exc}"
+    if audit:
+        audit(SOURCE_USER, "sandbox_list", path, mode, True, True, text[:200])
+    return text
+
+
+def _exec_sandbox_write(args, source, confirm_cb, audit, mode):
+    path = str(args.get("path", "") or "").strip()
+    content = args.get("content", "")
+    if not path:
+        return "缺少路径（path）"
+    if source != SOURCE_USER:
+        return _deny(audit, source, "sandbox_write", path, mode,
+                     "自主触发不允许读写沙盒（需要主人在场）")
+    if mode in (SHELL_MODE_OFF, SHELL_MODE_READONLY):
+        return _deny(audit, source, "sandbox_write", path, mode,
+                     f"当前工具档位（{mode}）不允许写沙盒")
+    desc = f"写入沙盒文件：{path}"
+    approved, denied = _confirm(desc, confirm_cb, audit, source,
+                                "sandbox_write", path, mode)
+    if not approved:
+        return denied
+    try:
+        text = sandbox_write(path, content)
+    except ValueError as exc:
+        return f"写入失败：{exc}"
+    if audit:
+        audit(SOURCE_USER, "sandbox_write", path, mode, True, True, text[:200])
+    return text
+
+
+def _exec_sandbox_run(args, source, confirm_cb, audit, mode):
+    command = str(args.get("command", "") or "").strip()
+    if not command:
+        return "缺少命令（command）"
+    if source != SOURCE_USER:
+        return _deny(audit, source, "sandbox_run", command, mode,
+                     "自主触发不允许执行沙盒命令（需要主人在场）")
+    if mode in (SHELL_MODE_OFF, SHELL_MODE_READONLY):
+        return _deny(audit, source, "sandbox_run", command, mode,
+                     f"当前工具档位（{mode}）不允许执行沙盒命令")
+    desc = f"在沙盒中执行命令：{command}"
+    approved, denied = _confirm(desc, confirm_cb, audit, source,
+                                "sandbox_run", command, mode)
+    if not approved:
+        return denied
+    text = sandbox_run(command)
+    ok = text.startswith("exit=0")
+    if audit:
+        audit(SOURCE_USER, "sandbox_run", command, mode, True, True, text[:200])
     return text
 
 
@@ -304,6 +700,30 @@ def _make_tool_ctx(mode, source, confirm_cb, audit, cwd):
         ),
         "install_skill": lambda zip_path: _exec_install(
             {"zip_path": str(zip_path)}, source, confirm_cb, audit, mode
+        ),
+        "skill_status": lambda name: _exec_skill_status(
+            {"name": str(name)}, source, confirm_cb, audit, mode
+        ),
+        "skill_setup": lambda name: _exec_skill_setup(
+            {"name": str(name)}, source, confirm_cb, audit, mode
+        ),
+        "skill_auth": lambda name, secret: _exec_skill_auth(
+            {"name": str(name), "secret": str(secret)}, source, confirm_cb, audit, mode
+        ),
+        "skill_exec": lambda name, args: _exec_skill_exec(
+            {"name": str(name), "args": list(args)}, source, confirm_cb, audit, mode
+        ),
+        "sandbox_read": lambda path: _exec_sandbox_read(
+            {"path": str(path)}, source, confirm_cb, audit, mode
+        ),
+        "sandbox_write": lambda path, content: _exec_sandbox_write(
+            {"path": str(path), "content": str(content)}, source, confirm_cb, audit, mode
+        ),
+        "sandbox_list": lambda path=".": _exec_sandbox_list(
+            {"path": str(path)}, source, confirm_cb, audit, mode
+        ),
+        "sandbox_run": lambda command: _exec_sandbox_run(
+            {"command": str(command)}, source, confirm_cb, audit, mode
         ),
         "now": datetime.now,
     }
@@ -404,6 +824,57 @@ def tool_declarations(cfg):
                 ),
             },
         })
+        # 沙盒工作区：Agent 可读可写可执行（路径限制在 <数据目录>/sandbox）
+        decls.append({
+            "type": "function",
+            "function": {
+                "name": "sandbox_read",
+                "description": (
+                    f"读取沙盒工作区（{_sandbox_root()}）里的文本文件。"
+                    "路径可以是相对路径或沙盒内绝对路径，越界会被拒绝。"
+                ),
+                "parameters": _params_decl("path", "沙盒内文件路径"),
+            },
+        })
+        decls.append({
+            "type": "function",
+            "function": {
+                "name": "sandbox_write",
+                "description": (
+                    f"把内容写入沙盒工作区（{_sandbox_root()}）的文本文件。"
+                    "需要主人确认；路径越界会被拒绝。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "沙盒内文件路径"},
+                        "content": {"type": "string", "description": "要写入的文本内容"},
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+        })
+        decls.append({
+            "type": "function",
+            "function": {
+                "name": "sandbox_list",
+                "description": (
+                    f"列出沙盒工作区（{_sandbox_root()}）里的文件与目录。"
+                ),
+                "parameters": _params_decl("path", "沙盒内目录路径，默认 ."),
+            },
+        })
+        decls.append({
+            "type": "function",
+            "function": {
+                "name": "sandbox_run",
+                "description": (
+                    f"在沙盒工作区（{_sandbox_root()}）执行一条完整 shell 命令"
+                    "（支持管道/重定向/脚本语法，工作目录固定在沙盒）。需要主人确认。"
+                ),
+                "parameters": _params_decl("command", "要执行的 shell 命令"),
+            },
+        })
         # 进化工具声明（<data>/tools/，AST+受限执行，随聊天实时扫描）
         for tname in _evolved_tool_names():
             mod = _load_evolved_tool(tname)
@@ -450,6 +921,14 @@ def execute(name, arguments, *, mode, source, confirm_cb=None, cwd=None, audit=N
         return _exec_download(args, source, confirm_cb, audit, mode)
     if name == "install_skill":
         return _exec_install(args, source, confirm_cb, audit, mode)
+    if name == "sandbox_read":
+        return _exec_sandbox_read(args, source, confirm_cb, audit, mode)
+    if name == "sandbox_write":
+        return _exec_sandbox_write(args, source, confirm_cb, audit, mode)
+    if name == "sandbox_list":
+        return _exec_sandbox_list(args, source, confirm_cb, audit, mode)
+    if name == "sandbox_run":
+        return _exec_sandbox_run(args, source, confirm_cb, audit, mode)
     # 进化工具（能力层自进化：<data>/tools/，AST+受限执行+ctx 原语白名单）
     if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
         mod = _load_evolved_tool(name)

@@ -10,8 +10,8 @@ tools.py 通过 re-export 保持旧引用兼容（agent / test_tools 直接 impo
 """
 
 import json
+import locale
 import os
-import shlex
 import subprocess
 from pathlib import Path
 
@@ -41,6 +41,19 @@ BASH_TIMEOUT = 15  # 秒
 BASH_MAX_OUTPUT = 4096  # 字符
 
 
+def run_process(argv, **kwargs):
+    """subprocess.run 封装：Windows 下隐藏子进程控制台窗口。
+
+    GUI 程序直接启动 powershell.exe / zhihu-cli.exe 等控制台程序时，
+    不带 CREATE_NO_WINDOW 会每次闪出黑窗口；这里统一处理。
+    """
+    if os.name == "nt":
+        kwargs.setdefault(
+            "creationflags", getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        )
+    return subprocess.run(argv, **kwargs)
+
+
 # ---------- 工作目录 ----------
 
 def resolve_workdir(cfg):
@@ -63,20 +76,27 @@ def _filter_env(env):
     }
 
 
-def run_bash(cmdline, cwd=None, timeout=BASH_TIMEOUT, max_output=BASH_MAX_OUTPUT):
-    """执行单条命令。不用 shell、shlex 解析参数、超时、输出截断、环境变量过滤。
+def run_bash(cmdline, cwd=None, timeout=BASH_TIMEOUT, max_output=BASH_MAX_OUTPUT, stdin=None):
+    """唯一 shell 执行引擎：Windows=PowerShell，POSIX=bash -c。
 
-    错误（超时/命令不存在/权限）统一转成文本返回，不向上抛异常。
+    完整 shell 语义（管道/重定向/脚本/任意可执行文件），环境变量过滤、
+    隐藏窗口、超时、输出截断；错误统一转成文本返回，不抛异常。
     """
-    parts = shlex.split(cmdline)
     env = _filter_env(os.environ.copy())
+    if os.name == "nt":
+        argv = ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmdline]
+        fallback_enc = locale.getpreferredencoding(False)
+    else:
+        argv = ["bash", "-c", cmdline]
+        fallback_enc = "utf-8"
     try:
-        proc = subprocess.run(
-            parts,
+        proc = run_process(
+            argv,
             shell=False,
             cwd=cwd,
             env=env,
             capture_output=True,
+            input=stdin,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
@@ -87,7 +107,11 @@ def run_bash(cmdline, cwd=None, timeout=BASH_TIMEOUT, max_output=BASH_MAX_OUTPUT
         return f"没有执行权限：{exc}"
     except OSError as exc:
         return f"执行失败：{exc}"
-    output = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
+    raw = proc.stdout + proc.stderr
+    try:
+        output = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        output = raw.decode(fallback_enc, errors="replace")
     output = output[:max_output]
     if output:
         return f"exit={proc.returncode}\n{output}"
@@ -108,4 +132,10 @@ def human_brief(name, arguments):
         return ("下载文件：" + str(args.get("url", "")))[:80]
     if name == "install_skill":
         return ("安装技能包：" + str(args.get("zip_path", "")))[:80]
+    if name == "skill_status":
+        return ("检查技能状态：" + str(args.get("name", "")))[:80]
+    if name == "skill_setup":
+        return ("初始化技能：" + str(args.get("name", "")))[:80]
+    if name == "skill_auth":
+        return ("配置技能认证：" + str(args.get("name", "")))[:80]
     return f"调用工具 {name}"[:80]

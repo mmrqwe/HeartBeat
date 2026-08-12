@@ -23,7 +23,7 @@ from gui.search_window import SearchWindow
 from gui.settings_window import SettingsWindow
 
 TICK_TIMEOUT_MS = 180_000
-CHAT_TIMEOUT_MS = 120_000
+CHAT_TIMEOUT_MS = 1_800_000  # 30 分钟：支持 100 轮工具循环的复杂任务
 
 
 class Bridge(QObject):

@@ -135,8 +135,10 @@ def test_run_sandboxed_replaces_hooked_import():
 
     calls = []
     orig = builtins.__import__
+    pre_existing_orig = getattr(builtins, "__orig_import__", None)
+    native = pre_existing_orig or orig
     old_safe = ts.SAFE_BUILTINS
-    builtins.__orig_import__ = orig
+    builtins.__orig_import__ = native
 
     def hooked(name, globals=None, locals=None, fromlist=(), level=0):
         calls.append(name)
@@ -152,7 +154,9 @@ def test_run_sandboxed_replaces_hooked_import():
     finally:
         builtins.__import__ = orig
         ts.SAFE_BUILTINS = old_safe
-        if hasattr(builtins, "__orig_import__"):
+        if pre_existing_orig is not None:
+            builtins.__orig_import__ = pre_existing_orig
+        else:
             del builtins.__orig_import__
 
 

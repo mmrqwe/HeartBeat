@@ -7,6 +7,7 @@
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -121,6 +122,22 @@ def _make_parser():
     )
     p_evolve.add_argument("module", choices=["memory", "planner", "brain", "tool"])
     p_evolve.add_argument("requirement", help="功能需求描述，如：每天上午9点提醒我喝水 / 查快递物流 / 升级 ping_check：支持超时参数")
+
+    p_skill = sub.add_parser("skill", help="技能包：下载 / 安装 / 查看 / 状态 / 初始化（如 zhihu-cli）")
+    skill_sub = p_skill.add_subparsers(dest="skill_cmd", required=True)
+    skill_sub.add_parser("list", help="列出已安装技能（SKILL.md 元数据）")
+    p_skill_dl = skill_sub.add_parser("download", help="下载技能包 zip 到 <数据目录>/downloads")
+    p_skill_dl.add_argument("url")
+    p_skill_dl.add_argument("--filename", default=None)
+    p_skill_install = skill_sub.add_parser("install", help="安装下载目录里的技能包 zip")
+    p_skill_install.add_argument("zip_path")
+    p_skill_status = skill_sub.add_parser("status", help="运行技能包状态检查（scripts/run.* status）")
+    p_skill_status.add_argument("name")
+    p_skill_setup = skill_sub.add_parser("setup", help="运行技能包安装脚本（scripts/setup.*）")
+    p_skill_setup.add_argument("name")
+    p_skill_auth = skill_sub.add_parser("auth", help="用 Access Secret 配置认证（stdin 输入，不回显）")
+    p_skill_auth.add_argument("name")
+    p_skill_auth.add_argument("--binary", default=None, help="CLI 可执行文件绝对路径（默认 %LOCALAPPDATA%\\ZhihuCLI\\current\\zhihu-cli.exe）")
     return parser
 
 
@@ -257,6 +274,9 @@ def _run(argv, default_config=None):
     if cmd == "evolve":
         return _evolve_cmd(args)
 
+    if cmd == "skill":
+        return _skill_cmd(args)
+
     print(f"unknown command: {cmd}")
     return 2
 
@@ -342,7 +362,7 @@ def _evolve_cmd(args):
         return 1
     try:
         version = ag.evolver.evolve(
-            args.module, args.requirement, on_status=lambda m: print(f"  • {m}")
+            args.module, args.requirement, on_status=lambda m: print("  -", m)
         )
     except ValueError as exc:
         print(f"进化失败：{exc}")
@@ -353,6 +373,86 @@ def _evolve_cmd(args):
         return 0
     print(f"进化成功：{args.module} -> {version}（已热加载生效）")
     return 0
+
+
+def _skill_auth(name, binary=None):
+    import tools as tools_mod
+
+    secret = sys.stdin.buffer.readline().decode("utf-8", errors="replace").strip()
+    if not secret:
+        print("Access Secret 为空。请通过 stdin 传入，例如：")
+        print(f'echo "<secret>" | python main.py --cli skill auth {name}')
+        return 1
+    rc, text = tools_mod.configure_skill_auth(name, secret, binary)
+    print(text)
+    return rc
+
+
+def _skill_cmd(args):
+    from kernel.permission import SOURCE_USER
+    import tools as tools_mod
+
+    if args.skill_cmd == "list":
+        skills_root = core.user_data_dir() / "skills"
+        found = False
+        if skills_root.is_dir():
+            for folder in sorted(skills_root.iterdir()):
+                md = folder / "SKILL.md"
+                if not md.is_file():
+                    continue
+                meta = core.parse_skill_frontmatter(
+                    md.read_text(encoding="utf-8", errors="replace")
+                )
+                name = meta.get("name") or folder.name
+                desc = meta.get("description", "")
+                print(f"{folder.name}: name={name} | desc={desc}")
+                found = True
+        if not found:
+            print("(no skills installed)")
+        return 0
+
+    if args.skill_cmd == "download":
+        payload = {"url": args.url}
+        if args.filename:
+            payload["filename"] = args.filename
+        result = tools_mod.execute(
+            "download_file", json.dumps(payload),
+            mode="full", source=SOURCE_USER, confirm_cb=lambda _desc: True,
+        )
+        print(result)
+        return 0 if "下载完成" in result else 1
+
+    if args.skill_cmd == "install":
+        result = tools_mod.execute(
+            "install_skill", json.dumps({"zip_path": args.zip_path}),
+            mode="full", source=SOURCE_USER, confirm_cb=lambda _desc: True,
+        )
+        print(result)
+        return 0 if "安装完成" in result else 1
+
+    if args.skill_cmd == "status":
+        import tools as tools_mod
+
+        rc, text = tools_mod.run_skill_script(
+            args.name, "run.ps1" if os.name == "nt" else "run.sh", ["status"]
+        )
+        print(text)
+        return rc
+
+    if args.skill_cmd == "setup":
+        import tools as tools_mod
+
+        rc, text = tools_mod.run_skill_script(
+            args.name, "setup.ps1" if os.name == "nt" else "setup.sh", []
+        )
+        print(text)
+        return rc
+
+    if args.skill_cmd == "auth":
+        return _skill_auth(args.name, args.binary)
+
+    print(f"unknown skill cmd: {args.skill_cmd}")
+    return 2
 
 
 def _probe(config_path=None, clean=False):
@@ -502,6 +602,12 @@ def _require(cond, msg):
 
 
 def run(argv, default_config=None):
+    if sys.platform == "win32":
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
     try:
         return _run(argv, default_config)
     except Exception as exc:

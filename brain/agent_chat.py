@@ -227,9 +227,11 @@ class ChatMixin:
         system, messages, budget = self._build_chat_messages(user_text)
         decls = tools.tool_declarations(self.cfg)
         use_stream = bool(on_delta) and self.cfg.get("stream", True)
+        max_rounds = int(self.cfg.get("tool_max_rounds", 100) or 100)
+        max_rounds = max(1, min(200, max_rounds))
         shown = ""        # 已推送给 UI 的可见文本（不含 [FACT]/[THINK]）
         pending_note = ""  # 工具执行状态行，追加在流式文本之后
-        for _ in range(4):
+        for _ in range(max_rounds):
             try:
                 if use_stream:
                     def cb(raw):
@@ -276,7 +278,29 @@ class ChatMixin:
                     "tool_call_id": call.get("id", ""),
                     "content": result,
                 })
-        return self._chat_llm(user_text)
+        # 达到轮次上限：保留全部工具结果，让模型做一次最终总结（不丢上下文）
+        return self._final_tool_reply(messages, budget)
+
+    def _final_tool_reply(self, messages, budget):
+        """工具轮次耗尽后的兜底：把 tool 结果转成 user 文本，带全上下文收尾。"""
+        final = []
+        for m in messages:
+            role = m.get("role")
+            if role == "tool":
+                final.append({
+                    "role": "user",
+                    "content": "工具返回：" + str(m.get("content", "")),
+                })
+            elif role == "assistant" and m.get("tool_calls"):
+                final.append({"role": "assistant", "content": m.get("content") or ""})
+            else:
+                final.append(m)
+        final.append({
+            "role": "user",
+            "content": "基于以上工具结果，请直接给主人最终答复；如果工具失败，请明确说明失败原因。",
+        })
+        reply = self._parse_agent_reply(self.brain.complete(final, max_tokens=budget))
+        return reply or "嗯嗯，我在听。"
 
     def _chat_llm_stream(self, user_text, on_delta):
         system, messages, budget = self._build_chat_messages(user_text)

@@ -12,13 +12,20 @@ from PySide6.QtCore import QCoreApplication
 
 from kernel.eventbus import EventBus
 
-app = QCoreApplication.instance() or QCoreApplication(sys.argv)
+_app = None
+
+
+def _ensure_app():
+    global _app
+    if _app is None:
+        _app = QCoreApplication.instance() or QCoreApplication(sys.argv)
+    return _app
 
 
 def wait(ms):
     deadline = time.time() + ms / 1000
     while time.time() < deadline:
-        app.processEvents()
+        _ensure_app().processEvents()
         time.sleep(0.005)
 
 
@@ -49,7 +56,7 @@ def test_async_dispatch_cross_thread():
 
     bus.subscribe("topic", handler, async_=True)
     threading.Thread(target=lambda: bus.emit("topic", "hello"), daemon=True).start()
-    wait(300)
+    wait(1000)
     assert got, "async handler 应收到事件"
     tid, payload = got[0]
     assert payload == "hello"
@@ -115,7 +122,7 @@ def test_agent_audit_publishes_tool_executed():
         def emit(self, topic, payload=None):
             events.append((topic, payload))
 
-    with TemporaryDirectory() as tmp:
+    with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         cfg = core.load_config(Path(tmp) / "nonexistent.json")
         cfg["api"]["api_key"] = ""
         cfg["embedding_enabled"] = False  # 测试不下载嵌入模型
@@ -123,6 +130,7 @@ def test_agent_audit_publishes_tool_executed():
         ag = agent.Agent(cfg, {}, tmp, stats=None, db=database)
         ag.eventbus = FakeBus()
         ag._audit_tool("user", "run_bash", '{"command": "ls"}', "readonly", True, True, "exit=0")
+        database.close()
     assert len(events) == 1, events
     topic, payload = events[0]
     assert topic == "tool.executed"

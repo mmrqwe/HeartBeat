@@ -264,6 +264,24 @@ def test_extract_success():
         assert (target / "zhihu" / "references" / "cli.md").read_text() == "cli doc"
 
 
+def test_extract_single_root_collapsed():
+    """官方 skill 包带单层顶层目录时，安装后剥掉该层，SKILL.md 直接可发现。"""
+    with TemporaryDirectory() as d:
+        z = _write_zip(Path(d) / "zhihu-cli-skill.zip", {
+            "zhihu/SKILL.md": b"# skill",
+            "zhihu/manifest.json": b'{"version":"0.2.1"}',
+            "zhihu/scripts/run.ps1": b"run",
+            "zhihu/references/cli.md": b"cli doc",
+        })
+        target, files = dl.extract_skill_zip(z, Path(d) / "skills")
+        assert target == (Path(d) / "skills" / "zhihu-cli-skill").resolve()
+        assert sorted(files) == [
+            "SKILL.md", "manifest.json", "references/cli.md", "scripts/run.ps1",
+        ]
+        assert (target / "SKILL.md").read_text() == "# skill"
+        assert (target / "scripts" / "run.ps1").read_text() == "run"
+
+
 def test_extract_not_zip():
     with TemporaryDirectory() as d:
         z = Path(d) / "fake.zip"

@@ -34,6 +34,7 @@ class Runtime(QObject):
         self._tasks = {}
         self._epochs = {}
         self._busy = set()
+        self._stopped = False
 
         self.task_done.connect(self._on_task_done)
         self.task_error.connect(self._on_task_error)
@@ -86,6 +87,8 @@ class Runtime(QObject):
 
     def schedule_next(self, name, interval_ms=None):
         """用任务间隔（或显式传入）重启单次定时器。"""
+        if self._stopped:
+            return
         spec = self._tasks.get(name)
         if not spec:
             return
@@ -96,7 +99,7 @@ class Runtime(QObject):
     def trigger(self, name, *args):
         """立即触发任务（同一任务忙碌时忽略）。返回是否真正启动。"""
         spec = self._tasks.get(name)
-        if not spec or name in self._busy:
+        if self._stopped or not spec or name in self._busy:
             return False
         self._epochs[name] += 1
         self._busy.add(name)
@@ -116,6 +119,8 @@ class Runtime(QObject):
         否则默认重排再触发。即使任务忙碌（trigger 返回 False）也要重排，
         保证周期任务不停摆。
         """
+        if self._stopped:
+            return
         spec = self._tasks.get(name)
         if not spec:
             return
@@ -131,6 +136,7 @@ class Runtime(QObject):
 
     def stop_all(self):
         """停止所有定时器与看门狗（不杀在途线程——daemon 随进程退出）。"""
+        self._stopped = True
         for spec in self._tasks.values():
             spec["timer"].stop()
             spec["watchdog"].stop()

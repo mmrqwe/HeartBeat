@@ -15,6 +15,11 @@ from datetime import timedelta
 
 FOLLOW_KEYWORDS = ("考试", "开会", "面试", "报告", "加班", "出差")
 
+_MEMORY_SECRET_MARKERS = (
+    "secret", "access secret", "api_key", "password", "passwd", "token",
+    "credential", "sk-", "密钥",
+)
+
 
 class MemoryModule:
     """记忆领域：事实提取、画像构建、记忆跟进、向量检索、日程解析。"""
@@ -95,6 +100,8 @@ class MemoryModule:
             (r"(?:我一般|我习惯|我每天)([^，。！？]{2,16}?(?:睡觉|起床|上班|下班|午休|睡))", "主人习惯：{}", "habit", 3),
             (r"我在([^，。！？]{2,16}?(?:上班|工作|上学|实习))", "主人在{}", "habit", 3),
             (r"(?:我|我最近|最近)(?:今天|昨晚|这两天|有点|总是|经常)?((?:熬夜|失眠|感冒|发烧|头疼|胃疼|过敏|嗓子疼)[^，。！？]{0,8})", "主人最近{}", "habit", 3),
+            (r"(?:请你|你|帮我)?(?:记住|记一下|记下来|记住一下|以后记得)(?:[：:，,]?\s*)(.{2,60})", "主人要求记住：{}", "misc", 3),
+            (r"(?:我希望你|你以后要|以后你)([^，。！？]{2,60})", "主人希望：{}", "preference", 3),
         ]
         for pattern, template, category, importance in rules:
             match = re.search(pattern, user_text)
@@ -130,6 +137,78 @@ class MemoryModule:
             self.extract_facts(row["text"])
         self.agent.state["fact_scan_id"] = rows[-1]["id"]
         self.agent._save_state()
+
+    # ---------- LLM 自主记忆分析（替代写死规则的主路径） ----------
+
+    _ANALYZER_SYSTEM = (
+        "你是记忆分析器。从对话中判断有没有值得长期记住的关于主人的事实。"
+        "值得记住的包括：身份、偏好、习惯、日程、资产/投资、宠物/家人、健康、工作学习等长期信息。"
+        "不要记：临时指令、一次性请求、客套话、网址、密钥/密码/Token/Access Secret。\n"
+        "只输出以下格式之一：\n"
+        "[FACT:类别] 一句事实（类别只能是 identity/preference/habit/schedule/finance/misc）\n"
+        "[NONE]\n"
+        "不要输出任何其他内容。"
+    )
+
+    @staticmethod
+    def _is_sensitive_fact(text):
+        low = text.lower()
+        return any(m in low for m in _MEMORY_SECRET_MARKERS)
+
+    def analyze_and_remember(self, user_text, reply=""):
+        """让 LLM 自己判断这段对话有没有值得记住的事实，并入库。
+
+        返回新记住的条数。任何异常都静默降级，不影响聊天主流程。
+        """
+        brain = getattr(self.agent, "brain", None)
+        cfg = getattr(self.agent, "cfg", {}) or {}
+        if brain is None or not (cfg.get("api") or {}).get("api_key"):
+            return 0
+        try:
+            content = "主人说：" + (user_text or "")
+            if reply:
+                content += "\n桌宠回：" + reply
+            raw = brain.complete(
+                [
+                    {"role": "system", "content": self._ANALYZER_SYSTEM},
+                    {"role": "user", "content": content},
+                ],
+                max_tokens=200,
+            ) or ""
+        except Exception:
+            return 0
+        existing = {i["text"] for i in self.agent.memory.facts()}
+        saved = 0
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("[FACT"):
+                continue
+            category = "misc"
+            fact = line[len("[FACT"):].strip()
+            if fact.startswith(":"):
+                end = fact.find("]")
+                if end > 0:
+                    category = fact[1:end].strip()
+                    fact = fact[end + 1:].strip()
+            elif fact.startswith("]"):
+                fact = fact[1:].strip()
+            if not fact or fact in existing or self._is_sensitive_fact(fact):
+                continue
+            if category not in ("identity", "preference", "habit", "schedule", "finance", "misc"):
+                category = "misc"
+            self.remember(
+                "fact",
+                fact,
+                category=category,
+                importance=3,
+                source="chat",
+                expires_at=self.parse_schedule_expiry(fact) if category == "schedule" else None,
+            )
+            if self.agent.stats:
+                self.agent.stats.record_fact()
+            existing.add(fact)
+            saved += 1
+        return saved
 
     # ---------- 记忆跟进 ----------
 

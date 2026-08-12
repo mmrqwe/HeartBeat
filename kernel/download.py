@@ -215,6 +215,22 @@ def _validate_members(infos):
     return clean
 
 
+def _collapse_root(infos):
+    """若 zip 所有文件都在同一个顶层目录，返回该目录名（安装时剥掉一层）。
+
+    官方 skill 包（如 zhihu-cli-skill）常带一个顶层目录；应用内技能扫描器
+    按 <skills>/<包名>/SKILL.md 发现技能，剥掉这层才能“安装即生效”。
+    """
+    tops = set()
+    for info in infos:
+        norm = info.filename.replace("\\", "/")
+        parts = [p for p in norm.split("/") if p not in ("", ".")]
+        if len(parts) <= 1:
+            return None  # 根目录有文件，不能剥
+        tops.add(parts[0])
+    return next(iter(tops)) if len(tops) == 1 else None
+
+
 def extract_skill_zip(zip_path, dest_dir):
     """把技能包 zip 解压到 dest_dir/<zip 文件名去扩展名>/。
 
@@ -238,6 +254,8 @@ def extract_skill_zip(zip_path, dest_dir):
         raise DownloadError(f"zip 打开失败：{exc}")
     with zf:
         clean = _validate_members(zf.infolist())
+        strip_root = _collapse_root(clean)
+        prefix = (strip_root + "/") if strip_root else ""
         dest = Path(dest_dir)
         target = dest / zip_path.stem
         try:
@@ -254,6 +272,8 @@ def extract_skill_zip(zip_path, dest_dir):
         try:
             for info in clean:
                 rel = info.filename.replace("\\", "/")
+                if prefix and rel.startswith(prefix):
+                    rel = rel[len(prefix):]
                 out = target / rel
                 # 纵深防御：前面已过滤绝对/穿越条目，这里再按真实路径校验一次
                 if not out.resolve().is_relative_to(target.resolve()):
@@ -262,6 +282,15 @@ def extract_skill_zip(zip_path, dest_dir):
                 with zf.open(info) as src, open(out, "wb") as dst:
                     shutil.copyfileobj(src, dst, length=_CHUNK)
                 extracted.append(rel)
+            if os.name == "nt":
+                # Windows PowerShell 5.1 按 ANSI 读取无 BOM 的 .ps1，
+                # UTF-8 中文注释会导致解析失败；安装时统一补 BOM。
+                for rel in extracted:
+                    if rel.lower().endswith(".ps1"):
+                        p = target / rel
+                        raw = p.read_bytes()
+                        if not raw.startswith(b"\xef\xbb\xbf") and any(b >= 0x80 for b in raw):
+                            p.write_bytes(b"\xef\xbb\xbf" + raw)
         except DownloadError:
             raise
         except (OSError, zipfile.BadZipFile) as exc:

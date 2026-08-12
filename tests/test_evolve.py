@@ -241,6 +241,77 @@ def test_evolve_tool_prompt_mentions_primitives(tmp_path):
     ev = _make_evolver(tmp_path, FakeBrain([]))
     text = ev._tool_prompt("查快递")[0]["content"]
     assert "ctx.web_search" in text and "禁止 import" in text and "TOOL_NAME" in text
+    assert "ctx.skill_status" in text and "ctx.skill_setup" in text and "ctx.skill_auth" in text
+    assert "ctx.skill_exec" in text
+    assert "ctx.sandbox_read" in text and "ctx.sandbox_write" in text
+    assert "ctx.sandbox_list" in text and "ctx.sandbox_run" in text
+
+
+def test_evolve_tool_skill_lifecycle(tmp_path, monkeypatch):
+    """自升级验证：程序自己生成技能管理工具（只用 ctx.skill_* 原语），
+    不修改任何源码，安装后即可通过 tools.execute 使用。"""
+    import json
+
+    import tools as tools_mod
+    from kernel.permission import SOURCE_USER
+
+    src = '''\
+TOOL_NAME = "zhihu_cli"
+TOOL_DESCRIPTION = "管理知乎技能：状态检查 / 初始化 / 认证"
+TOOL_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": ["status", "setup", "auth"]},
+        "name": {"type": "string"},
+        "secret": {"type": "string"},
+    },
+    "required": ["action", "name"],
+}
+
+
+def handler(args, ctx):
+    action = str(args.get("action", "")).strip()
+    name = str(args.get("name", "") or "zhihu").strip()
+    if action == "status":
+        return ctx.skill_status(name)
+    if action == "setup":
+        return ctx.skill_setup(name)
+    if action == "auth":
+        return ctx.skill_auth(name, str(args.get("secret", "")).strip())
+    return "未知 action: " + action
+'''
+    fake = FakeBrain(["```python\n" + src + "\n```"])
+    ev = _make_evolver(tmp_path, fake)
+    result = ev.evolve("tool", "给 zhihu 技能增加管理工具：状态检查/初始化/认证")
+    assert result == "zhihu_cli@v0.1"
+    assert ev.updater.list_tools() == ["zhihu_cli"]
+
+    # 模拟真实技能目录（含 scripts），并让 tools 从 updater 的 tools 目录发现新工具
+    skills = tmp_path / "skills"
+    (skills / "zhihu" / "scripts").mkdir(parents=True)
+    (skills / "zhihu" / "SKILL.md").write_text(
+        "---\nname: zhihu\ndescription: 测试\n---\n", encoding="utf-8"
+    )
+    (skills / "zhihu" / "scripts" / "run.ps1").write_text(
+        'Write-Output "EVOLVED-STATUS"\n', encoding="utf-8"
+    )
+    (skills / "zhihu" / "scripts" / "run.sh").write_text(
+        '#!/bin/sh\necho EVOLVED-STATUS\n', encoding="utf-8"
+    )
+    (skills / "zhihu" / "scripts" / "setup.ps1").write_text(
+        'Write-Output "EVOLVED-SETUP"\n', encoding="utf-8"
+    )
+    (skills / "zhihu" / "scripts" / "setup.sh").write_text(
+        '#!/bin/sh\necho EVOLVED-SETUP\n', encoding="utf-8"
+    )
+
+    monkeypatch.setattr(tools_mod, "_skills_dir", lambda: skills)
+    monkeypatch.setattr(tools_mod, "_tools_dir", lambda: ev.updater.root.parent / "tools")
+    out = tools_mod.execute(
+        "zhihu_cli", json.dumps({"action": "status", "name": "zhihu"}),
+        mode="confirm", source=SOURCE_USER, confirm_cb=lambda _d: True,
+    )
+    assert "EVOLVED-STATUS" in out
 
 
 def test_extract_code_variants(tmp_path):

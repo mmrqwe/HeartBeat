@@ -85,7 +85,14 @@ def _ensure_bundled_model(cache):
             if dst.exists():
                 continue  # 已有（上次注入/用户自行放置）：不动
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(entry, dst)
+            try:
+                # HF 缓存 snapshots 是指向 blobs 的符号链接：保留链接可避免体积翻倍
+                shutil.copytree(entry, dst, symlinks=True)
+            except OSError:
+                # Windows 无符号链接权限时降级为实体复制（占用约 2 倍，仍离线可用）
+                if dst.exists():
+                    shutil.rmtree(dst, ignore_errors=True)
+                shutil.copytree(entry, dst, symlinks=False)
             logger.info("已从包内注入嵌入模型 %s → %s", entry.name, dst)
     except Exception:
         # 磁盘满/权限问题等：不阻断启动，fastembed 回退联网下载

@@ -20,12 +20,11 @@ if errorlevel 1 goto :fail
 echo [2/3] 打包 exe...
 %PY% -m PyInstaller --noconfirm --clean --workpath "%LOCALAPPDATA%\Temp\HeartBeat-build" --distpath "%~dp0dist" HeartBeat.spec
 if errorlevel 1 goto :fail
-if exist "%~dp0models\fast-bge-small-zh-v1.5" xcopy /e /i /y "%~dp0models\fast-bge-small-zh-v1.5" "%~dp0dist\models\fast-bge-small-zh-v1.5" >nul
-if not exist "%~dp0dist\HeartBeat.exe" goto :fail
+if not exist "%~dp0dist\HeartBeat\HeartBeat.exe" goto :fail
 echo [3/3] 校验完成...
 echo.
-echo 构建完成: %~dp0dist\HeartBeat.exe
-echo 运行后 exe 旁边会自动生成 config.json，也可以放 plugins\ 扩展内容源。
+echo 构建完成: %~dp0dist\HeartBeat\HeartBeat.exe
+echo 首次运行会在用户数据目录（%%APPDATA%%\HeartBeat）自动生成 config.json，也可以放 plugins\ 扩展内容源。
 pause
 exit /b 0
 
