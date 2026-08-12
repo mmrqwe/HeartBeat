@@ -50,6 +50,8 @@ _CODE_FENCE = re.compile(r"`{3,}(?:python|py|python3)?\s*(.*?)`{3,}", re.DOTALL)
 _REQUIREMENT_RE = re.compile(r"[：:，,。！!？?\s]+$")
 # 工具升级语法："升级 <工具名>：需求"（工具名必须已安装）
 _UPGRADE_RE = re.compile(r"^升级\s*([A-Za-z_][A-Za-z0-9_]*)[：:，,]?\s*(.*)$")
+# 技能需求检测：涉及已安装技能时强制要求 ctx.skill_* 原语
+_SKILL_REQ_RE = re.compile(r"技能|skill|zhihu|知乎|热榜|直答", re.IGNORECASE)
 
 
 class Evolver:
@@ -401,7 +403,13 @@ class Evolver:
             "4. 禁止访问任何下划线开头的属性（__class__/__globals__/__builtins__ 等）；\n"
             "5. 网络、文件、命令只能通过 ctx 原语，可用原语：\n" + prims + "\n"
             "6. handler 必须稳健：异常用 try/except 包裹后返回中文错误文本；\n"
-            "7. 只输出纯 Python 源码（```python 围栏包裹），不要任何解释文字。"
+            "7. 只输出纯 Python 源码（```python 围栏包裹），不要任何解释文字。\n"
+            "8. 技能硬性要求：若需求涉及已安装技能（如 zhihu），必须通过 ctx.skill_status/"
+            "ctx.skill_setup/ctx.skill_auth/ctx.skill_exec 访问真实技能 CLI；"
+            "禁止用模块级变量模拟技能状态（技能状态以 skill_status 返回为准，每次调用都是真实操作）；"
+            "禁止用 ctx.web_search 代替技能自身的搜索/热榜/直答能力；"
+            "skill_exec 的 args 必须是字符串列表，如 ['search', 'zhihu', '--query', '关键词', '--count', '5']，"
+            "command 用 --help 无法确认时按上面示例格式调用。"
         )
         if upgrade_of:
             system += (
@@ -485,6 +493,16 @@ class Evolver:
             candidate_dir.mkdir(parents=True, exist_ok=True)
             (candidate_dir / "tool.py").write_text(code, encoding="utf-8")
             try:
+                # 技能需求强制走 ctx.skill_* 原语（防 LLM 用 web_search/run_bash/假状态模拟技能）
+                if _SKILL_REQ_RE.search(requirement) and "ctx.skill_" not in code:
+                    feedback = (
+                        "需求涉及已安装技能（技能/skill/zhihu/知乎等），但生成代码没有使用任何 "
+                        "ctx.skill_* 原语（ctx.skill_status / ctx.skill_setup / ctx.skill_auth / "
+                        "ctx.skill_exec）。必须通过 ctx.skill_exec(name, args) 调用技能真实 CLI "
+                        "（args 为字符串列表，如 ['search', 'zhihu', '--query', '关键词', '--count', '5']）；"
+                        "禁止用 ctx.web_search / ctx.run_bash / 模块级变量状态模拟技能功能。"
+                    )
+                    continue
                 status("运行验证（受限加载/契约/AST 安全/冒烟）…")
                 ok, v_errors = self.updater.validate_candidate(
                     "tool", candidate_dir, upgrade_of=upgrade_of

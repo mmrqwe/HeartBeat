@@ -393,15 +393,25 @@ class HeartBeatApp:
         """主线程槽：弹窗显示命令全文，用户允许/拒绝。"""
         try:
             box = QMessageBox(None)
-            box.setWindowTitle("桌宠请求执行命令")
-            box.setText(
-                f"桌宠想在你的电脑上执行：\n\n{cmdline}\n\n"
-                "请确认这是你要求的操作。点「否」或等待超时都会取消执行。"
-            )
+            box.setWindowTitle("桌宠请求确认")
+            is_auth = "skill_auth" in cmdline or "认证" in cmdline
+            if is_auth:
+                box.setText(
+                    f"桌宠要配置技能认证（如知乎），这不是危险操作，"
+                    f"请点「是」允许完成配置：\n\n{cmdline}\n\n"
+                    "点「是」= 允许；点「否」或等待超时 = 取消。"
+                )
+            else:
+                box.setText(
+                    f"桌宠想在你的电脑上执行：\n\n{cmdline}\n\n"
+                    "请确认这是你要求的操作。点「否」或等待超时都会取消执行。"
+                )
             box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
             box.setDefaultButton(QMessageBox.No)
             # 桌宠是菜单栏应用（无 Dock 图标），弹窗必须置顶才能被用户看到
             box.setWindowFlags(box.windowFlags() | Qt.WindowStaysOnTopHint)
+            # 认证配置是用户主动发起的操作：允许后不重复打扰，超时更宽松
+            box.setWindowModality(Qt.WindowModal)
             answer = box.exec()
             holder["approved"] = answer == QMessageBox.Yes
         except Exception:

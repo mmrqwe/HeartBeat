@@ -443,7 +443,26 @@ def test_evolve_brain_rejects_unknown_target(tmp_path):
     assert ev.updater.active_version("brain") == "v1.0"
 
 
+class _Patch:
+    """迷你 monkeypatch：记录 setattr 并在 restore 时还原（供 runner 传参）。"""
+
+    def __init__(self):
+        self._saved = []
+
+    def setattr(self, target, name, value):
+        self._saved.append((target, name, getattr(target, name, None)))
+        setattr(target, name, value)
+
+    def restore(self):
+        for target, name, old in reversed(self._saved):
+            if old is None and hasattr(target, name):
+                delattr(target, name)
+            else:
+                setattr(target, name, old)
+
+
 if __name__ == "__main__":
+    import inspect
     import tempfile
     import traceback
 
@@ -451,12 +470,19 @@ if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
             tmp = tempfile.mkdtemp(prefix="evolve_test_")
+            patch = _Patch()
             try:
-                fn(Path(tmp))
+                params = list(inspect.signature(fn).parameters)
+                if "monkeypatch" in params:
+                    fn(Path(tmp), patch)
+                else:
+                    fn(Path(tmp))
                 print(f"PASS {name}")
             except Exception:
                 failed += 1
                 print(f"FAIL {name}")
                 traceback.print_exc()
+            finally:
+                patch.restore()
     print("ALL TESTS PASSED" if failed == 0 else f"{failed} FAILED")
     sys.exit(1 if failed else 0)

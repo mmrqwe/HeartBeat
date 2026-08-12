@@ -120,11 +120,13 @@ def classify(cmdline, mode, source):
         return AUTO, ""
     if not has_meta and cmd in WRITE_COMMANDS:
         return _write_decision(f"写命令：{cmd}", mode, source)
-    # 复合命令 / 未知命令：用户在场可确认，不再硬拒
+    # 复合命令 / 未知命令：confirm 档用户在场可确认；full 档自动放行（与写命令一致）
     if source == SOURCE_AUTO:
         return REJECT, "自主触发不允许执行非只读命令"
     if mode == SHELL_MODE_READONLY:
         return REJECT, "readonly 档只允许只读命令"
+    if mode == SHELL_MODE_FULL:
+        return AUTO, ""  # full 档：用户已显式授权，不弹确认
     return CONFIRM, ("复合命令，需确认" if has_meta else f"未授权命令：{cmd}")
 
 
