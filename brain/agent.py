@@ -453,3 +453,24 @@ class Agent(ChatMixin, ThinkMixin):
     def _extract_facts_rule(self, user_text):
         """规则事实提取（委托 brain.memory）。"""
         return self.memory_module.extract_facts(user_text)
+
+    # ---------- Coding 协作（P0：同步循环） ----------
+
+    def coding_task(self, user_text, on_status=None, on_delta=None, max_rounds=None):
+        """Coding 模式入口：在 project_dir 项目内完成编程任务。
+
+        安全基座在 kernel（pathguard/processpool/权限判定），控制循环在
+        brain.coding_agent（策略层）。工具以 SOURCE_USER 执行——写操作
+        走 confirm 档用户确认，与聊天路径的 confirm_cb 共用同一弹窗。
+        """
+        # 绝对导入（与 Evolver 同理）：brain 包化安装时包内只有控制流
+        # 四件套，coding_agent 始终来自宿主源码——宿主缺失时会直接报错。
+        from brain.coding_agent import run_coding_task
+
+        def run(name, arguments):
+            return self._run_tool(name, arguments, source=tools.SOURCE_USER)
+
+        return run_coding_task(
+            self.brain, self.cfg, user_text, run,
+            on_status=on_status, on_delta=on_delta, max_rounds=max_rounds,
+        )

@@ -73,6 +73,8 @@ class ChatWindow(QWidget):
         self._streaming = False
         self._think_dots = 0
         self._think_timer = None
+        self.coding_mode = False
+        self.coding_status_label = None
 
         self.setWindowTitle(f"和{pet_name}聊天")
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
@@ -99,13 +101,24 @@ class ChatWindow(QWidget):
         self.stats_label.setObjectName("Hint")
         clear_btn = QPushButton("清空记录")
         clear_btn.clicked.connect(self._confirm_clear)
+        self.coding_btn = QPushButton("🔨 编码")
+        self.coding_btn.setCheckable(True)
+        self.coding_btn.setToolTip("开启后，消息将作为编程任务在项目目录里执行")
+        self.coding_btn.toggled.connect(self._on_coding_toggled)
         row1.addWidget(name_label)
         row1.addWidget(self.status_label)
         row1.addStretch(1)
+        row1.addWidget(self.coding_btn)
         row1.addWidget(clear_btn)
         header_layout.addLayout(row1)
         header_layout.addWidget(self.stats_label)
         root.addWidget(header)
+
+        self.coding_status_label = QLabel("")
+        self.coding_status_label.setObjectName("CodingStatus")
+        self.coding_status_label.setWordWrap(True)
+        self.coding_status_label.hide()
+        root.addWidget(self.coding_status_label)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -303,6 +316,32 @@ class ChatWindow(QWidget):
         self.add_message("user", text)
         self.set_thinking(True)
         self.on_send(text)
+
+    def _on_coding_toggled(self, checked):
+        self.coding_mode = bool(checked)
+        self.coding_btn.setText("🔨 编码中" if checked else "🔨 编码")
+        if checked:
+            self.set_coding_status(
+                "编码模式已开启：下一条消息将作为编程任务执行。"
+                "请在设置里确认项目目录（project_dir）。"
+            )
+        else:
+            self.set_coding_status("")
+        self.input_text.setPlaceholderText(
+            "描述要完成的编程任务…（Enter 发送）"
+            if checked
+            else "说点什么…（Enter 发送 / Shift+Enter 换行）"
+        )
+
+    def set_coding_status(self, text):
+        """编码任务状态行（步骤进度 / 完成提示）；空文本隐藏。"""
+        if self.coding_status_label is None:
+            return
+        if text:
+            self.coding_status_label.setText(text)
+            self.coding_status_label.show()
+        else:
+            self.coding_status_label.hide()
 
     def set_thinking(self, on):
         if on:

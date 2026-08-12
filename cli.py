@@ -34,6 +34,10 @@ def _load(config_path=None):
     cfg = core.load_config(cfg_path)
     # 数据目录统一 user_data_dir（GUI Kernel 同源）；config 路径可 --config 自定义
     data_dir = core.user_data_dir()
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)  # 隔离 HOME 首跑时目录可能不存在
+    except OSError:
+        pass
     database = db.Database(data_dir / "heartbeat.db")
     stats = core.Stats(database)
     plugins = core.discover_plugins()
@@ -71,6 +75,14 @@ def _make_parser():
     p_chat = sub.add_parser("chat", help="和桌宠对话（走真实 LLM 配置）")
     p_chat.add_argument("text", help="用户说的话")
     p_chat.add_argument("--no-stream", action="store_true", help="关闭流式输出")
+
+    p_coding = sub.add_parser(
+        "coding", help="Coding 模式：在 project_dir 项目内完成编程任务"
+    )
+    p_coding.add_argument("request", help="编程需求描述")
+    p_coding.add_argument("--project-dir", default=None, help="临时覆盖项目目录")
+    p_coding.add_argument("--mode", default=None, choices=["off", "readonly", "confirm", "full"],
+                          help="临时覆盖工具档位（CLI 无弹窗，写操作建议 full）")
 
     sub.add_parser("tick", help="跑一次完整生活循环（采集 + 主动思考）")
 
@@ -206,6 +218,9 @@ def _run(argv, default_config=None):
         print(f"elapsed: {time.time() - t0:.2f}s")
         return 0
 
+    if cmd == "coding":
+        return _coding_cmd(args)
+
     if cmd == "tick":
         _, cfg, _, stats, plugins, ag = _load(config)
         t0 = time.time()
@@ -292,6 +307,27 @@ def _run(argv, default_config=None):
 
     print(f"unknown command: {cmd}")
     return 2
+
+
+def _coding_cmd(args):
+    """CLI Coding 模式：真实 LLM + 真实工具循环（CLI 无弹窗，写操作建议 --mode full）。"""
+    _, cfg, _, _, _, ag = _load(args.config)
+    if args.project_dir:
+        cfg["project_dir"] = args.project_dir
+    if args.mode:
+        cfg["shell_tools_mode"] = args.mode
+    if not str(cfg.get("project_dir", "") or "").strip():
+        print("未配置 project_dir。用 --project-dir 指定项目目录。")
+        return 1
+    t0 = time.time()
+
+    def on_status(text):
+        print("  " + text, flush=True)
+
+    reply = ag.coding_task(args.request, on_status=on_status)
+    print("reply:", reply)
+    print(f"elapsed: {time.time() - t0:.2f}s")
+    return 0
 
 
 def _memory_cmd(config, args):

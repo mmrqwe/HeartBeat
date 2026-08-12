@@ -634,7 +634,13 @@ def test_migrate_keeps_higher_independent_version(tmp_path):
     _write_legacy_package(tmp_path)
     mem_v11 = Path(tmp_path) / "brain" / "memory" / "v1.1"
     mem_v11.mkdir(parents=True, exist_ok=True)
-    (mem_v11 / "memory.py").write_text("# v1.1 用户进化版\n", encoding="utf-8")
+    # v1.1 必须是可加载的真实模块（启动预检会加载 active；纯注释桩会被
+    # 判为损坏并回滚重建 v1.0——那是另一条防损坏路径，不是本测试意图）
+    (mem_v11 / "memory.py").write_text(
+        "# v1.1 用户进化版\n"
+        + (ROOT / "brain" / "memory.py").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
     (Path(tmp_path) / "brain" / "memory" / "active").write_text("v1.1\n", encoding="utf-8")
     upd = Updater(tmp_path)
     upd.ensure_installed()

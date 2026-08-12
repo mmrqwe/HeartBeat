@@ -138,4 +138,22 @@ def human_brief(name, arguments):
         return ("初始化技能：" + str(args.get("name", "")))[:80]
     if name == "skill_auth":
         return ("配置技能认证：" + str(args.get("name", "")))[:80]
+    if name == "read_file":
+        return ("读取文件：" + str(args.get("path", "")))[:80]
+    if name == "list_files":
+        return ("查看目录：" + str(args.get("path", ".")))[:80]
+    if name == "search_files":
+        return ("搜索代码：" + str(args.get("pattern", "")))[:80]
+    if name == "glob_match":
+        return ("匹配文件：" + str(args.get("pattern", "")))[:80]
+    if name == "write_file":
+        return ("写入文件：" + str(args.get("path", "")))[:80]
+    if name == "edit_file":
+        return ("编辑文件：" + str(args.get("path", "")))[:80]
+    if name == "bg_exec":
+        return ("后台执行：" + str(args.get("command", "")))[:80]
+    if name == "bg_check":
+        return ("检查后台任务：" + str(args.get("task_id", "")))[:80]
+    if name == "bg_cancel":
+        return ("取消后台任务：" + str(args.get("task_id", "")))[:80]
     return f"调用工具 {name}"[:80]

@@ -32,6 +32,7 @@ DEFAULT_CONFIG = {
     "tools_enabled": True,
     "shell_tools_mode": "confirm",
     "shell_workdir": "",
+    "project_dir": "",  # Coding 协作项目根目录（文件工具/后台命令的边界）
     "memory_cap": 500,
     "max_context_tokens": 400000,
     "context_compress_ratio": 0.75,

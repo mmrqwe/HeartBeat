@@ -51,6 +51,42 @@ def _make_app():
     return tmp, hb, orig_gather
 
 
+def test_coding_task_registered_and_routed():
+    """coding 运行时任务注册 + 编码模式消息路由（无 project_dir → 立即返回提示）。"""
+    tmp, hb, orig_gather = _make_app()
+    try:
+        rt = hb.kernel.runtime
+        assert "coding" in rt._tasks, "coding 任务未注册"
+
+        class _Stub:
+            coding_mode = True
+            received = []
+
+            def add_message(self, role, text, time_str=None):
+                self.received.append((role, text))
+
+            def set_thinking(self, on):
+                pass
+
+            def set_coding_status(self, text):
+                pass
+
+        hb.chat_win = _Stub()
+        hb._send_chat("帮我把代码改一下")
+        # 编码模式下消息走 coding 任务：忙碌或已完成（任务体很快返回）
+        deadline = time.time() + 3
+        while time.time() < deadline and rt.is_busy("coding"):
+            wait(50)
+        assert any("项目目录" in text for _, text in hb.chat_win.received), (
+            f"应提示配置项目目录，实际：{hb.chat_win.received}"
+        )
+        assert not rt.is_busy("coding")
+    finally:
+        hb.kernel.stop()
+        tmp.cleanup()
+        core.gather = orig_gather
+
+
 def test_tick_lifecycle():
     """一次完整 tick：触发 → 忙碌 + 状态 → 完成复位 + 结果提示。"""
     tmp, hb, orig_gather = _make_app()

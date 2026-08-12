@@ -27,6 +27,7 @@ from kernel.embedqueue import EmbedQueue
 
 TICK_TIMEOUT_MS = 180_000
 CHAT_TIMEOUT_MS = 1_800_000  # 30 分钟：支持 100 轮工具循环的复杂任务
+CODING_TIMEOUT_MS = 2_700_000  # 45 分钟：Coding 任务（含后台构建/测试轮询）
 
 
 class Bridge(QObject):
@@ -42,6 +43,8 @@ class Bridge(QObject):
     evolve_status = Signal(str)
     # 主动打招呼回复（后台线程生成 → 主线程气泡）
     greet_reply = Signal(str)
+    # Coding 任务步骤进度（agent 子线程 → 主线程状态行）
+    coding_status = Signal(str)
     # 工具确认：cmdline, event, result_holder（子线程 emit 后阻塞等 event）
     tool_confirm = Signal(str, object, object)
 
@@ -84,6 +87,7 @@ class HeartBeatApp:
         self.bridge.status.connect(self._set_status)
         self.bridge.evolve_status.connect(self._on_evolve_status)
         self.bridge.greet_reply.connect(self._show_greet_reply)
+        self.bridge.coding_status.connect(self._on_coding_status)
         self.bridge.tool_confirm.connect(self._on_tool_confirm)
         self._setup_runtime()
         # 注入工具确认回调：confirm 档写命令由主线程弹窗决定（60s 超时拒绝）
@@ -109,6 +113,7 @@ class HeartBeatApp:
         self.settings_win = None
         self.search_win = None
         self._chat_pending = []
+        self._coding_pending = []
 
         self.pet.show()
 
@@ -312,6 +317,14 @@ class HeartBeatApp:
             on_error=self._chat_error,
             on_timeout=self._chat_timeout,
         )
+        self.kernel.runtime.add_task(
+            "coding",
+            timeout_ms=CODING_TIMEOUT_MS,
+            work=self._coding_work,
+            on_result=self._show_coding_reply,
+            on_error=self._coding_error,
+            on_timeout=self._coding_timeout,
+        )
         # 启动后 15 秒首次主动思考
         QTimer.singleShot(15_000, self._autonomy_tick)
 
@@ -478,6 +491,11 @@ class HeartBeatApp:
 
     def _send_chat(self, text):
         self.pet.play("think")
+        if self.chat_win is not None and self.chat_win.coding_mode:
+            if not self.kernel.runtime.trigger("coding", text):
+                self._coding_pending.append(text)
+                self._set_status("编码任务还在执行，已排队")
+            return
         if not self.kernel.runtime.trigger("chat", text):
             self._chat_pending.append(text)
             self._set_status("上一条还在回复中，已排队")
@@ -538,6 +556,75 @@ class HeartBeatApp:
         self.pet.play("talk", 1600)
         preview = text if len(text) <= 16 else text[:15] + "…"
         self._set_status(preview)
+
+    # ---------- Coding 模式（平行路径：见 brain/coding_agent.py） ----------
+
+    def _coding_work(self, epoch, text):
+        """编码任务体（子线程执行）：coding 循环 + 步骤状态回传。"""
+        trace = f"coding_{uuid.uuid4().hex[:8]}"
+        self.agent._trace_id = trace
+        self.db.log_event(
+            db.EventType.CHAT_STARTED, "main.coding", {"text_len": len(text)}, trace,
+        )
+        t0 = time.time()
+        try:
+            return self.agent.coding_task(
+                text,
+                on_status=self.bridge.coding_status.emit,
+            )
+        finally:
+            self.db.log_event(
+                db.EventType.CHAT_FINISHED, "main.coding",
+                {"elapsed_ms": int((time.time() - t0) * 1000)}, trace,
+            )
+
+    def _on_coding_status(self, text):
+        """编码任务步骤进度（agent 子线程 → 主线程）：聊天窗状态行。"""
+        if self.chat_win:
+            self.chat_win.set_coding_status(text)
+        preview = text if len(text) <= 16 else text[:15] + "…"
+        self._set_status(preview)
+
+    def _show_coding_reply(self, reply):
+        """编码任务完成（主线程回调，runtime 已过滤过期 epoch）。"""
+        self.pet.play("talk", 1600)
+        if self.chat_win:
+            self.chat_win.add_message("assistant", reply)
+            self.chat_win.set_thinking(False)
+            self.chat_win.set_coding_status("任务完成")
+        self._set_status("编码任务完成")
+        self._drain_coding_pending()
+
+    def _coding_timeout(self):
+        self._set_status("编码任务超时，已停止等待")
+        if self.chat_win:
+            self.chat_win.set_thinking(False)
+            self.chat_win.set_coding_status("任务超时")
+            self.chat_win.add_message(
+                "system",
+                f"{time.strftime('%H:%M')} 编码任务超时（45 分钟）。"
+                "后台进程已按超时强杀；文件修改都有备份。",
+            )
+        self._drain_coding_pending()
+
+    def _coding_error(self, error):
+        stamp = time.strftime("%H:%M")
+        text = f"{stamp} 编码任务失败：{error}"
+        self._set_status("编码任务失败")
+        if self.chat_win:
+            self.chat_win.set_thinking(False)
+            self.chat_win.set_coding_status("任务失败")
+            self.chat_win.add_message("system", text)
+        self._drain_coding_pending()
+
+    def _drain_coding_pending(self):
+        """coding 空闲后取出排队任务（FIFO）。"""
+        if not self._coding_pending:
+            return
+        text = self._coding_pending[0]
+        if self.kernel.runtime.trigger("coding", text):
+            self._coding_pending.pop(0)
+            self.pet.play("think")
 
     def _chat_timeout(self):
         self._set_status("回复超时，已停止等待")

@@ -188,7 +188,29 @@ class SettingsWindow(QDialog):
         )
         self._basic["shell_workdir"].setPlaceholderText("留空 = 用户主目录")
         form.addRow("Shell 工作目录", self._basic["shell_workdir"])
+
+        self._basic["project_dir"] = QLineEdit(
+            str(self.cfg.get("project_dir", "") or "")
+        )
+        self._basic["project_dir"].setPlaceholderText("留空 = 未启用编码模式")
+        project_row = QWidget()
+        project_layout = QHBoxLayout(project_row)
+        project_layout.setContentsMargins(0, 0, 0, 0)
+        project_layout.addWidget(self._basic["project_dir"], 1)
+        browse_btn = QPushButton("浏览…")
+        browse_btn.clicked.connect(self._browse_project_dir)
+        project_layout.addWidget(browse_btn)
+        form.addRow("编码项目目录（coding 文件读写边界）", project_row)
         return self._wrap_scroll(tab)
+
+    def _browse_project_dir(self):
+        current = str(self._basic["project_dir"].text() or "").strip()
+        start = current if current and Path(current).is_dir() else str(Path.home())
+        path = QFileDialog.getExistingDirectory(
+            self, "选择编码协作项目目录", start
+        )
+        if path:
+            self._basic["project_dir"].setText(path)
 
     # ---------- 内容源 ----------
 
@@ -591,6 +613,7 @@ class SettingsWindow(QDialog):
             cfg["tools_enabled"] = self._basic["tools_enabled"].isChecked()
             cfg["shell_tools_mode"] = self._basic["shell_tools_mode"].currentData()
             cfg["shell_workdir"] = self._basic["shell_workdir"].text().strip()
+            cfg["project_dir"] = self._basic["project_dir"].text().strip()
 
             for name, data in self._plugin_widgets.items():
                 module = self.plugins[name]

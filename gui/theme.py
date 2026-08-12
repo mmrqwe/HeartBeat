@@ -28,6 +28,14 @@ QLabel#Hint {{
     color: {SECONDARY};
     font-size: 12px;
 }}
+QLabel#CodingStatus {{
+    background-color: #eef3ff;
+    border: 1px solid {ACCENT};
+    border-radius: 8px;
+    color: {TEXT};
+    padding: 6px 10px;
+    margin: 6px 8px;
+}}
 QPushButton {{
     background-color: {CARD};
     border: 1px solid {BORDER};

@@ -81,6 +81,30 @@ def test_super_long_word_capped():
     assert _bubble_width(w, 0) == chat_window.BUBBLE_MAX_W
 
 
+def test_coding_toggle_mode_and_placeholder():
+    """编码开关：切换 coding_mode 与输入框提示文案。"""
+    w = _make_window()
+    assert w.coding_mode is False
+    assert "编码" not in w.input_text.placeholderText()
+    w.coding_btn.click()
+    assert w.coding_mode is True
+    assert "编程任务" in w.input_text.placeholderText()
+    w.coding_btn.click()
+    assert w.coding_mode is False
+    assert "说点什么" in w.input_text.placeholderText()
+
+
+def test_coding_status_show_hide():
+    """编码状态行：有文本显示，空文本隐藏。"""
+    w = _make_window()
+    assert w.coding_status_label.isHidden()
+    w.set_coding_status("🔨 第 1 步：读取文件")
+    assert not w.coding_status_label.isHidden()
+    assert "第 1 步" in w.coding_status_label.text()
+    w.set_coding_status("")
+    assert w.coding_status_label.isHidden()
+
+
 def _run_plain():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

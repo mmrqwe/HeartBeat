@@ -7,8 +7,10 @@ PySide6 在 Windows 上若让 QCoreApplication/QApplication 单例拖到解释�
 
 
 def pytest_sessionfinish(session, exitstatus):
-    from PySide6.QtCore import QCoreApplication, QEvent
-
+    try:
+        from PySide6.QtCore import QCoreApplication, QEvent
+    except ImportError:
+        return  # 非 GUI 环境（无 PySide6）：跳过清理
     app = QCoreApplication.instance()
     if app is not None:
         app.deleteLater()

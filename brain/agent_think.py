@@ -583,6 +583,7 @@ class ThinkMixin:
             confirm_cb=self.tool_confirm_cb,
             cwd=tools.resolve_workdir(self.cfg),
             audit=self._audit_tool,
+            project_dir=self.cfg.get("project_dir", ""),
         )
 
     def _audit_tool(self, source, tool, detail, mode, approved, ok, summary):
