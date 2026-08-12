@@ -8,6 +8,7 @@ Agent 实测新行为生效，回滚后行为恢复）。
 """
 
 import json
+import shutil
 import sys
 import tempfile
 import traceback
@@ -252,26 +253,23 @@ def test_startup_rebuild_when_no_older(tmp_path):
 
 
 def test_end_to_end_evolve_cycle(tmp_path):
-    """安装增强版 memory（brain 包内，阶段2 包模式）→ Agent 实测新规则生效
+    """安装增强版 memory（P2 拆包：独立版本单元）→ Agent 实测新规则生效
     → 回滚 → 新 Agent 恢复内置行为。"""
     upd = _make_updater(tmp_path)
-    # 组装候选包：active brain 包全部文件 + 增强版 memory.py
-    files = upd.source_files("brain")
-    cand = Path(tmp_path) / "cand_pkg"
+    # 单文件候选（独立版本单元，不重建 brain 包）
+    cand = Path(tmp_path) / "cand_mem"
     cand.mkdir()
-    for fname, content in files.items():
-        (cand / fname).write_text(content, encoding="utf-8")
     (cand / "memory.py").write_text(_evolved_memory_source(), encoding="utf-8")
-    upd.install_candidate("brain", cand)
+    upd.install_candidate("memory", cand)
 
-    # 进化后：Agent 走 updater 加载 brain 包 → 新规则生效（独立数据目录，隔离历史）
+    # 进化后：Agent 经 loader 加载独立 memory 版本 → 新规则生效
     ag = _make_agent(Path(tempfile.mkdtemp()), brain_loader=upd)
     assert type(ag.memory_module).__name__ == "MemoryModule"
     ag.memory_module.extract_facts("进化验证")
     assert _has_evolved_fact(ag), "增强版规则未生效"
 
     # 回滚后：新 Agent 恢复内置行为（不再识别进化标记）
-    upd.rollback("brain")
+    upd.rollback("memory")
     ag2 = _make_agent(Path(tempfile.mkdtemp()), brain_loader=upd)
     ag2.memory_module.extract_facts("进化验证")
     assert not _has_evolved_fact(ag2), "回滚后增强规则应消失"
@@ -421,38 +419,11 @@ _PACKAGE_FILES = {
         "    def reindex_async(self, *a, **k):\n        return None\n"
         "    def patrol_topics(self, *a, **k):\n        return []\n"
     ),
-    "memory.py": (
-        "class MemoryModule:\n"
-        "    def remember(self, *a, **k):\n        return None\n"
-        "    def relevant(self, *a, **k):\n        return []\n"
-        "    def profile(self, *a, **k):\n        return {}\n"
-        "    def extract_facts(self, *a, **k):\n        return []\n"
-        "    def followup_candidate(self, *a, **k):\n        return None\n"
-        "    def parse_schedule_expiry(self, *a, **k):\n        return None\n"
-        "    def format_memories(self, *a, **k):\n        return ''\n"
-    ),
-    "planner.py": (
-        "class Planner:\n"
-        "    def rules_think(self, *a, **k):\n        return None\n"
-        "    def greeting(self, *a, **k):\n        return None\n"
-        "    def cooldown_ok(self, *a, **k):\n        return True\n"
-        "    def proactive_budget_ok(self, *a, **k):\n        return True\n"
-        "    def mark_proactive(self, *a, **k):\n        return None\n"
-        "    def is_quiet(self, *a, **k):\n        return False\n"
-        "    def update_mood(self, *a, **k):\n        return None\n"
-        "    def plugin_messages(self, *a, **k):\n        return []\n"
-        "    def pick_search_topic(self, *a, **k):\n        return None\n"
-        "    def patrol_topics(self, *a, **k):\n        return []\n"
-        "    def maybe_save_thought(self, *a, **k):\n        return None\n"
-        "    def build_time_context(self, *a, **k):\n        return ''\n"
-        "    def build_recent_thread(self, *a, **k):\n        return ''\n"
-    ),
-    "__init__.py": (
-        "from .agent import Agent\n"
-        "from .memory import MemoryModule\n"
-        "from .planner import Planner\n"
-    ),
-    "_contract.py": "EXPORTS = {'agent.py': 'Agent', 'memory.py': 'MemoryModule', 'planner.py': 'Planner'}\n",
+    "agent_chat.py": "class ChatMixin:\n    pass\n",
+    "agent_think.py": "class ThinkMixin:\n    pass\n",
+    "skills.py": "def scan_skill_metadata():\n    return []\n",
+    "__init__.py": "from .agent import Agent\n",
+    "_contract.py": "EXPORTS = {'agent.py': 'Agent'}\n",
 }
 
 
@@ -507,7 +478,7 @@ def test_package_rejects_missing_method(tmp_path):
 def test_package_rejects_missing_submodule(tmp_path):
     upd = _make_updater(tmp_path)
     files = dict(_PACKAGE_FILES)
-    del files["planner.py"]
+    del files["agent.py"]
     cand = _write_package_candidate(tmp_path, files)
     ok, errors = upd.validate_candidate("brain", cand, run_smoke=False)
     assert not ok
@@ -530,12 +501,14 @@ def test_package_install_load_and_source(tmp_path):
     assert sub is not None, "包内 agent 子模块应已加载"
     agent = sub.Agent()
     assert agent.chat("hi") == "pkg:hi"
-    # source_files 返回多文件
+    # source_files 返回多文件（P2 拆包：包只含控制流，无 policy）
     files = upd.source_files("brain")
     assert set(files) == {
-        "__init__.py", "_contract.py", "agent.py", "memory.py", "planner.py"
+        "__init__.py", "_contract.py", "agent.py", "agent_chat.py",
+        "agent_think.py", "skills.py",
     }
     assert "class Agent" in files["agent.py"]
+    assert "memory.py" not in files and "planner.py" not in files
 
 
 def test_package_install_bad_no_change(tmp_path):
@@ -592,3 +565,110 @@ if __name__ == "__main__":
                 traceback.print_exc()
     print("ALL TESTS PASSED" if failed == 0 else f"{failed} FAILED")
     sys.exit(1 if failed else 0)
+
+
+# ---------- P2 拆包：旧布局迁移 ----------
+
+_LEGACY_PKG_INIT = (
+    "from .agent import Agent\n"
+    "from .memory import MemoryModule\n"
+    "from .planner import Planner\n"
+)
+_LEGACY_PKG_CONTRACT = (
+    "EXPORTS = {'agent.py': 'Agent', 'memory.py': 'MemoryModule', 'planner.py': 'Planner'}\n"
+)
+
+
+def _write_legacy_package(tmp_path):
+    """构造旧布局 brain 包（含 memory/planner 拷贝 + 旧 __init__/_contract）。"""
+    vdir = Path(tmp_path) / "brain" / "brain" / "v1.0"
+    vdir.mkdir(parents=True, exist_ok=True)
+    for fname in ("agent.py", "agent_chat.py", "agent_think.py", "skills.py"):
+        shutil.copy2(ROOT / "brain" / fname, vdir / fname)
+    (vdir / "memory.py").write_text(_evolved_memory_source(), encoding="utf-8")
+    (vdir / "planner.py").write_text(
+        "# legacy planner 进化标记\n"
+        + (ROOT / "brain" / "planner.py").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (vdir / "__init__.py").write_text(_LEGACY_PKG_INIT, encoding="utf-8")
+    (vdir / "_contract.py").write_text(_LEGACY_PKG_CONTRACT, encoding="utf-8")
+    (Path(tmp_path) / "brain" / "brain" / "active").write_text("v1.0\n", encoding="utf-8")
+
+
+def test_migrate_legacy_brain_package(tmp_path):
+    """旧布局（包内含 policy）→ ensure_installed 自动迁移为拆包布局。"""
+    _write_legacy_package(tmp_path)
+    upd = Updater(tmp_path)
+    upd.smoke_runner = smoke_test_module
+    upd.ensure_installed()
+    # policy 已导出为独立版本单元
+    assert upd.active_version("memory") == "v1.0"
+    assert upd.active_version("planner") == "v1.0"
+    mem_src = (Path(tmp_path) / "brain" / "memory" / "v1.0" / "memory.py").read_text(
+        encoding="utf-8")
+    assert "进化验证" in mem_src, "包内增强版 memory 应导出到独立目录"
+    # 包内 policy 已删除、入口已重写
+    pkg_dir = Path(tmp_path) / "brain" / "brain" / "v1.0"
+    assert not (pkg_dir / "memory.py").exists()
+    assert not (pkg_dir / "planner.py").exists()
+    init = (pkg_dir / "__init__.py").read_text(encoding="utf-8")
+    assert "MemoryModule" not in init and "from .agent import Agent" in init
+    # 新布局包可加载、Agent 组合独立 policy 生效（增强规则来自迁移导出）
+    upd.load("brain")
+    ag = _make_agent(Path(tempfile.mkdtemp()), brain_loader=upd)
+    assert type(ag.memory_module).__name__ == "MemoryModule"
+    ag.memory_module.extract_facts("进化验证")
+    assert _has_evolved_fact(ag), "迁移导出的 policy 未生效"
+    # 幂等：再次 ensure_installed 无变化
+    upd.ensure_installed()
+    assert not (pkg_dir / "memory.py").exists()
+    assert upd.active_version("memory") == "v1.0"
+    # 审计有迁移记录
+    log = (Path(tmp_path) / "brain" / "updates.log").read_text(encoding="utf-8")
+    assert '"action": "migrate"' in log
+
+
+def test_migrate_keeps_higher_independent_version(tmp_path):
+    """独立目录已有更高版本 → 迁移不覆盖，active 指向更高版本。"""
+    _write_legacy_package(tmp_path)
+    mem_v11 = Path(tmp_path) / "brain" / "memory" / "v1.1"
+    mem_v11.mkdir(parents=True, exist_ok=True)
+    (mem_v11 / "memory.py").write_text("# v1.1 用户进化版\n", encoding="utf-8")
+    (Path(tmp_path) / "brain" / "memory" / "active").write_text("v1.1\n", encoding="utf-8")
+    upd = Updater(tmp_path)
+    upd.ensure_installed()
+    assert upd.active_version("memory") == "v1.1"
+    # v1.1 未被包内版覆盖
+    v11_src = (Path(tmp_path) / "brain" / "memory" / "v1.1" / "memory.py").read_text(
+        encoding="utf-8")
+    assert "v1.1 用户进化版" in v11_src
+    # 包内 policy 仍被清理
+    pkg_dir = Path(tmp_path) / "brain" / "brain" / "v1.0"
+    assert not (pkg_dir / "memory.py").exists()
+
+
+def test_migrate_rolls_back_legacy_agent_relative_imports(tmp_path):
+    """旧布局 agent.py 相对导入 policy → 迁移回退控制流宿主源码（保证可加载）。"""
+    _write_legacy_package(tmp_path)
+    vdir = Path(tmp_path) / "brain" / "brain" / "v1.0"
+    legacy_agent = (ROOT / "brain" / "agent.py").read_text(encoding="utf-8")
+    legacy_agent = legacy_agent.replace(
+        "from brain.memory import MemoryModule", "from .memory import MemoryModule"
+    ).replace(
+        "from brain.planner import Planner", "from .planner import Planner"
+    )
+    (vdir / "agent.py").write_text(legacy_agent, encoding="utf-8")
+    upd = Updater(tmp_path)
+    upd.smoke_runner = smoke_test_module
+    upd.ensure_installed()
+    # 控制流回退宿主源码：agent.py 不再相对导入 policy
+    agent_src = (vdir / "agent.py").read_text(encoding="utf-8")
+    assert "from .memory import" not in agent_src
+    assert "from brain.memory import" in agent_src
+    # 包可加载、policy 已独立
+    upd.load("brain")
+    assert upd.active_version("memory") == "v1.0"
+    # 审计有回退记录
+    log = (Path(tmp_path) / "brain" / "updates.log").read_text(encoding="utf-8")
+    assert '"action": "migrate_control"' in log

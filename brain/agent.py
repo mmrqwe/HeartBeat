@@ -5,8 +5,8 @@
 agent_think.py（ThinkMixin）——单文件 ≤500 行，LLM 可整体重写。
 
 包模式：数据目录 <data>/brain/brain/vN/ 存在时，本类（或其拷贝）经
-brain_loader 从包加载；memory/planner 组合模块优先从包取，失败回退
-单文件版本（老数据目录兼容）。
+brain_loader 从包加载；memory/planner 是独立版本单元（P2 拆包：
+<data>/brain/<name>/active），经 loader.create 动态加载，不随包版本漂移。
 """
 
 import random
@@ -26,8 +26,11 @@ from .agent_think import ThinkMixin
 # 进化引擎自身是核心锁定集（不可进化），绝对导入宿主实现——
 # 包内 Agent 的进化能力永远跟随宿主内核，不随包版本漂移。
 from brain.evolver import Evolver
-from .memory import MemoryModule
-from .planner import Planner
+# memory/planner 内置实现（宿主源码）。P2 拆包后它们独立版本化，
+# 控制流不再静态绑定包内 policy：运行时经 _load_brain_modules 加载
+# 独立版本单元（<data>/brain/<name>/active），无 loader 时用内置实现。
+from brain.memory import MemoryModule
+from brain.planner import Planner
 
 
 class Agent(ChatMixin, ThinkMixin):
@@ -67,22 +70,12 @@ class Agent(ChatMixin, ThinkMixin):
         )
 
     def _load_brain_modules(self):
-        """组合领域模块：brain 包 active → 包内类；否则单文件 active 版本；
-        无 loader → 内置实现。任一层失败逐级回退（升级失败不破坏运行）。"""
+        """组合领域模块（P2 拆包后两条正交路径）：
+        memory/planner 是独立版本单元（<data>/brain/<name>/active），
+        经 loader.create 动态加载（Agent 类本身由 create_agent 从包取）；
+        无 loader → 内置实现。失败回退内置（升级失败不破坏运行）。"""
         loader = self.brain_loader
         if loader is not None:
-            try:
-                if "brain" in loader.BUILTIN_MODULES and loader.active_version("brain"):
-                    pkg = loader.load("brain")
-                    if pkg is not None:
-                        import sys
-
-                        base = pkg.__name__
-                        mem_cls = getattr(sys.modules[f"{base}.memory"], "MemoryModule")
-                        plan_cls = getattr(sys.modules[f"{base}.planner"], "Planner")
-                        return mem_cls(self), plan_cls(self)
-            except Exception:
-                pass
             try:
                 return (
                     loader.create("memory", self),

@@ -77,17 +77,18 @@ def _make_evolver(tmp_path, fake_brain):
 def test_evolve_pipeline_success(tmp_path):
     """全链路：生成候选 → 安全/契约/冒烟验证 → 安装 → 新方法生效。
 
-    阶段2 包模式：brain 包 active 时 evolve('planner') = 升级包内 planner.py，
-    整体安装为新包版本（v1.0 → v1.1）。
+    P2 拆包：evolve('planner') 升级独立版本单元（<data>/brain/planner/），
+    不重建 brain 包（Policy 级升级不触发 Brain 包重建）。
     """
     ev = _make_evolver(tmp_path, FakeBrain([PLANNER_EVOLVED]))
     version = ev.evolve("planner", "每天上午9点提醒我喝水")
     assert version == "v1.1"
-    assert ev.updater.active_version("brain") == "v1.1"
-    # active 包已切换且可加载，新方法真实存在
-    module = ev.updater.load("brain")
-    sub = sys.modules[f"{module.__name__}.planner"]
-    assert hasattr(getattr(sub, "Planner"), "drink_reminder")
+    assert ev.updater.active_version("planner") == "v1.1"
+    # active 独立模块已切换且可加载，新方法真实存在
+    module = ev.updater.load("planner")
+    assert hasattr(getattr(module, "Planner"), "drink_reminder")
+    # brain 包版本未被触碰（Policy 级升级独立于 Brain 包）
+    assert ev.updater.active_version("brain") == "v1.0"
     # 候选目录已清理
     assert not list(ev.candidate_root.glob("*"))
     # 审计有 install 记录
@@ -445,9 +446,9 @@ def test_evolve_brain_package(tmp_path):
     assert ev.updater.active_version("brain") == "v1.1"
     files = ev.updater.source_files("brain")
     assert "进化标记：2026-08-12 包级生成测试" in files["agent_chat.py"]
-    # 其它文件未被修改
+    # 其它文件未被修改；policy 不在包内（独立版本单元）
     assert "class Agent" in files["agent.py"]
-    assert "class Planner" in files["planner.py"]
+    assert "planner.py" not in files and "memory.py" not in files
     # 候选目录已清理
     assert not list(ev.candidate_root.glob("*"))
 

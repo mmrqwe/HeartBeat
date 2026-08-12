@@ -30,14 +30,17 @@ BUILTIN_MODULES = ("memory", "planner", "brain")
 # 包模块：版本单元是目录（多文件 + __init__.py + _contract.py），
 # 整体版本化（active 指向整个包版本，禁止包内混版本）。
 # 阶段2（2026-08-12）：brain 包化后 agent 控制流也进入进化域。
+# 阶段5（P2 拆包）：brain 包只含控制流三件套 + skills；memory/planner
+# 回到独立版本单元（<data>/brain/<name>/vN/）——三级进化粒度：
+# Policy 级升级只动独立目录，不再整体重建 Brain 包。
 PACKAGE_MODULES = ("brain",)
 # 包内子模块固定布局：文件名 -> 公开类名（内核强制，候选不可改——
-# 防止候选把类藏到任意文件里逃避契约检查）
+# 防止候选把类藏到任意文件里逃避契约检查）。
+# 只声明契约类 agent.py（Agent）；agent_chat/agent_think 是混入、
+# skills 是纯函数——缺失时 agent.py 的相对导入在 L0 包加载即失败。
 PACKAGE_LAYOUT = {
     "brain": (
         ("agent.py", "Agent"),
-        ("memory.py", "MemoryModule"),
-        ("planner.py", "Planner"),
     ),
 }
 
@@ -152,6 +155,9 @@ class Updater:
         每次 Kernel 启动调用：已安装则做加载预检，损坏自动回滚，
         保证升级失败不会卡死启动（自进化安全底座）。
         """
+        # P2 拆包迁移（旧布局 brain 包内含 policy → 独立版本单元），
+        # 幂等：新布局包（无 policy 文件）直接跳过。
+        self._migrate_legacy_brain_package()
         for name in BUILTIN_MODULES:
             base = self.root / name
             if not base.is_dir() or not (base / "active").exists():
@@ -166,6 +172,80 @@ class Updater:
                     self._install_builtin(name)
                     self._audit("rebuild", name, "v1.0", detail="active 损坏且无旧版本可回退")
 
+    # ---------- 旧布局迁移（P2 拆包） ----------
+
+    def _migrate_legacy_brain_package(self):
+        """旧布局（brain 包内含 memory.py/planner.py）→ 新布局（包只含控制流）。
+
+        拆包（P2 三级进化粒度）：policy 独立版本化。规则：
+        - 包内 policy 文件存在 = 旧布局信号（幂等：迁移后无残留即跳过）；
+        - 导出包内 memory/planner 到独立目录 v<包版本>（以包内为准——
+          包是 active，是用户实际在用的实现）；
+        - 独立目录已有更高版本 → 不覆盖，active 指向更高版本（尊重用户进化）；
+        - 重写包 __init__.py/_contract.py 为新布局 + 删除包内 policy 文件；
+        - 任何一步失败：保留原样 + 审计，不阻断启动（旧布局仍可加载）。
+        """
+        if "brain" not in PACKAGE_MODULES:
+            return
+        version = self.active_version("brain")
+        if not version:
+            return
+        pkg_dir = self._base("brain") / version
+        if not pkg_dir.is_dir():
+            return
+        legacy = [n for n in ("memory", "planner")
+                  if (pkg_dir / f"{n}.py").is_file()]
+        if not legacy:
+            return
+        # 旧布局包内 agent.py 用相对导入（from .memory import ...）访问 policy——
+        # 拆包删除 policy 文件后无法加载。检测到即把控制流四件套整体回退
+        # 宿主源码（旧版控制流与 policy 静态纠缠，无法独立存活）。
+        try:
+            agent_src = (pkg_dir / "agent.py").read_text(encoding="utf-8")
+            if re.search(r"from \.memory import|from \.planner import", agent_src):
+                src_dir = self._builtin_package_dir("brain")
+                for fname in self._PACKAGE_BUNDLE:
+                    shutil.copy2(src_dir / fname, pkg_dir / fname)
+                self._audit("migrate_control", "brain", version,
+                            detail="旧 agent.py 相对导入 policy，控制流回退宿主源码")
+        except OSError as exc:
+            self._audit("migrate_failed", "brain", version,
+                        detail=f"控制流回退失败：{exc}")
+            return  # 保留原样，不继续
+        for name in legacy:
+            src = pkg_dir / f"{name}.py"
+            try:
+                versions = self.list_versions(name)
+                highest = versions[-1] if versions else None
+                if highest and self._version_key(highest) > self._version_key(version):
+                    # 独立目录已有更高版本：包内副本弃用（用户侧可能已进化）
+                    self._audit("migrate_keep", name, highest,
+                                detail="独立目录已有更高版本，包内副本弃用")
+                else:
+                    target = self._base(name) / version
+                    target.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, target / f"{name}.py")
+                    self._audit("migrate", name, version,
+                                detail="从 brain 包导出（P2 拆包）")
+                self._write_active(
+                    name,
+                    highest if highest and self._version_key(highest)
+                    > self._version_key(version) else version,
+                )
+                src.unlink(missing_ok=True)
+            except OSError as exc:
+                self._audit("migrate_failed", name, version, detail=str(exc))
+                return  # 保留原样，不继续删其他文件
+        try:
+            (pkg_dir / "__init__.py").write_text(
+                self._PACKAGE_INIT, encoding="utf-8")
+            (pkg_dir / "_contract.py").write_text(
+                self._PACKAGE_CONTRACT, encoding="utf-8")
+            self._audit("migrate", "brain", version,
+                        detail="包重写为新布局（控制流）")
+        except OSError as exc:
+            self._audit("migrate_failed", "brain", version, detail=str(exc))
+
     def _install_builtin(self, name):
         if name in PACKAGE_MODULES:
             self._install_builtin_package(name)
@@ -176,20 +256,17 @@ class Updater:
         shutil.copy2(src, version_dir / f"{name}.py")
         self._write_active(name, "v1.0")
 
-    # 包模块内置文件清单：PACKAGE_LAYOUT 三件套（Agent 控制流与领域）。
+    # 包模块内置文件清单（P2 拆包后）：控制流四件套——Agent 主类 +
+    # 聊天/思考混入 + 技能元数据（agent_chat 相对导入的依赖）。
+    # memory/planner 是独立版本单元（<data>/brain/<name>/vN/），不随包漂移；
     # evolver 是核心锁定集（进化引擎自身），agent.py 绝对导入宿主实现，
     # 不随包版本漂移；__init__/_contract 为包入口与契约声明。
     _PACKAGE_BUNDLE = ("agent.py", "agent_chat.py", "agent_think.py",
-                       "memory.py", "planner.py", "skills.py")
-    _PACKAGE_INIT = (
-        "from .agent import Agent\n"
-        "from .memory import MemoryModule\n"
-        "from .planner import Planner\n"
-    )
+                       "skills.py")
+    _PACKAGE_INIT = "from .agent import Agent\n"
     _PACKAGE_CONTRACT = (
         "# 候选包契约声明：必须与内核 PACKAGE_LAYOUT 完全一致\n"
-        "EXPORTS = {'agent.py': 'Agent', 'memory.py': 'MemoryModule', "
-        "'planner.py': 'Planner'}\n"
+        "EXPORTS = {'agent.py': 'Agent'}\n"
     )
 
     def _install_builtin_package(self, name):

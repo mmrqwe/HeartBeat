@@ -1,7 +1,10 @@
 """brain.evolver：自我进化生成器（LLM 产出候选代码 → 走 updater 验证安装流水线）。
 
 架构决策（MVP，经架构评审）：
-- 只允许 updater.BUILTIN_MODULES（memory/planner）进化，agent.py 核心控制流锁定不可自改；
+- 只允许 updater.BUILTIN_MODULES（memory/planner/brain）进化；
+  阶段5（P2 拆包）：memory/planner 是独立版本单元（<data>/brain/<name>/vN/），
+  进化只动独立目录——Policy 级升级不再触发 Brain 包整体重建（三级进化粒度）；
+  brain 包（控制流三件套 + skills）仍整体版本化，evolve("brain") = LLM 选子模块重写；
 - 完整文件生成（非 diff）：读当前 active 源码 + 用户需求 → LLM 生成 vN+1 完整文件
   → 落盘候选目录 → 复用 updater.validate_candidate + install_candidate；
 - 安全边界：AST import 白名单 + 危险内置调用检查（L0 前）+ token 预算 + 重试上限；
@@ -72,33 +75,16 @@ class Evolver:
 
     # ---------- 当前源码 ----------
 
-    def _package_active(self):
-        """brain 包 active？包模式下 memory/planner 的进化单元是包：
-        LLM 只生成目标单文件，其余文件从 active 包拷贝组装成新包版本。"""
-        upd = self.updater
-        if "brain" not in upd.BUILTIN_MODULES:
-            return False
-        return bool(upd.active_version("brain"))
-
     def current_source(self, name):
         """读当前 active 版本的完整源码（进化基准 = 正在运行的实现）。
-        包模式下 memory/planner 读 brain 包内对应文件；
         name='brain'（包级进化）返回空（prompt 只给文件清单，不给全包源码）。"""
         if name == "brain":
             return ""
-        version = self.updater.active_version(name)
-        if not version:
-            raise ValueError(f"{name} 尚未安装（先 ensure_installed）")
-        if self._package_active():
-            files = self.updater.source_files("brain")
-            key = f"{name}.py"
-            if key not in files:
-                raise FileNotFoundError(f"brain 包内缺少 {key}")
-            return files[key]
-        src = self.updater.root / name / version / f"{name}.py"
-        if not src.is_file():
-            raise FileNotFoundError(f"active 版本源码缺失：{src}")
-        return src.read_text(encoding="utf-8")
+        files = self.updater.source_files(name)
+        key = f"{name}.py"
+        if key not in files:
+            raise FileNotFoundError(f"active 版本源码缺失：{key}")
+        return files[key]
 
     # ---------- Prompt 构建 ----------
 
@@ -143,8 +129,8 @@ class Evolver:
             "- agent.py：Agent 主类（构造/状态/聊天入口/委托壳/回复解析）——改动风险最高\n"
             "- agent_chat.py：聊天链路（ChatMixin：意图识别/进化触发/LLM 对话/消息组装）\n"
             "- agent_think.py：自主思考（ThinkMixin：触发门控/巡视/工具执行）\n"
-            "- memory.py：记忆领域（MemoryModule：事实提取/画像/跟进/向量检索）\n"
-            "- planner.py：规则决策（Planner：问候/预算/冷却/时间感知/规则发言）\n"
+            "（memory/planner 不属于本包——它们是独立版本单元，"
+            "用“进化 memory”或“进化 planner”单独升级）\n"
         )
         system = (
             "你是桌宠「小跳」的自我进化引擎。用户要求你升级自己的【某个子模块】。\n"
@@ -213,7 +199,7 @@ class Evolver:
 
         name='brain'（包级进化）时：LLM 输出 TARGET 文件 + 完整源码，
         与 active 包其余文件组装成完整候选包；否则单文件候选
-        （包模式下 memory/planner 同样组装为候选包）。
+        （P2 拆包后 memory/planner 直接生成单文件独立版本）。
         """
         messages = self._build_prompt(name, requirement, self.current_source(name))
         if feedback:
@@ -229,8 +215,8 @@ class Evolver:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         candidate_dir = self.candidate_root / f"{name}_{stamp}"
         candidate_dir.mkdir(parents=True, exist_ok=True)
-        if name == "brain" or self._package_active():
-            # 包组装：active 包全部文件 + 覆盖目标文件
+        if name == "brain":
+            # 包组装：active brain 包全部文件 + 覆盖目标文件
             for file_name, content in self.updater.source_files("brain").items():
                 (candidate_dir / file_name).write_text(content, encoding="utf-8")
             (candidate_dir / target).write_text(code, encoding="utf-8")
@@ -355,11 +341,12 @@ class Evolver:
                     feedback = "；".join(errors)
                     continue
                 status("运行验证（语法/接口契约/冒烟）…")
-                install_name = "brain" if self._package_active() else name
-                ok, v_errors = self.updater.validate_candidate(install_name, candidate_dir)
+                # P2 拆包：memory/planner 单文件独立版本（install_name=name），
+                # brain 包级候选走包分支（updater 按 PACKAGE_MODULES 自动分流）
+                ok, v_errors = self.updater.validate_candidate(name, candidate_dir)
                 if ok:
                     status("验证通过，安装中…")
-                    version = self.updater.install_candidate(install_name, candidate_dir)
+                    version = self.updater.install_candidate(name, candidate_dir)
                     return version
                 feedback = "；".join(v_errors)
             finally:
