@@ -11,13 +11,260 @@ LLM）/ LLM 巡视（含工具调用）/ 工具执行与审计。
 
 import random
 import re
+import time
 
 import core
+import search
 import tools
+from brain import context as context_mgr
 
 
 class ThinkMixin:
     """自主思考混入：Agent 主类继承本类获得巡视/思考能力。"""
+
+    # ---------- 生活循环（替代巡视） ----------
+
+    _LIFE_ACTIONS = {
+        "search": "web",
+        "news": "news",
+        "stock": "stock",
+        "weather": "weather",
+        "wiki": "wiki",
+    }
+
+    def live(self, ctx):
+        """生活循环：睡眠/体力检查 → 唤醒 → 内心思考 → 欲望行动 → 角色化说话。"""
+        now = self.clock()
+        if self.stats:
+            self.stats.record_tick()
+        try:
+            self.memory_module.cleanup(now=now.strftime("%Y-%m-%d %H:%M"))
+        except Exception:
+            pass
+        self._update_mood(ctx)
+        self._extract_facts_watermark()
+
+        if self._is_quiet(now):
+            self.state["sleep_mode"] = True
+            self._save_state()
+            self._log_activity("sleep", "进入睡眠，不主动消耗体力")
+            return None
+        self.state["sleep_mode"] = False
+        self._save_state()
+
+        if not (self.cfg.get("api") or {}).get("api_key"):
+            # 无 LLM 时继续走规则发言（问候/日程/天气等），不涉及体力
+            return self._think_rules(ctx, now)
+
+        if not self._proactive_energy_ok(now):
+            self._log_activity("rest", "体力不足，保持安静")
+            return None
+
+        wake = self._wake_greeting(now)
+        if wake:
+            self._log_activity("wake", wake, energy=1)
+            if self.stats:
+                self.stats.record_proactive()
+            return wake
+
+        plan = self._inner_thought(ctx, now)
+        if not plan:
+            self._log_activity("think", "内心思考后选择安静", energy=1)
+            return None
+        if plan.get("type") == "speak":
+            self._log_activity("speak", plan.get("text", ""), energy=1)
+            if self.stats:
+                self.stats.record_proactive()
+            return plan.get("text")
+        if plan.get("type") == "think":
+            text = plan.get("text", "")
+            self._remember("thought", text, source="self_thought")
+            self._record_desire(text, status="thought")
+            self._log_activity("think", text, energy=1)
+            return None
+        if plan.get("type") == "action":
+            self._record_desire(
+                f"想查{plan.get('query', '')}", status="done"
+            )
+            message = self._do_life_action(plan, now)
+            if message and self.stats:
+                self.stats.record_proactive()
+            return message
+        return None
+
+    def _record_desire(self, text, status="active"):
+        """把内心思考产生的欲望/计划记进状态（cap 10 条）。"""
+        desires = list(self.state.get("desires") or [])
+        desires.append({
+            "id": f"{int(time.time() * 1000)}-{len(desires)}",
+            "text": str(text or "")[:120],
+            "status": status,
+            "ts": time.strftime("%Y-%m-%d %H:%M"),
+        })
+        self.state["desires"] = desires[-10:]
+        self._save_state()
+
+    def _wake_greeting(self, now):
+        """每天醒来一次的角色化主动问候，不是新闻汇报。"""
+        if not self.cfg.get("wake_greeting_enabled", True):
+            return None
+        day = self._energy_day(now)
+        if self.state.get("last_wake_date") == day:
+            return None
+        if self._energy_remaining(now) < 1:
+            return None
+        owner = core.owner_title(self.cfg)
+        system = core.build_persona(self.cfg) + (
+            "\n\n你现在刚睡醒。像真正的角色一样主动跟"
+            + owner
+            + "打招呼，可以有情绪、有语气，但不要汇报新闻、不要列清单，不超过40字。"
+        )
+        try:
+            raw = self.brain.complete(
+                [
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"现在时间：{now.strftime('%Y-%m-%d %H:%M')}；"
+                            f"当前情绪：{self.state.get('mood', '平静')}。"
+                            "说一句主动唤醒的话。"
+                        ),
+                    },
+                ],
+                max_tokens=80,
+            ) or ""
+            reply = self._parse_agent_reply(raw).strip()
+        except Exception:
+            reply = ""
+        if not reply or "SILENT" in reply.upper():
+            reply = self.planner.greeting(now) or ""
+        reply = reply.strip()
+        if reply:
+            self.state["last_wake_date"] = day
+            self._save_state()
+        return reply or None
+
+    def _inner_thought(self, ctx, now):
+        """内心思考：输出想说的话 / 想做的事 / 私下的想法 / 保持安静。"""
+        owner = core.owner_title(self.cfg)
+        profile = self.memory_module.profile()
+        recent = self._build_recent_thread()
+        context = self.brain._context_text(ctx)
+        desires = self.state.get("desires") or []
+        desire_text = "；".join(
+            f"{d.get('id', '?')}:{d.get('text', '')}"
+            for d in desires[-5:]
+        ) or "（暂无）"
+        system = (
+            core.build_persona(self.cfg)
+            + "\n\n你是一个有生命的角色，有自己的精力、情绪和想做的事。"
+            "你会主动思考，而不是机械巡视。\n"
+            "只输出以下格式之一：\n"
+            "SPEAK 想对"
+            + owner
+            + "说的一句话\n"
+            "ACTION <search|news|stock|weather|wiki> 想查的关键词\n"
+            "THINK 私下的想法\n"
+            "SILENT\n"
+            "不要说废话，不要复述设定。"
+        )
+        user = (
+            f"[当前状态] 时间：{now.strftime('%Y-%m-%d %H:%M')}；"
+            f"情绪：{self.state.get('mood', '平静')}；"
+            f"剩余体力：{self._energy_remaining(now)}。\n"
+            f"[用户画像]\n{profile}\n"
+            f"[最近对话]\n{recent or '（暂无）'}\n"
+            f"[周围信息]\n{context or '（暂无）'}\n"
+            f"[我的欲望]\n{desire_text}\n\n"
+            "现在你在主动生活：想做什么、想说什么、还是保持安静？"
+        )
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        max_tokens = int(self.cfg.get("max_context_tokens", 400000) or 400000)
+        ratio = float(self.cfg.get("context_compress_ratio", 0.75) or 0.75)
+        messages, _ = context_mgr.truncate_messages(
+            messages, int(max_tokens * ratio), keep_recent=10
+        )
+        try:
+            raw = self.brain.complete(messages, max_tokens=200) or ""
+        except Exception:
+            return None
+        return self._parse_life_reply(raw)
+
+    def _parse_life_reply(self, raw):
+        for line in (raw or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            upper = line.upper()
+            if upper == "SILENT":
+                continue
+            if upper.startswith("SPEAK"):
+                text = line[5:].strip()
+                if text:
+                    return {"type": "speak", "text": text}
+            if upper.startswith("THINK"):
+                text = line[5:].strip()
+                if text:
+                    return {"type": "think", "text": text}
+            if upper.startswith("ACTION"):
+                rest = line[6:].strip()
+                parts = rest.split(None, 1)
+                tool = parts[0].lower() if parts else ""
+                query = parts[1].strip() if len(parts) > 1 else ""
+                if tool in self._LIFE_ACTIONS and query:
+                    return {"type": "action", "tool": tool, "query": query}
+        return None
+
+    def _do_life_action(self, plan, now):
+        """执行一个低打扰的主动行动：查完记想法，只有值得说才角色化说话。"""
+        tool = plan.get("tool", "")
+        query = plan.get("query", "")
+        category = self._LIFE_ACTIONS.get(tool, "web")
+        try:
+            entries = search.search_all(query, category, 4)
+        except Exception as exc:
+            self._log_activity("action", f"{tool} {query} 失败：{exc}")
+            return None
+        if not entries:
+            self._remember(
+                "thought", f"我查了{query}，暂时没有新结果。", source="self_action"
+            )
+            self._log_activity("action", f"{tool} {query} 无结果")
+            return None
+        title = str(entries[0].get("title") or entries[0].get("text") or "")[:80]
+        self._remember(
+            "thought", f"我自己查了{query}：{title}", source="self_action"
+        )
+        self._log_activity("action", f"{tool} {query} -> {title}")
+        return self._phrase_action_result(query, title)
+
+    def _phrase_action_result(self, query, title):
+        """把主动查到的结果用角色语气说成一句话，而不是新闻播报。"""
+        owner = core.owner_title(self.cfg)
+        system = core.build_persona(self.cfg) + (
+            "\n\n你刚刚主动查了一个东西。用你的角色语气，像随口跟"
+            + owner
+            + "分享一样说一句话，不超过50字，不要用列表、标题或“报告”口吻。"
+        )
+        try:
+            raw = self.brain.complete(
+                [
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": f"我查了：{query}\n结果：{title}\n说一句话。",
+                    },
+                ],
+                max_tokens=80,
+            ) or ""
+            reply = self._parse_agent_reply(raw).strip()
+        except Exception:
+            reply = ""
+        return reply or f"我刚好去看了看{query}，{title}"
 
     # ---------- 自主思考 ----------
 

@@ -12,11 +12,13 @@
 import random
 import re
 import threading
+import time
 from pathlib import Path
 
 import core
 import search
 import tools
+from brain import context as context_mgr
 
 
 class ChatMixin:
@@ -284,6 +286,12 @@ class ChatMixin:
         shown = ""        # 已推送给 UI 的可见文本（不含 [FACT]/[THINK]）
         pending_note = ""  # 工具执行状态行，追加在流式文本之后
         for _ in range(max_rounds):
+            max_tokens = int(self.cfg.get("max_context_tokens", 400000) or 400000)
+            ratio = float(self.cfg.get("context_compress_ratio", 0.75) or 0.75)
+            keep_recent = int(self.cfg.get("keep_recent_messages", 20) or 20)
+            messages, _ = context_mgr.truncate_messages(
+                messages, int(max_tokens * ratio), keep_recent=keep_recent
+            )
             try:
                 if use_stream:
                     def cb(raw):
@@ -421,20 +429,62 @@ class ChatMixin:
         r"好处|坏处|利弊|对比|分析|说明|科普|多少钱|哪个(?:好|更)|选哪个)"
     )
 
+    def _conversation_summary(self, limit):
+        """旧对话滚动摘要：只在上下文超限时生成/刷新，缓存到 agent_state。"""
+        if not self.cfg.get("conversation_summary_enabled", True):
+            return ""
+        keep = int(self.cfg.get("keep_recent_messages", 20) or 20)
+        old = [
+            m for m in self.chat_history[:-keep]
+            if m.get("text", "").strip()
+        ] if len(self.chat_history) > keep else []
+        existing = str(self.state.get("conversation_summary") or "")
+        if not old:
+            return existing
+        old_tokens = context_mgr.estimate_messages_tokens(
+            [{"role": m["role"], "content": m["text"]} for m in old[-80:]]
+        )
+        if old_tokens + context_mgr.estimate_tokens(existing) <= limit // 5:
+            return existing
+        text = "\n".join(
+            f"{m['role']}: {m['text'][:200]}" for m in old[-80:]
+        )
+        system = (
+            "你是对话摘要器。把下面的旧对话压缩成一段中文摘要，"
+            "保留：用户身份/偏好/重要事件/未完成事项/情绪变化。"
+            "不要编造，不要输出其他内容。"
+        )
+        try:
+            raw = self.brain.complete(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": text},
+                ],
+                max_tokens=300,
+            ) or ""
+            summary = self._parse_agent_reply(raw).strip()
+        except Exception:
+            summary = ""
+        if summary:
+            self.state["conversation_summary"] = summary
+            self._save_state()
+            return summary
+        return existing
+
     def _build_chat_messages(self, user_text):
         relevant = self._relevant_memories(user_text, 5)
         recent = [m for m in self.chat_history[-8:] if m["role"] in ("user", "assistant")]
         knowledge = bool(self._KNOWLEDGE_RE.search(user_text))
         owner = core.owner_title(self.cfg)
         narrator = "用户" if owner == "你" else owner
-        memories = self._format_memories(relevant)
-        if memories == "暂无":
-            memories = f"你还在慢慢了解{narrator}，记住的还不多"
+        profile = self.memory_module.profile()
+        if profile.startswith("还没有关于"):
+            profile = f"你还在慢慢了解{narrator}，记住的还不多"
         system = (
-            core.build_persona(self.cfg, mood=self.state.get("mood"))
+            core.build_persona(self.cfg)  # 稳定前缀：不把情绪写进人设
             + "\n\n"
             f"你在和{narrator}相处中不断学习、慢慢长大：你记得关于{narrator}的事："
-            + memories
+            + profile
             + "。聊天时自然地用上这些记忆（不要说“我记得你上次说”这类话）。"
         )
         system += (
@@ -464,7 +514,33 @@ class ChatMixin:
             }
             for m in recent
         ]
+        # 动态尾部：情绪/时间、按 query 检索的记忆，最后才是当前问题
+        mood = str(self.state.get("mood") or "")
+        now_text = time.strftime("%Y-%m-%d %H:%M")
+        if mood:
+            messages.append({
+                "role": "user",
+                "content": f"[当前状态] 情绪：{mood}；现在时间：{now_text}",
+            })
+        relevant_text = self._format_memories(relevant)
+        if relevant_text != "暂无":
+            messages.append({"role": "user", "content": "[相关记忆] " + relevant_text})
         messages.append({"role": "user", "content": user_text})
+        # token 上限：默认 400k，达到 75% 才压缩；当前用户消息保留
+        max_tokens = int(self.cfg.get("max_context_tokens", 400000) or 400000)
+        ratio = float(self.cfg.get("context_compress_ratio", 0.75) or 0.75)
+        keep_recent = int(self.cfg.get("keep_recent_messages", 20) or 20)
+        limit = int(max_tokens * ratio)
+        if context_mgr.estimate_messages_tokens(messages) > limit:
+            summary = self._conversation_summary(limit)
+            if summary:
+                system += "\n\n[对话摘要]\n" + summary
+                messages[0]["content"] = system
+        messages, _ = context_mgr.truncate_messages(
+            messages,
+            limit,
+            keep_recent=keep_recent,
+        )
         return system, messages, budget
 
     # ---------- 已安装技能（数据驱动能力：安装即获得，无需改代码） ----------

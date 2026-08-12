@@ -12,7 +12,7 @@ brain_loader 从包加载；memory/planner 组合模块优先从包取，失败�
 import random
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -42,7 +42,6 @@ class Agent(ChatMixin, ThinkMixin):
         self.embedder = rag.default_embedder(cfg, self.data_dir)
         self._embed_sig = (cfg.get("embedding_enabled"), cfg.get("embedding_model"))
         self._reindex_pending = False
-        self.brain = core.Brain(cfg, self.plugins, stats)
         self.tool_confirm_cb: Optional[Callable[[str], bool]] = None  # GUI 注入：confirm 档写命令的用户确认回调
         self.eventbus = None  # GUI 注入：kernel.eventbus（工具执行旁路通知）
         self.brain_loader = brain_loader  # 自进化加载器（kernel.updater），None=用内置实现
@@ -51,6 +50,9 @@ class Agent(ChatMixin, ThinkMixin):
         self.state: dict = self._load_state()
         self._sync_embed_model()
         self.clock = clock or datetime.now
+        self.brain = core.Brain(
+            cfg, self.plugins, stats, energy_cb=self._consume_energy
+        )
         # 领域模块（组合）：记忆 / 规划 —— brain 层可独立升级的进化单元。
         # 包模式（brain 包 active）优先从包取三件套（Agent/Memory/Planner）；
         # 否则按 active 单文件版本动态加载；未注入 loader（测试/CLI 直连）
@@ -109,6 +111,14 @@ class Agent(ChatMixin, ThinkMixin):
             "topics_date": "",         # 兴趣话题自动提取日期（每天一次）
             "topics_list": [],          # 自动提取的话题列表
             "embed_model": "",          # 当前向量模型（切换时重建向量表）
+            "energy_date": "",          # 体力日（按醒来时间划分）
+            "energy_used": 0,           # 当天已消耗的 LLM 调用次数
+            "sleep_mode": False,        # 是否处于睡眠模式
+            "current_desire_id": None,  # 当前欲望/计划 id
+            "last_wake_date": "",       # 当天是否已执行过唤醒
+            "activity_log": [],         # 最近活动日志（cap 50）
+            "desires": [],              # 欲望/计划列表（状态 JSON）
+            "conversation_summary": "", # 旧对话滚动摘要（超限压缩用）
         }
         return {
             key: self.db.get_state(key, default)
@@ -132,11 +142,64 @@ class Agent(ChatMixin, ThinkMixin):
         self.state["embed_model"] = model
         self._save_state()
 
+    # ---------- 体力模型（LLM 调用次数 = 每日体力） ----------
+
+    def _energy_day(self, now=None):
+        """体力日按醒来时间划分：quiet_end 之前算前一天。"""
+        now = now or self.clock()
+        end = int(self.cfg.get("quiet_end", 7) or 7)
+        day = now.date()
+        if now.hour < end:
+            day = day - timedelta(days=1)
+        return day.isoformat()
+
+    def _consume_energy(self, amount=1):
+        """每次成功 LLM 调用扣 1 点体力；无 API Key 时不计。"""
+        if not (self.cfg.get("api") or {}).get("api_key"):
+            return
+        day = self._energy_day()
+        if self.state.get("energy_date") != day:
+            self.state["energy_date"] = day
+            self.state["energy_used"] = 0
+        self.state["energy_used"] = int(self.state.get("energy_used", 0)) + amount
+        self._save_state()
+
+    def _energy_used(self, now=None):
+        day = self._energy_day(now)
+        if self.state.get("energy_date") != day:
+            return 0
+        return int(self.state.get("energy_used", 0))
+
+    def _energy_remaining(self, now=None):
+        budget = int(self.cfg.get("daily_energy_budget", 1000) or 1000)
+        return max(0, budget - self._energy_used(now))
+
+    def _proactive_energy_ok(self, now=None):
+        """主动思考/行动还有没有余力：同时受总预算和主动预算约束。"""
+        used = self._energy_used(now)
+        budget = int(self.cfg.get("daily_energy_budget", 1000) or 1000)
+        cap = int(self.cfg.get("proactive_energy_daily_cap", 150) or 150)
+        return used < budget and used < cap
+
+    def _log_activity(self, kind, summary, energy=0):
+        """活动日志：它主动想了/做了什么，便于观察（cap 50 条）。"""
+        log = list(self.state.get("activity_log") or [])
+        log.append({
+            "ts": time.strftime("%Y-%m-%d %H:%M"),
+            "kind": kind,
+            "summary": str(summary or "")[:200],
+            "energy": int(energy or 0),
+        })
+        self.state["activity_log"] = log[-50:]
+        self._save_state()
+
     def reload(self, cfg, plugins=None):
         self.cfg = cfg
         if plugins is not None:
             self.plugins = plugins
-        self.brain = core.Brain(cfg, self.plugins, self.stats)
+        self.brain = core.Brain(
+            cfg, self.plugins, self.stats, energy_cb=self._consume_energy
+        )
         # embedder 仅在模型配置变化时重建，避免每次保存都重新加载/下载模型
         sig = (cfg.get("embedding_enabled"), cfg.get("embedding_model"))
         if sig != self._embed_sig:

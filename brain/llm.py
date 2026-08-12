@@ -218,12 +218,21 @@ def build_persona(cfg, mood=None):
 class Brain:
     """桌宠的大脑：有 API Key 走 LLM，否则走各插件的规则建议。"""
 
-    def __init__(self, cfg, plugins=None, stats=None):
+    def __init__(self, cfg, plugins=None, stats=None, energy_cb=None):
         self.cfg = cfg
         self.plugins = plugins or {}
         self.stats = stats
+        self.energy_cb = energy_cb
         self.history = []
         self.state = {}
+
+    def _consume_energy(self):
+        """每次成功调用 LLM 扣 1 点体力（由宿主注入回调）。"""
+        if self.energy_cb is not None:
+            try:
+                self.energy_cb()
+            except Exception:
+                pass
 
     def _retry_cfg(self):
         """LLM 重连配置：config.json 的 retry 块（带默认值兜底）。"""
@@ -341,6 +350,7 @@ class Brain:
                 cached_tokens=cached,
                 latency_ms=latency_ms,
             )
+        self._consume_energy()
 
     def _stream_read(self, url, headers, payload, on_delta):
         """SSE 流式读取，带自动重连。
@@ -555,6 +565,7 @@ class Brain:
         else:
             payload.update({"temperature": 0.9, "max_tokens": max_tokens or 300})
         data = self._post_chat(payload, timeout=timeout)
+        self._consume_energy()
         return data["choices"][0]["message"]["content"].strip()
 
     def complete_tools(self, messages, tools):
@@ -571,6 +582,7 @@ class Brain:
         else:
             payload.update({"temperature": 0.7, "max_tokens": 500})
         data = self._post_chat(payload)
+        self._consume_energy()
         message = data["choices"][0]["message"]
         return message.get("content"), message.get("tool_calls") or []
 
@@ -622,6 +634,7 @@ class Brain:
                 cached_tokens=cached,
                 latency_ms=latency_ms,
             )
+        self._consume_energy()
         return content, tool_calls
 
     def _stream_read_tools(self, url, headers, payload, on_delta):

@@ -56,7 +56,7 @@ def test_tick_lifecycle():
         assert "tick" in rt._tasks and "chat" in rt._tasks, "tick/chat 任务未注册"
 
         # 慢任务制造 busy 窗口
-        hb.agent.think = lambda ctx: time.sleep(0.3) or None
+        hb.agent.live = lambda ctx: time.sleep(0.3) or None
         QTimer.singleShot(50, hb._autonomy_tick)
         wait(150)
         assert rt.is_busy("tick"), "tick 应处于忙碌状态"

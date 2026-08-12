@@ -210,7 +210,7 @@ def _run(argv, default_config=None):
         _, cfg, _, stats, plugins, ag = _load(config)
         t0 = time.time()
         ctx = core.gather(plugins, cfg, stats)
-        message = ag.think(ctx)
+        message = ag.live(ctx)
         print("message:", message)
         if ctx["errors"]:
             print("errors:", ctx["errors"])
@@ -632,7 +632,7 @@ def _selfcheck(config):
 
     def tick_step():
         ctx = core.gather(plugins, cfg, stats)
-        message = ag.think(ctx)
+        message = ag.live(ctx)
         _require(True, "tick finished")
     check("tick/think", tick_step)
 

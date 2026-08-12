@@ -14,6 +14,7 @@ import agent
 import core
 import search
 import tools
+from brain import context as context_mgr
 from brain.memory import MemoryModule
 
 
@@ -1248,6 +1249,162 @@ def test_think_context_text_capped(tmp_path):
     }
     text = a.brain._context_text(ctx)
     assert len(text) < 4500
+
+
+def test_context_truncate_messages_keeps_recent():
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+    ]
+    for i in range(30):
+        messages.append({"role": "user", "content": "很长" * 100})
+    new_messages, dropped = context_mgr.truncate_messages(
+        messages, max_tokens=800, keep_recent=5
+    )
+    assert dropped > 0
+    assert new_messages[-1]["content"].startswith("很长")
+
+
+def test_build_chat_messages_stable_prefix_excludes_mood(tmp_path):
+    cfg = _cfg()
+    cfg["api"]["api_key"] = "test-key"
+    a = _make_agent(tmp_path, cfg=cfg)
+    system1, _, _ = a._build_chat_messages("hi")
+    a.state["mood"] = "开心"
+    system2, _, _ = a._build_chat_messages("hi")
+    assert system1 == system2
+    assert "当前情绪" not in system1
+
+
+def test_conversation_summary_compression(tmp_path):
+    cfg = _cfg()
+    cfg["api"]["api_key"] = "test-key"
+    cfg["max_context_tokens"] = 200
+    cfg["keep_recent_messages"] = 2
+    cfg["conversation_summary_enabled"] = True
+    a = _make_agent(tmp_path, cfg=cfg)
+    for i in range(6):
+        a.append_chat("user", f"第{i}条很长" + "内容" * 50)
+        a.append_chat("assistant", "嗯")
+
+    class FakeBrain:
+        def complete(self, messages, max_tokens=None, **kw):
+            return "旧对话摘要：聊过很多内容"
+
+    a.brain = FakeBrain()
+    system, _, _ = a._build_chat_messages("hi")
+    assert "对话摘要" in system
+    assert "聊过很多内容" in system
+    assert a.state["conversation_summary"] == "旧对话摘要：聊过很多内容"
+
+
+def test_energy_model_tracks_and_resets(tmp_path):
+    cfg = _cfg()
+    cfg["api"]["api_key"] = "test-key"
+    cfg["daily_energy_budget"] = 1000
+    cfg["proactive_energy_daily_cap"] = 150
+    cfg["quiet_end"] = 7
+    a = _make_agent(
+        tmp_path, cfg=cfg, clock=lambda: datetime(2026, 8, 12, 10, 0)
+    )
+    assert a._energy_remaining() == 1000
+    a._consume_energy(3)
+    assert a._energy_used() == 3
+    assert a._proactive_energy_ok()
+    a._consume_energy(147)
+    assert not a._proactive_energy_ok()
+    # 同一体力日（quiet_end=7 之前仍算前一天）
+    b = _make_agent(
+        tmp_path, cfg=cfg, clock=lambda: datetime(2026, 8, 13, 6, 0)
+    )
+    assert b._energy_used() == 150
+    # 醒来后进入新体力日
+    c = _make_agent(
+        tmp_path, cfg=cfg, clock=lambda: datetime(2026, 8, 13, 8, 0)
+    )
+    assert c._energy_used() == 0
+
+
+def test_live_wake_greeting_once(tmp_path):
+    cfg = _cfg()
+    cfg["api"]["api_key"] = "test-key"
+    cfg["wake_greeting_enabled"] = True
+    a = _make_agent(tmp_path, cfg=cfg)  # clock 10:00
+
+    class FakeBrain:
+        def _context_text(self, ctx):
+            return ""
+
+        def complete(self, messages, max_tokens=None, **kw):
+            return "早呀，今天想先干嘛？"
+
+    a.brain = FakeBrain()
+    msg = a.live({"collections": []})
+    assert msg == "早呀，今天想先干嘛？"
+    assert a.state["last_wake_date"] == a._energy_day()
+    assert a.live({"collections": []}) is None  # 唤醒只一次，内心思考无有效输出
+
+
+def test_live_inner_thought_speak(tmp_path):
+    cfg = _cfg()
+    cfg["api"]["api_key"] = "test-key"
+    a = _make_agent(tmp_path, cfg=cfg)
+    a.state["last_wake_date"] = a._energy_day()
+
+    class FakeBrain:
+        def _context_text(self, ctx):
+            return ""
+
+        def complete(self, messages, max_tokens=None, **kw):
+            return "SPEAK 我今天突然想学摄影了"
+
+    a.brain = FakeBrain()
+    assert a.live({"collections": []}) == "我今天突然想学摄影了"
+
+
+def test_live_inner_thought_action(monkeypatch, tmp_path):
+    cfg = _cfg()
+    cfg["api"]["api_key"] = "test-key"
+    a = _make_agent(tmp_path, cfg=cfg)
+    a.state["last_wake_date"] = a._energy_day()
+    calls = {"n": 0}
+
+    class FakeBrain:
+        def _context_text(self, ctx):
+            return ""
+
+        def complete(self, messages, max_tokens=None, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return "ACTION weather 武汉"
+            return "今天武汉晴天，适合出门！"
+
+    a.brain = FakeBrain()
+    monkeypatch.setattr(
+        search, "search_all",
+        lambda query, category, limit: [{"title": "晴天 30°C"}],
+    )
+    msg = a.live({"collections": []})
+    assert msg == "今天武汉晴天，适合出门！"
+    assert any("我自己查了武汉" in i["text"] for i in a.memory.thoughts())
+    assert any("想查武汉" in d["text"] for d in a.state["desires"])
+
+
+def test_live_sleep_and_energy_exhausted(tmp_path):
+    cfg = _cfg()
+    cfg["api"]["api_key"] = "test-key"
+    cfg["quiet_start"] = 23
+    cfg["quiet_end"] = 7
+    a = _make_agent(
+        tmp_path, cfg=cfg, clock=lambda: datetime(2026, 8, 12, 23, 30)
+    )
+    assert a.live({"collections": []}) is None
+    assert a.state["sleep_mode"] is True
+
+    b = _make_agent(tmp_path, cfg=cfg)  # 10:00
+    b._consume_energy(1000)
+    assert b.live({"collections": []}) is None
+    assert any(i["kind"] == "rest" for i in b.state["activity_log"])
 
 
 if __name__ == "__main__":

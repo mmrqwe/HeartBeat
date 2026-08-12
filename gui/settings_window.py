@@ -119,6 +119,9 @@ class SettingsWindow(QDialog):
         add_text("speaking_style", "说话方式（可选，留空跟随皮肤）")
         add_spin("interval_minutes", "巡视间隔（分钟）", 1, 1440)
         add_spin("proactive_gap_minutes", "主动发言间隔（分钟）", 10, 1440)
+        add_spin("daily_energy_budget", "每日体力（LLM 调用次数）", 1, 1000000)
+        add_spin("proactive_energy_daily_cap", "主动思考每日上限", 0, 1000000)
+        add_spin("max_context_tokens", "上下文上限（token）", 1000, 1000000)
         add_spin("quiet_start", "安静时段开始（小时）", 0, 23)
         add_spin("quiet_end", "安静时段结束（小时）", 0, 23)
 

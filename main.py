@@ -321,7 +321,7 @@ class HeartBeatApp:
                 self.stats,
                 context={"topics": self.agent.patrol_topics()},
             )
-            message = self.agent.think(ctx)
+            message = self.agent.live(ctx)
             errors = "，".join(ctx["errors"])
         except Exception as exc:
             message, errors = None, str(exc)
