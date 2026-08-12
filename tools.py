@@ -1393,10 +1393,14 @@ def execute(name, arguments, *, mode, source, confirm_cb=None, cwd=None, audit=N
     """
     args = {}
     if arguments:
-        try:
-            args = json.loads(arguments)
-        except ValueError:
-            args = {}
+        # 网关兼容：arguments 可能是已解析的 dict（部分 OpenAI 兼容网关行为）
+        if isinstance(arguments, dict):
+            args = arguments
+        else:
+            try:
+                args = json.loads(arguments)
+            except ValueError:
+                args = {}
     if name in SEARCH_HANDLERS:
         try:
             text = SEARCH_HANDLERS[name](args)

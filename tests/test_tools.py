@@ -661,5 +661,18 @@ def _run_plain():
     print("ALL TESTS PASSED")
 
 
+def test_execute_accepts_dict_arguments():
+    """网关兼容：arguments 为已解析 dict（非 JSON 字符串）时与字符串等价。"""
+    from kernel.permission import human_brief
+
+    r_str = tools.execute("bg_cancel", '{"task_id": ""}', mode="confirm",
+                          source=tools.SOURCE_USER)
+    r_dict = tools.execute("bg_cancel", {"task_id": ""}, mode="confirm",
+                           source=tools.SOURCE_USER)
+    assert r_dict == r_str == "缺少任务 ID（task_id）"
+    assert "index.html" in human_brief("write_file", {"path": "index.html", "content": "x"})
+    assert "index.html" in human_brief("write_file", '{"path": "index.html"}')
+
+
 if __name__ == "__main__":
     _run_plain()

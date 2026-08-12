@@ -120,10 +120,13 @@ def run_bash(cmdline, cwd=None, timeout=BASH_TIMEOUT, max_output=BASH_MAX_OUTPUT
 
 def human_brief(name, arguments):
     """工具调用的简短中文描述，用于 UI 流式过程中的状态行。"""
-    try:
-        args = json.loads(arguments or "{}")
-    except Exception:
-        args = {}
+    if isinstance(arguments, dict):
+        args = arguments  # 网关兼容：arguments 可能是已解析的 dict
+    else:
+        try:
+            args = json.loads(arguments or "{}")
+        except Exception:
+            args = {}
     if name == "run_bash":
         return ("执行命令：" + str(args.get("command", "")))[:80]
     if name == "web_search":
