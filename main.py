@@ -488,6 +488,7 @@ class HeartBeatApp:
                 on_delete_session=self._delete_session,
                 on_rename_session=self._rename_session,
                 on_cancel_coding=self._cancel_coding,
+                on_open_workspace=self._open_workspace,
             )
             for entry in self.agent.chat_history(session_id=self.current_session_id):
                 self.chat_win.add_message(entry["role"], entry["text"], entry.get("time"))
@@ -508,6 +509,17 @@ class HeartBeatApp:
             )
         self.chat_win.raise_()
         self.chat_win.activateWindow()
+
+    def _open_workspace(self):
+        """工作区按钮：在系统文件管理器里打开 Agent 自己的默认文件夹。"""
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        from kernel.workspace import workspace_root
+
+        root = workspace_root(base=self.data_dir)
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(root))):
+            self._set_status(f"打不开工作区：{root}")
 
     def _pick_project_dir(self):
         """目录按钮：选择编程项目目录 → 启用该目录对应的会话（没有则新建绑定）。

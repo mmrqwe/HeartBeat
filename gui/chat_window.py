@@ -107,7 +107,7 @@ class ChatWindow(QWidget):
     def __init__(self, pet_name, on_send, on_clear, on_pick_dir=None,
                  on_new_session=None, on_switch_session=None,
                  on_delete_session=None, on_rename_session=None,
-                 on_cancel_coding=None):
+                 on_cancel_coding=None, on_open_workspace=None):
         super().__init__()
         self.pet_name = pet_name
         self.on_send = on_send
@@ -118,6 +118,7 @@ class ChatWindow(QWidget):
         self.on_delete_session = on_delete_session
         self.on_rename_session = on_rename_session
         self.on_cancel_coding = on_cancel_coding
+        self.on_open_workspace = on_open_workspace
         self.messages = []
         self._bubble_items = []  # (bubble, text, markdown)：窗口缩放时按记录重排
         self._bubble_roles = {}  # id(bubble) -> role：主题切换时重上色
@@ -177,6 +178,11 @@ class ChatWindow(QWidget):
         self.session_list.itemClicked.connect(self._on_session_clicked)
         self.session_list.itemDoubleClicked.connect(self._on_session_double_clicked)
         side_layout.addWidget(self.session_list, 1)
+        # 工作区：Agent 自己的默认文件夹（收集数据/生成产物的地方）
+        ws_btn = QPushButton("🏠 打开工作区")
+        ws_btn.setToolTip("打开 Agent 自己的默认文件夹（收集的数据、生成的网站/仪表盘都在这里）")
+        ws_btn.clicked.connect(self._on_open_workspace)
+        side_layout.addWidget(ws_btn)
         root.addWidget(sidebar)
 
         main = QVBoxLayout()
@@ -591,6 +597,11 @@ class ChatWindow(QWidget):
         """点击目录按钮 → 回调宿主弹目录选择器。"""
         if self.on_pick_dir is not None:
             self.on_pick_dir()
+
+    def _on_open_workspace(self):
+        """点击工作区按钮 → 回调宿主打开 Agent 自己的默认文件夹。"""
+        if self.on_open_workspace is not None:
+            self.on_open_workspace()
 
     def set_project_dir(self, path):
         """宿主设置项目目录后回传：更新按钮提示与状态行。"""

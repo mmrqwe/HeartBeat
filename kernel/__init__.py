@@ -13,7 +13,7 @@
 
 from pathlib import Path
 
-from . import boot, module, permission  # noqa: F401
+from . import boot, module, permission, workspace  # noqa: F401
 
 
 class Kernel:

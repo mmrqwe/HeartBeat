@@ -655,7 +655,7 @@ def test_patrol_declarations_include_sandbox():
     assert "bash" not in names  # 主动 bash 统一走 sandbox run，不暴露通用 bash
     sandbox = next(d for d in decls if d["function"]["name"] == "sandbox")
     actions = sandbox["function"]["parameters"]["properties"]["action"]["enum"]
-    assert set(actions) == {"list", "read", "write", "run"}
+    assert set(actions) == {"list", "read", "write", "run", "db"}
 
 
 def test_declarations_off_no_bash():

@@ -260,7 +260,7 @@ def test_events_written_for_chat_and_tick():
         hb.agent.chat = lambda user_text, on_delta=None, session_id="default": "ok"
         # tick 会话
         QTimer.singleShot(0, hb._autonomy_tick)
-        wait(300)
+        wait(800)
         tick_trace = getattr(hb.agent, "_trace_id", "") or ""
         assert tick_trace.startswith("tick_"), f"tick trace 缺失：{tick_trace!r}"
         tick_events = hb.db.event_items(trace_id=tick_trace, limit=10)

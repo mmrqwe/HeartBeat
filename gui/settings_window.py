@@ -198,7 +198,15 @@ class SettingsWindow(QDialog):
             bool(self.cfg.get("tools_enabled", True))
         )
         form.addRow(self._basic["tools_enabled"])
+        self._basic["workspace_enabled"] = QCheckBox(
+            "启用桌宠自己的工作区（默认文件夹：收集数据、生成网页/仪表盘）"
+        )
+        self._basic["workspace_enabled"].setChecked(
+            bool(self.cfg.get("workspace_enabled", True))
+        )
+        form.addRow(self._basic["workspace_enabled"])
         add_spin(form, "patrol_tool_rounds", "主动思考工具轮数", 1, 30)
+        add_spin(form, "patrol_tool_budget", "主动思考单次工具调用预算", 2, 30)
         self._basic["shell_tools_mode"] = QComboBox()
         for label, value in [
             ("关闭（off）", "off"),
@@ -672,7 +680,7 @@ class SettingsWindow(QDialog):
                 "interval_minutes", "quiet_start", "quiet_end",
                 "daily_energy_budget", "proactive_energy_daily_cap",
                 "max_context_tokens", "max_output_tokens",
-                "patrol_tool_rounds",
+                "patrol_tool_rounds", "patrol_tool_budget",
             ):
                 cfg[key] = self._basic[key].value()
             api = cfg["api"]
@@ -688,6 +696,7 @@ class SettingsWindow(QDialog):
             cfg["thinking_enabled"] = self._basic["thinking_enabled"].isChecked()
             cfg["thinking_effort"] = self._basic["thinking_effort"].currentData()
             cfg["tools_enabled"] = self._basic["tools_enabled"].isChecked()
+            cfg["workspace_enabled"] = self._basic["workspace_enabled"].isChecked()
             cfg["shell_tools_mode"] = self._basic["shell_tools_mode"].currentData()
             cfg["shell_workdir"] = self._basic["shell_workdir"].text().strip()
             cfg["project_dir"] = self._basic["project_dir"].text().strip()

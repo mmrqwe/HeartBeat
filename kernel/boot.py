@@ -33,6 +33,8 @@ DEFAULT_CONFIG = {
     "thinking_effort": "medium",
     "tools_enabled": True,
     "patrol_tool_rounds": 10,  # 主动思考单次最多工具轮数
+    "patrol_tool_budget": 12,  # 主动思考单次最多工具调用次数（工作循环预算）
+    "workspace_enabled": True,  # Agent 自己的默认文件夹（工作区）与观察库落库
     "shell_tools_mode": "confirm",
     "shell_workdir": "",
     "project_dir": "",  # Coding 协作项目根目录（文件工具/后台命令的边界）

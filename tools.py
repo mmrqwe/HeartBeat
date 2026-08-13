@@ -58,6 +58,8 @@ from tools_skill import (
     sandbox_read,
     sandbox_run,
     sandbox_write,
+    workspace_brief,
+    workspace_record_observations,
 )
 from tools_coding import (
     CODING_TOOLS,

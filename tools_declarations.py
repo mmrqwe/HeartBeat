@@ -270,21 +270,28 @@ def _sandbox_decl():
         "function": {
             "name": "sandbox",
             "description": (
-                "在你的私有沙盒（用户数据目录/sandbox）里自娱自乐：list 列目录、"
-                "read 读文件、write 写文件、run 执行命令。全部限制在沙盒内，"
-                "不需要主人确认；危险命令会被拒绝。"
+                "在你自己的默认文件夹（工作区，<用户数据目录>/workspace）里做事："
+                "list 列目录、read 读文件、write 写文件、run 执行 shell 命令、"
+                "db 对观察库 observations.db 执行 SQL。"
+                "工作区完全属于你：projects/ 放产物（网站/仪表盘/脚本/报告），"
+                "notes/ 放笔记，data/observations.db 是插件采集自动累积的观察库"
+                "（行情/新闻/天气等历史数据，可用 db 查询分析）。"
+                "全部限制在工作区内，不需要主人确认；危险命令会被拒绝。"
+                "你可以在工作区里持续做事：收集数据入库、生成 dashboard.html、"
+                "维护你自己的文件——而不只是回答一句话。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list", "read", "write", "run"],
+                        "enum": ["list", "read", "write", "run", "db"],
                         "description": "操作类型",
                     },
-                    "path": {"type": "string", "description": "list/read/write 时的沙盒内相对路径"},
+                    "path": {"type": "string", "description": "list/read/write 时的工作区内相对路径"},
                     "content": {"type": "string", "description": "write 时的文件内容"},
                     "command": {"type": "string", "description": "run 时的完整 shell 命令"},
+                    "sql": {"type": "string", "description": "db 时的 SQL 语句（observations.db）"},
                     "timeout": {"type": "integer", "description": "run 超时秒数，默认 60，最大 300"},
                 },
                 "required": ["action"],

@@ -150,6 +150,14 @@ def _make_parser():
     p_embed = sub.add_parser("embed", help="测试本地向量模型")
     p_embed.add_argument("text")
 
+    p_ws = sub.add_parser("workspace", help="工作区（Agent 自己的默认文件夹）：状态/同步/查询/打开")
+    ws_sub = p_ws.add_subparsers(dest="ws_cmd", required=True)
+    ws_sub.add_parser("status", help="工作区快照与观察库统计")
+    ws_sub.add_parser("sync", help="跑一次采集并把结果落进观察库")
+    p_ws_db = ws_sub.add_parser("db", help="对观察库执行 SQL（只读建议）")
+    p_ws_db.add_argument("sql")
+    ws_sub.add_parser("open", help="在文件管理器里打开工作区")
+
     sub.add_parser("selfcheck", help="逐项测试全部核心功能")
 
     p_skill = sub.add_parser("skill", help="技能包：下载 / 安装 / 查看 / 状态 / 初始化（如 zhihu-cli）")
@@ -247,6 +255,36 @@ def _run(argv, default_config=None):
             print("errors:", ctx["errors"])
         print(f"elapsed: {time.time() - t0:.2f}s")
         return 0
+
+    if cmd == "workspace":
+        from kernel.workspace import db_exec, record_observations, workspace_brief, workspace_root
+
+        base = core.user_data_dir()
+        if args.ws_cmd == "status":
+            print(workspace_brief(base=base))
+            return 0
+        if args.ws_cmd == "sync":
+            _, cfg, _, stats, plugins, _ = _load(config)
+            t0 = time.time()
+            ctx = core.gather(plugins, cfg, stats)
+            summary = record_observations(ctx["collections"], base=base)
+            print("summary:", summary)
+            print(f"elapsed: {time.time() - t0:.2f}s")
+            return 0
+        if args.ws_cmd == "db":
+            print(db_exec(args.sql, base=base))
+            return 0
+        if args.ws_cmd == "open":
+            root = workspace_root(base=base)
+            if sys.platform == "darwin":
+                os.system(f"open {root}")  # noqa: S605
+            elif os.name == "nt":
+                os.startfile(str(root))  # type: ignore[attr-defined]  # noqa: S606
+            else:
+                os.system(f"xdg-open {root}")  # noqa: S605
+            print(root)
+            return 0
+        return 1
 
     if cmd == "search":
         t0 = time.time()

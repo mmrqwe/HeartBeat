@@ -417,16 +417,12 @@ def _exec_skill(args, source, confirm_cb, audit, mode):
     return "未知 skill action：" + action
 
 
-# ---------- 沙盒（Agent 可读可写可执行的工作区） ----------
+# ---------- 沙盒（Agent 可读可写可执行的工作区，即 kernel.workspace） ----------
 
 
 def _sandbox_root():
-    root = Path(_user_data_dir()) / "sandbox"
-    try:
-        root.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-    return root
+    import kernel.workspace
+    return kernel.workspace.workspace_root(base=_user_data_dir())
 
 
 def _resolve_sandbox_path(rel):
@@ -543,8 +539,25 @@ def _exec_sandbox_run(args, source, confirm_cb, audit, mode):
     return text
 
 
+def _exec_sandbox_db(args, source, confirm_cb, audit, mode):
+    sql = str(args.get("sql", "") or "").strip()
+    if not sql:
+        return "缺少 SQL（sql）"
+    if mode == SHELL_MODE_OFF:
+        return _deny(audit, source, "sandbox_db", sql, mode, "shell 工具已关闭")
+    readonly = mode == SHELL_MODE_READONLY
+    import kernel.workspace as workspace_mod
+    try:
+        text = workspace_mod.db_exec(sql, base=_user_data_dir(), readonly=readonly)
+    except Exception as exc:
+        text = f"数据库操作失败：{exc}"
+    if audit:
+        audit(source, "sandbox_db", sql, mode, True, "失败" not in text, text[:200])
+    return text
+
+
 def _exec_sandbox(args, source, confirm_cb, audit, mode):
-    """统一 sandbox 工具：action = list | read | write | run。"""
+    """统一 sandbox 工具：action = list | read | write | run | db。"""
     action = str(args.get("action", "list") or "list").strip().lower()
     if action == "list":
         return _exec_sandbox_list(args, source, confirm_cb, audit, mode)
@@ -554,6 +567,23 @@ def _exec_sandbox(args, source, confirm_cb, audit, mode):
         return _exec_sandbox_write(args, source, confirm_cb, audit, mode)
     if action == "run":
         return _exec_sandbox_run(args, source, confirm_cb, audit, mode)
+    if action == "db":
+        return _exec_sandbox_db(args, source, confirm_cb, audit, mode)
     return f"未知 sandbox action：{action}"
+
+
+# ---------- 工作区门面（供 brain 主动思考使用：brain 不 import kernel） ----------
+
+
+def workspace_record_observations(collections, base=None):
+    """把巡视采集结果落进工作区观察库（去重）。返回摘要 dict。"""
+    import kernel.workspace as workspace_mod
+    return workspace_mod.record_observations(collections, base=base)
+
+
+def workspace_brief(base=None):
+    """工作区快照文本（注入主动思考提示词）。"""
+    import kernel.workspace as workspace_mod
+    return workspace_mod.workspace_brief(base=base)
 
 
