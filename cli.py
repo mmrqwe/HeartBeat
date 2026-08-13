@@ -683,7 +683,7 @@ def _selfcheck(config):
             "redact failed",
         )
         _require(bool(tools_mod.shell_hint()), "shell hint empty")
-        # 完整 12 工具声明依赖 project_dir（备份/文件类工具绑定项目）；
+        # 完整 13 工具声明依赖 project_dir（备份/文件类工具绑定项目）；
         # 声明层备份是单个 backup 工具（action=list/preview/restore 子操作），
         # list_backups/restore_backup 是内部执行名，不出现在 LLM 声明里
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -695,7 +695,7 @@ def _selfcheck(config):
                 )
             }
         _require(
-            {"todo", "backup", "write", "edit", "bash"} <= names,
+            {"todo", "backup", "write", "edit", "bash", "list"} <= names,
             "coding tools missing",
         )
     check("redact + shell + coding tools", safety_step)

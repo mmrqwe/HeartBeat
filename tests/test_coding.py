@@ -420,7 +420,7 @@ def test_coding_declarations_include_all_tools(tmp_path):
     for t in tools.CODING_TOOLS:
         assert t in names
     assert "web" in names
-    assert len(names) == 12
+    assert len(names) == 13
 
 
 def test_coding_declarations_off_mode_readonly_only():

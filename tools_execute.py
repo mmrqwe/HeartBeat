@@ -22,6 +22,7 @@ from tools_skill import (
     _exec_skill_exec,
     _exec_skill_setup,
     _exec_skill_status,
+    _exec_sandbox,
     _exec_sandbox_list,
     _exec_sandbox_read,
     _exec_sandbox_run,
@@ -109,6 +110,9 @@ def execute(name, arguments, *, mode, source, confirm_cb=None, cwd=None, audit=N
     if name == "web":
         return _exec_web(args, source, audit)
     if name in ("bash", "run_bash"):
+        if source == SOURCE_AUTO:
+            # 主动思考的 bash 跑在私有沙盒里，不弹确认打断主人
+            return _exec_sandbox_run(args, source, confirm_cb, audit, mode)
         return _exec_bash(args, source, confirm_cb, audit, mode, cwd)
     if name == "skill":
         return _exec_skill(args, source, confirm_cb, audit, mode)
@@ -130,6 +134,8 @@ def execute(name, arguments, *, mode, source, confirm_cb=None, cwd=None, audit=N
         return _exec_sandbox_write(args, source, confirm_cb, audit, mode)
     if name == "sandbox_list":
         return _exec_sandbox_list(args, source, confirm_cb, audit, mode)
+    if name == "sandbox":
+        return _exec_sandbox(args, source, confirm_cb, audit, mode)
     if name == "sandbox_run":
         return _exec_sandbox_run(args, source, confirm_cb, audit, mode)
     # Coding 文件/后台工具（project_dir 基座；路径校验/备份在 kernel.pathguard，

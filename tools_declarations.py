@@ -1,9 +1,9 @@
-"""tools_declarations：12 工具声明（web + bash/read/write/edit/glob/grep/todo/bg/skill/backup/note）。"""
+"""tools_declarations：13 工具声明（web + bash/list/read/write/edit/glob/grep/todo/bg/skill/backup/note）。"""
 
 from tools_common import _params_decl, SHELL_MODE_CONFIRM, SHELL_MODE_OFF
 
 def _agent_declarations():
-    """12 工具方案里的项目/通用工具（不含 web）。"""
+    """13 工具方案里的项目/通用工具（不含 web）。"""
     return [
         {
             "type": "function",
@@ -21,6 +21,23 @@ def _agent_declarations():
                         "timeout": {"type": "integer", "description": "超时秒数，默认 15，最大 60"},
                     },
                     "required": ["command"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list",
+                "description": (
+                    "列出项目目录树（目录/文件、大小），跳过 VCS/依赖/构建产物等噪音。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "项目内相对路径，默认当前根目录"},
+                        "depth": {"type": "integer", "description": "递归深度，默认 2，最大 4"},
+                    },
+                    "required": [],
                 },
             },
         },
@@ -247,15 +264,52 @@ def _web_decl():
     }
 
 
+def _sandbox_decl():
+    return {
+        "type": "function",
+        "function": {
+            "name": "sandbox",
+            "description": (
+                "在你的私有沙盒（用户数据目录/sandbox）里自娱自乐：list 列目录、"
+                "read 读文件、write 写文件、run 执行命令。全部限制在沙盒内，"
+                "不需要主人确认；危险命令会被拒绝。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "read", "write", "run"],
+                        "description": "操作类型",
+                    },
+                    "path": {"type": "string", "description": "list/read/write 时的沙盒内相对路径"},
+                    "content": {"type": "string", "description": "write 时的文件内容"},
+                    "command": {"type": "string", "description": "run 时的完整 shell 命令"},
+                    "timeout": {"type": "integer", "description": "run 超时秒数，默认 60，最大 300"},
+                },
+                "required": ["action"],
+            },
+        },
+    }
+
+
 def coding_declarations(cfg):
-    """Coding 模式工具声明（与 tool_declarations 一致：≤12 个一级工具）。"""
+    """Coding 模式工具声明（与 tool_declarations 一致：13 个一级工具）。"""
     return tool_declarations(cfg)
 
 
-def tool_declarations(cfg):
-    """12 工具声明：web + bash/read/write/edit/glob/grep/todo/bg/skill/backup/note。
+def patrol_declarations(cfg):
+    """主动思考专用工具：搜索 + 私有沙盒（不碰项目文件，不弹确认）。"""
+    decls = [_web_decl()]
+    if cfg.get("shell_tools_mode", SHELL_MODE_CONFIRM) != SHELL_MODE_OFF:
+        decls.append(_sandbox_decl())
+    return decls
 
-    配置了 project_dir 时给完整 12 个；未配置时只给不依赖项目的通用工具。
+
+def tool_declarations(cfg):
+    """13 工具声明：web + bash/list/read/write/edit/glob/grep/todo/bg/skill/backup/note。
+
+    配置了 project_dir 时给完整 13 个；未配置时只给不依赖项目的通用工具。
     off 档只保留只读搜索。
     """
     decls = [_web_decl()]

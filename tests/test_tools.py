@@ -563,7 +563,7 @@ def test_sandbox_read_write_list_run_and_policy():
             patch.setattr(tools, "user_data_dir", lambda: Path(d))
             result = tools._exec_sandbox_write(
                 {"path": "notes.md", "content": "hello sandbox"},
-                tools.SOURCE_USER, lambda _d: True, None, "confirm",
+                tools.SOURCE_USER, None, None, "confirm",
             )
             assert "已写入" in result
             result = tools._exec_sandbox_read(
@@ -576,7 +576,7 @@ def test_sandbox_read_write_list_run_and_policy():
             assert "notes.md" in result
             result = tools._exec_sandbox_run(
                 {"command": "echo sandbox-ok"}, tools.SOURCE_USER,
-                lambda _d: True, None, "confirm",
+                None, None, "confirm",
             )
             assert "exit=0" in result and "sandbox-ok" in result
             # 越界拒绝
@@ -585,16 +585,56 @@ def test_sandbox_read_write_list_run_and_policy():
                 tools.SOURCE_USER, None, None, "confirm",
             )
             assert "越出沙盒" in result
-            # 自主触发拒绝写
+            # 自主触发允许在沙盒内写（这是它自己的空间）
             result = tools._exec_sandbox_write(
                 {"path": "x.txt", "content": "x"},
                 tools.SOURCE_AUTO, None, None, "confirm",
             )
-            assert "自主触发不允许" in result
+            assert "已写入" in result
+            # 自主触发允许执行沙盒命令，不弹确认
+            result = tools._exec_sandbox_run(
+                {"command": "echo auto-ok"}, tools.SOURCE_AUTO,
+                None, None, "confirm",
+            )
+            assert "auto-ok" in result
+            # 硬禁命令仍拒绝
+            result = tools._exec_sandbox_run(
+                {"command": "sudo echo bad"}, tools.SOURCE_AUTO,
+                None, None, "confirm",
+            )
+            assert "禁止命令" in result
         finally:
             patch.restore()
 
 
+
+
+def test_execute_sandbox_and_auto_bash_no_confirm():
+    """统一 sandbox 工具和主动 bash 都走沙盒，且不需要确认回调。"""
+    with TemporaryDirectory() as d:
+        patch = _Patch()
+        try:
+            patch.setattr(tools, "user_data_dir", lambda: Path(d))
+            result = tools.execute(
+                "sandbox",
+                {"action": "write", "path": "a.txt", "content": "hi"},
+                mode="confirm", source=tools.SOURCE_AUTO,
+            )
+            assert "已写入" in result
+            result = tools.execute(
+                "sandbox",
+                {"action": "run", "command": "echo sandbox-ok"},
+                mode="confirm", source=tools.SOURCE_AUTO,
+            )
+            assert "sandbox-ok" in result
+            result = tools.execute(
+                "bash",
+                {"command": "echo auto-bash-ok"},
+                mode="confirm", source=tools.SOURCE_AUTO,
+            )
+            assert "auto-bash-ok" in result
+        finally:
+            patch.restore()
 
 
 # ---------- 声明生成 ----------
@@ -606,6 +646,16 @@ def test_declarations_default_has_bash():
     assert "todo" in names and "skill" in names and "note" in names
     assert "sandbox_read" not in names  # 沙盒已从默认声明移除
     assert len(decls) == 5  # 未配置项目目录时只给通用工具
+
+
+def test_patrol_declarations_include_sandbox():
+    decls = tools.patrol_declarations(_cfg("confirm"))
+    names = [d["function"]["name"] for d in decls]
+    assert "sandbox" in names
+    assert "bash" not in names  # 主动 bash 统一走 sandbox run，不暴露通用 bash
+    sandbox = next(d for d in decls if d["function"]["name"] == "sandbox")
+    actions = sandbox["function"]["parameters"]["properties"]["action"]["enum"]
+    assert set(actions) == {"list", "read", "write", "run"}
 
 
 def test_declarations_off_no_bash():

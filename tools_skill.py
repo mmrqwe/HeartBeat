@@ -13,10 +13,13 @@ import core
 
 from kernel import download as kdownload
 from kernel.permission import (
+    REJECT,
     SHELL_MODE_OFF,
+    SHELL_MODE_FULL,
     SHELL_MODE_READONLY,
     SOURCE_AUTO,
     SOURCE_USER,
+    classify,
     run_bash,
     run_process,
 )
@@ -479,15 +482,12 @@ def _exec_sandbox_read(args, source, confirm_cb, audit, mode):
         return "缺少路径（path）"
     if mode == SHELL_MODE_OFF:
         return _deny(audit, source, "sandbox_read", path, mode, "shell 工具已关闭")
-    if source != SOURCE_USER:
-        return _deny(audit, source, "sandbox_read", path, mode,
-                     "自主触发不允许读写沙盒（需要主人在场）")
     try:
         text = sandbox_read(path)
     except ValueError as exc:
         return f"读取失败：{exc}"
     if audit:
-        audit(SOURCE_USER, "sandbox_read", path, mode, True, True, text[:200])
+        audit(source, "sandbox_read", path, mode, True, True, text[:200])
     return text
 
 
@@ -495,15 +495,12 @@ def _exec_sandbox_list(args, source, confirm_cb, audit, mode):
     path = str(args.get("path", "") or ".").strip() or "."
     if mode == SHELL_MODE_OFF:
         return _deny(audit, source, "sandbox_list", path, mode, "shell 工具已关闭")
-    if source != SOURCE_USER:
-        return _deny(audit, source, "sandbox_list", path, mode,
-                     "自主触发不允许读写沙盒（需要主人在场）")
     try:
         text = sandbox_list(path)
     except ValueError as exc:
         return f"列出失败：{exc}"
     if audit:
-        audit(SOURCE_USER, "sandbox_list", path, mode, True, True, text[:200])
+        audit(source, "sandbox_list", path, mode, True, True, text[:200])
     return text
 
 
@@ -512,23 +509,15 @@ def _exec_sandbox_write(args, source, confirm_cb, audit, mode):
     content = args.get("content", "")
     if not path:
         return "缺少路径（path）"
-    if source != SOURCE_USER:
-        return _deny(audit, source, "sandbox_write", path, mode,
-                     "自主触发不允许读写沙盒（需要主人在场）")
     if mode in (SHELL_MODE_OFF, SHELL_MODE_READONLY):
         return _deny(audit, source, "sandbox_write", path, mode,
                      f"当前工具档位（{mode}）不允许写沙盒")
-    desc = f"写入沙盒文件：{path}"
-    approved, denied = _confirm(desc, confirm_cb, audit, source,
-                                "sandbox_write", path, mode)
-    if not approved:
-        return denied
     try:
         text = sandbox_write(path, content)
     except ValueError as exc:
         return f"写入失败：{exc}"
     if audit:
-        audit(SOURCE_USER, "sandbox_write", path, mode, True, True, text[:200])
+        audit(source, "sandbox_write", path, mode, True, True, text[:200])
     return text
 
 
@@ -536,21 +525,35 @@ def _exec_sandbox_run(args, source, confirm_cb, audit, mode):
     command = str(args.get("command", "") or "").strip()
     if not command:
         return "缺少命令（command）"
-    if source != SOURCE_USER:
-        return _deny(audit, source, "sandbox_run", command, mode,
-                     "自主触发不允许执行沙盒命令（需要主人在场）")
     if mode in (SHELL_MODE_OFF, SHELL_MODE_READONLY):
         return _deny(audit, source, "sandbox_run", command, mode,
                      f"当前工具档位（{mode}）不允许执行沙盒命令")
-    desc = f"在沙盒中执行命令：{command}"
-    approved, denied = _confirm(desc, confirm_cb, audit, source,
-                                "sandbox_run", command, mode)
-    if not approved:
-        return denied
-    text = sandbox_run(command)
+    # 沙盒是它自己的空间：不再弹确认，但保留硬禁命令/敏感路径判定
+    decision, reason = classify(command, SHELL_MODE_FULL, SOURCE_USER)
+    if decision == REJECT:
+        return _deny(audit, source, "sandbox_run", command, mode, reason)
+    try:
+        timeout = max(5, min(int(args.get("timeout", 60) or 60), 300))
+    except (TypeError, ValueError):
+        timeout = 60
+    text = sandbox_run(command, timeout=timeout)
     ok = text.startswith("exit=0")
     if audit:
-        audit(SOURCE_USER, "sandbox_run", command, mode, True, True, text[:200])
+        audit(source, "sandbox_run", command, mode, True, ok, text[:200])
     return text
+
+
+def _exec_sandbox(args, source, confirm_cb, audit, mode):
+    """统一 sandbox 工具：action = list | read | write | run。"""
+    action = str(args.get("action", "list") or "list").strip().lower()
+    if action == "list":
+        return _exec_sandbox_list(args, source, confirm_cb, audit, mode)
+    if action == "read":
+        return _exec_sandbox_read(args, source, confirm_cb, audit, mode)
+    if action == "write":
+        return _exec_sandbox_write(args, source, confirm_cb, audit, mode)
+    if action == "run":
+        return _exec_sandbox_run(args, source, confirm_cb, audit, mode)
+    return f"未知 sandbox action：{action}"
 
 

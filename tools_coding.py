@@ -35,7 +35,7 @@ def _user_data_dir():
 # ---------- Coding 文件/后台工具（project_dir 基座，锁定层校验在 kernel.pathguard） ----------
 
 CODING_TOOLS = frozenset({
-    "bash", "read", "write", "edit", "glob", "grep",
+    "bash", "list", "read", "write", "edit", "glob", "grep",
     "todo", "bg", "skill", "backup", "note",
 })
 _LEGACY_TOOL_NAMES = frozenset({

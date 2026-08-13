@@ -169,6 +169,8 @@ def human_brief(name, arguments):
         return ("读取文件：" + str(args.get("path", "")))[:80]
     if name == "list_files":
         return ("查看目录：" + str(args.get("path", ".")))[:80]
+    if name == "list":
+        return ("查看目录：" + str(args.get("path", ".")))[:80]
     if name == "search_files":
         return ("搜索代码：" + str(args.get("pattern", "")))[:80]
     if name == "glob_match":

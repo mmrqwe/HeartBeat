@@ -36,6 +36,7 @@ from tools_skill import (
     _downloads_dir,
     _exec_download,
     _exec_install,
+    _exec_sandbox,
     _exec_sandbox_list,
     _exec_sandbox_read,
     _exec_sandbox_run,
@@ -84,5 +85,5 @@ from tools_coding import (
     _walk_tree,
     cancel_all_background,
 )
-from tools_declarations import coding_declarations, tool_declarations
+from tools_declarations import coding_declarations, patrol_declarations, tool_declarations
 from tools_execute import execute

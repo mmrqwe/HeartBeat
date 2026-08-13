@@ -32,6 +32,7 @@ DEFAULT_CONFIG = {
     "thinking_enabled": True,
     "thinking_effort": "medium",
     "tools_enabled": True,
+    "patrol_tool_rounds": 10,  # 主动思考单次最多工具轮数
     "shell_tools_mode": "confirm",
     "shell_workdir": "",
     "project_dir": "",  # Coding 协作项目根目录（文件工具/后台命令的边界）

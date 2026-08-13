@@ -193,11 +193,12 @@ class SettingsWindow(QDialog):
         )
         form.addRow(self._basic["embedding_enabled"])
         add_text(form, "embedding_model", "向量模型")
-        self._basic["tools_enabled"] = QCheckBox("允许桌宠自主调用搜索工具")
+        self._basic["tools_enabled"] = QCheckBox("允许桌宠主动思考时调用工具")
         self._basic["tools_enabled"].setChecked(
             bool(self.cfg.get("tools_enabled", True))
         )
         form.addRow(self._basic["tools_enabled"])
+        add_spin(form, "patrol_tool_rounds", "主动思考工具轮数", 1, 30)
         self._basic["shell_tools_mode"] = QComboBox()
         for label, value in [
             ("关闭（off）", "off"),
@@ -671,6 +672,7 @@ class SettingsWindow(QDialog):
                 "interval_minutes", "quiet_start", "quiet_end",
                 "daily_energy_budget", "proactive_energy_daily_cap",
                 "max_context_tokens", "max_output_tokens",
+                "patrol_tool_rounds",
             ):
                 cfg[key] = self._basic[key].value()
             api = cfg["api"]

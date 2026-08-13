@@ -200,7 +200,7 @@ class ChatWindow(QWidget):
         clear_btn.clicked.connect(self._confirm_clear)
         # 选择编程项目目录（选目录后，编程任务自然路由到 coding，无需切换模式）
         self.dir_btn = QPushButton("📁 目录")
-        self.dir_btn.setToolTip("选择编程项目目录；选好后，编程任务会自动在该目录里执行")
+        self.dir_btn.setToolTip("选择编程项目目录；当前会话绑定该目录后，所有发言都在里面执行")
         self.dir_btn.clicked.connect(self._on_pick_dir)
         row1.addWidget(name_label)
         row1.addWidget(self.status_label)
@@ -595,10 +595,10 @@ class ChatWindow(QWidget):
     def set_project_dir(self, path):
         """宿主设置项目目录后回传：更新按钮提示与状态行。"""
         if not path:
-            self.dir_btn.setToolTip("选择编程项目目录；选好后，编程任务会自动在该目录里执行")
+            self.dir_btn.setToolTip("选择编程项目目录；当前会话绑定该目录后，所有发言都在里面执行")
             self.set_coding_status("")
             return
-        self.dir_btn.setToolTip(f"编程目录：{path}\n编程任务会自动在该目录里执行（点击更换）")
+        self.dir_btn.setToolTip(f"编程目录：{path}\n此会话的所有发言都在该目录里执行（点击更换）")
         self.set_coding_status(f"编程目录：{path}")
 
     def set_coding_status(self, text):

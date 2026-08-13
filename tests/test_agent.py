@@ -1405,6 +1405,77 @@ def test_live_inner_thought_action(monkeypatch, tmp_path):
     assert any("想查武汉" in d["text"] for d in a.state["desires"])
 
 
+def test_live_inner_thought_calls_tools(tmp_path):
+    """主动思考也可以像编码一样调用工具，再给出有价值的反馈。"""
+    cfg = _cfg()
+    cfg["api"]["api_key"] = "test-key"
+    a = _make_agent(tmp_path, cfg=cfg)
+    a.state["last_wake_date"] = a._energy_day()
+    calls = {"rounds": 0, "tools": 0, "last": None}
+
+    class FakeBrain:
+        def _context_text(self, ctx):
+            return ""
+
+        def complete_tools(self, messages, decls, max_tokens=None):
+            calls["rounds"] += 1
+            if calls["rounds"] == 1:
+                return "", [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "web", "arguments": '{"query":"AI 新闻"}'},
+                }]
+            return "SPEAK 我顺手搜了搜，今天 AI 圈有条大新闻！", []
+
+    a.brain = FakeBrain()
+
+    def fake_run_tool(name, arguments, source=tools.SOURCE_AUTO, project_dir=None):
+        calls["tools"] += 1
+        calls["last"] = (name, arguments, source)
+        return "搜索结果"
+
+    a._run_tool = fake_run_tool
+    assert a.live({"collections": []}) == "我顺手搜了搜，今天 AI 圈有条大新闻！"
+    assert calls["tools"] == 1
+    assert calls["last"][0] == "web"
+    assert calls["last"][2] == tools.SOURCE_AUTO
+
+
+def test_live_inner_thought_includes_persona(tmp_path):
+    """主动思考的 system 里必须带上用户配置的角色设定。"""
+    cfg = _cfg()
+    cfg["api"]["api_key"] = "test-key"
+    cfg["role"] = "元气女生"
+    cfg["personality"] = "温柔又调皮，有点小傲娇"
+    a = _make_agent(tmp_path, cfg=cfg)
+    a.state["last_wake_date"] = a._energy_day()
+    seen = {}
+
+    class FakeBrain:
+        def _context_text(self, ctx):
+            return ""
+
+        def complete_tools(self, messages, decls, max_tokens=None):
+            seen["system"] = messages[0]["content"]
+            return "SILENT", []
+
+    a.brain = FakeBrain()
+    assert a.live({"collections": []}) is None
+    assert "元气女生" in seen["system"]
+    assert "温柔又调皮" in seen["system"]
+
+
+def test_patrol_tool_rounds_config(tmp_path):
+    cfg = _cfg()
+    cfg["api"]["api_key"] = "test-key"
+    cfg["patrol_tool_rounds"] = 3
+    a = _make_agent(tmp_path, cfg=cfg)
+    assert a._patrol_tool_rounds() == 3
+    cfg["patrol_tool_rounds"] = 100
+    a.cfg = cfg
+    assert a._patrol_tool_rounds() == 30
+
+
 def test_live_sleep_and_energy_exhausted(tmp_path):
     cfg = _cfg()
     cfg["api"]["api_key"] = "test-key"

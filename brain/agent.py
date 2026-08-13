@@ -422,11 +422,52 @@ class Agent(ChatMixin, ThinkMixin):
         """规则事实提取（委托 brain.memory）。"""
         return self.memory_module.extract_facts(user_text)
 
-    # ---------- Coding 协作（P0：同步循环） ----------
+    # ---------- 统一会话入口 ----------
+
+    def converse(self, user_text, session_id="default", on_delta=None,
+                 on_status=None, cancel_event=None):
+        """统一会话入口：只有一个 Agent，按会话是否绑定项目目录选择模式。
+
+        未绑定目录 → 聊天模式（self.chat，负责落库 user/assistant）；
+        绑定目录 → 编码模式（coding 控制循环，负责落库 user/assistant）。
+        返回 (mode, reply)：mode 为 "chat" 或 "coding"，宿主据此渲染 UI。
+        """
+        user_text = str(user_text or "").strip()
+        info = self.db.session(session_id) or {}
+        project_dir = str(info.get("project_dir") or "").strip()
+        if not project_dir:
+            reply = self.chat(user_text, on_delta=on_delta, session_id=session_id)
+            return "chat", reply
+
+        self.append_chat("user", user_text, session_id=session_id)
+        rule_saved = self._extract_facts_rule(user_text)
+        reply = self.coding_task(
+            user_text,
+            on_status=on_status,
+            session_id=session_id,
+            cancel_event=cancel_event,
+            confirm_plan=self.confirm_plan_cb,
+            project_dir=project_dir,
+        )
+        # 手动取消时 runtime 已把结果按过期丢弃，这里也不再落库半途回复。
+        if cancel_event is None or not cancel_event.is_set():
+            self.append_chat("assistant", reply, session_id=session_id)
+        if (self.cfg.get("api") or {}).get("api_key"):
+            if self.memory_module.should_analyze(user_text, rule_saved):
+                try:
+                    self._analyze_async(user_text, reply)
+                except Exception:
+                    pass
+        if self.stats:
+            self.stats.record_chat(2)
+        return "coding", reply
+
+    # ---------- Coding 协作（统一 Agent 的编码模式控制循环） ----------
 
     def coding_task(self, user_text, on_status=None, on_delta=None, max_rounds=None,
-                    session_id="default", cancel_event=None, confirm_plan=None):
-        """Coding 模式入口：在 project_dir 项目内完成编程任务。
+                    session_id="default", cancel_event=None, confirm_plan=None,
+                    project_dir=None):
+        """Coding 模式入口：在绑定的 project_dir 项目内完成编程任务。
 
         安全基座在 kernel（pathguard/processpool/权限判定），控制循环在
         brain.coding_agent（策略层）。工具以 SOURCE_USER 执行——写操作
@@ -434,14 +475,25 @@ class Agent(ChatMixin, ThinkMixin):
         session_id：任务发起的会话（回复归属，不回写历史，由宿主落库）。
         cancel_event：threading.Event；置位后 coding 循环在轮次边界停止。
         confirm_plan：callable(plan)->bool；None 时用宿主注入的 confirm_plan_cb。
+        project_dir：统一 Agent 按会话绑定目录传入；None 时沿用全局配置。
         """
         from brain.coding_agent import run_coding_task
 
+        effective_cfg = dict(self.cfg)
+        effective_cfg["project_dir"] = (
+            project_dir or str(self.cfg.get("project_dir", "") or "")
+        )
+
         def run(name, arguments):
-            return self._run_tool(name, arguments, source=tools.SOURCE_USER)
+            return self._run_tool(
+                name,
+                arguments,
+                source=tools.SOURCE_USER,
+                project_dir=effective_cfg["project_dir"],
+            )
 
         return run_coding_task(
-            self.brain, self.cfg, user_text, run,
+            self.brain, effective_cfg, user_text, run,
             on_status=on_status, on_delta=on_delta, max_rounds=max_rounds,
             history=self.chat_history(session_id=session_id, limit=12),
             cancel_event=cancel_event,
