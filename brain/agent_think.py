@@ -588,7 +588,12 @@ class ThinkMixin:
 
     def _audit_tool(self, source, tool, detail, mode, approved, ok, summary):
         try:
-            self.db.log_tool(source, tool, detail, mode, approved, ok, summary)
+            self.db.log_tool(
+                source, tool,
+                tools.redact_secrets(str(detail)),
+                mode, approved, ok,
+                tools.redact_secrets(str(summary)),
+            )
         except Exception:
             pass
         # P1 事件时间线：tool.called（与 tool_logs 并存，按 trace_id 聚合调试）

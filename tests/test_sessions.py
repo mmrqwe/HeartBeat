@@ -47,6 +47,15 @@ def test_create_and_find_session_by_project_dir(tmp_path):
     assert d.find_session_by_project_dir("")["id"] == "default"
 
 
+def test_rename_session(tmp_path):
+    d = _make_db(tmp_path)
+    sid = d.create_session("旧名")
+    d.rename_session(sid, "新名字")
+    assert d.session(sid)["name"] == "新名字"
+    d.rename_session("default", "默认也支持改名")
+    assert d.session("default")["name"] == "默认也支持改名"
+
+
 def test_delete_session_cascades_messages(tmp_path):
     d = _make_db(tmp_path)
     sid = d.create_session("临时对话")
@@ -105,3 +114,43 @@ def test_agent_chat_writes_to_session(tmp_path):
     assert bbb[-1]["role"] == "assistant"
     # 默认会话只有手工 append 的一条
     assert len(a.chat_history(session_id="default")) == 1
+
+
+def test_clear_chat_removes_summary_state(tmp_path):
+    a = _make_agent(tmp_path)
+    a.state["conversation_summary:aaa"] = "旧摘要"
+    a._save_state()
+    a.clear_chat_history(session_id="aaa")
+    assert "conversation_summary:aaa" not in a.state
+    assert a.db.get_state("conversation_summary:aaa") is None
+
+    a.state["conversation_summary"] = "旧摘要"
+    a._save_state()
+    a.clear_chat_history()
+    assert a.db.get_state("conversation_summary") is None
+
+
+def test_clear_chat_session_keeps_other_session_vectors(tmp_path):
+    d = _make_db(tmp_path)
+    if not d.vec_ready:
+        pytest.skip("sqlite_vec 不可用")
+    sid1 = d.create_session("s1")
+    sid2 = d.create_session("s2")
+    id1 = d.add_chat("user", "会话1", session_id=sid1)
+    id2 = d.add_chat("user", "会话2", session_id=sid2)
+    d.add_embedding("chat", id1, [0.1] * 512)
+    d.add_embedding("chat", id2, [0.2] * 512)
+    d.clear_chat(session_id=sid1)
+    remaining = d._conn.execute("SELECT COUNT(*) AS n FROM chat_vec").fetchone()["n"]
+    assert remaining == 1
+
+
+def test_delete_session_removes_chat_vectors(tmp_path):
+    d = _make_db(tmp_path)
+    if not d.vec_ready:
+        pytest.skip("sqlite_vec 不可用")
+    sid = d.create_session("s")
+    mid = d.add_chat("user", "x", session_id=sid)
+    d.add_embedding("chat", mid, [0.3] * 512)
+    assert d.delete_session(sid) is True
+    assert d._conn.execute("SELECT COUNT(*) AS n FROM chat_vec").fetchone()["n"] == 0

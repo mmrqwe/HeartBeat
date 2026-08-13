@@ -33,15 +33,19 @@ def wait(ms):
 
 
 def _make_app():
-    tmp = TemporaryDirectory()
+    tmp = TemporaryDirectory(ignore_cleanup_errors=True)
     cfg_path = Path(tmp.name) / "config.json"
     cfg = json.loads(json.dumps(kernel.boot.DEFAULT_CONFIG))
     cfg["api"]["api_key"] = ""  # 规则模式，零 LLM 调用
+    cfg["embedding_enabled"] = False  # 测试不加载/不残留 ONNX 嵌入线程
     cfg["interval_minutes"] = 1
     cfg_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
-    app = QApplication.instance() or QApplication(sys.argv)
-    if isinstance(app, QGuiApplication):
-        app.setQuitOnLastWindowClosed(False)
+    app = QApplication.instance()
+    if app is None or not isinstance(app, QGuiApplication):
+        # 若前面已有 QCoreApplication（eventbus/runtime 测试），不能复用，
+        # 必须新建真正的 QApplication，否则创建 QWidget 会原生崩溃。
+        app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
     # P3：data_dir 显式注入 tmp（Kernel 跳过真实用户目录迁移）——
     # 每个测试独立数据库/事件表，不再污染真实用户库
     hb = mainmod.HeartBeatApp(str(cfg_path), data_dir=tmp.name)
@@ -49,6 +53,38 @@ def _make_app():
     orig_gather = core.gather
     core.gather = lambda *a, **k: {"collections": [], "errors": []}
     return tmp, hb, orig_gather
+
+
+def _cleanup(tmp, hb, orig_gather):
+    """统一清理：先还原 mock，再 close（关 DB/停线程），最后删临时目录。"""
+    core.gather = orig_gather
+    try:
+        hb.close()
+    finally:
+        tmp.cleanup()
+
+
+class _ChatStub:
+    """轻量聊天窗替身：记录消息与编码运行状态。"""
+
+    def __init__(self):
+        self.received = []
+        self.coding_running = False
+
+    def add_message(self, role, text, time_str=None):
+        self.received.append((role, text))
+
+    def set_thinking(self, on):
+        pass
+
+    def set_coding_status(self, text):
+        pass
+
+    def set_coding_running(self, on):
+        self.coding_running = bool(on)
+
+    def cancel_stream(self):
+        pass
 
 
 def test_coding_intent_routing():
@@ -70,6 +106,9 @@ def test_coding_intent_routing():
             def set_coding_status(self, text):
                 pass
 
+            def set_coding_running(self, on):
+                pass
+
         hb.chat_win = _Stub()
         # 1) 编程意图 + 未选目录 → 本地引导提示，不进入任何任务
         hb._send_chat("帮我把代码改一下")
@@ -85,6 +124,13 @@ def test_coding_intent_routing():
         while time.time() < deadline and rt.is_busy("coding"):
             wait(50)
         assert not rt.is_busy("coding")
+        # coding 平行路径也必须落库用户提问，历史不能只有 assistant 回复
+        coding_texts = [
+            m["text"] for m in hb.agent.chat_history(session_id="default")
+        ]
+        assert any("写一个 html 页面" in t for t in coding_texts), (
+            f"coding 用户消息缺失：{coding_texts}"
+        )
         # 3) 闲聊消息不触发 coding（走 chat）
         hb._send_chat("今天天气不错")
         deadline = time.time() + 3
@@ -92,9 +138,7 @@ def test_coding_intent_routing():
             wait(50)
         assert not rt.is_busy("coding")
     finally:
-        hb.kernel.stop()
-        tmp.cleanup()
-        core.gather = orig_gather
+        _cleanup(tmp, hb, orig_gather)
 
 
 def test_tick_lifecycle():
@@ -120,9 +164,7 @@ def test_tick_lifecycle():
         assert not rt.is_busy("tick"), "tick 完成后应复位 busy"
         assert hb.pet._status_text.endswith("想了一圈，暂无新事"), f"状态应为完成提示，实际：{hb.pet._status_text}"
     finally:
-        hb.kernel.stop()
-        tmp.cleanup()
-        core.gather = orig_gather
+        _cleanup(tmp, hb, orig_gather)
 
 
 def test_chat_lifecycle_and_stale_delta():
@@ -132,13 +174,13 @@ def test_chat_lifecycle_and_stale_delta():
         rt = hb.kernel.runtime
 
         deltas = []
-        hb.bridge.delta.connect(lambda epoch, text: deltas.append((epoch, text)))
+        hb.bridge.delta.connect(lambda epoch, text, session_id: deltas.append((epoch, text)))
 
         def fake_chat(user_text, on_delta=None, session_id="default"):
             # 模拟流式：正确 epoch 的增量 + 过期线程的增量
             if on_delta:
                 on_delta("你好")
-                hb._stream_delta(999, "过期增量")  # 模拟旧线程（epoch 不匹配）
+                hb._stream_delta(999, "过期增量", "default")  # 模拟旧线程（epoch 不匹配）
             return "你好呀，我在！"
 
         hb.agent.chat = fake_chat
@@ -152,9 +194,7 @@ def test_chat_lifecycle_and_stale_delta():
         assert not rt.is_busy("chat"), "chat 完成后应复位 busy"
         assert hb.pet._status_text == "陪我聊天中", f"状态应为‘陪我聊天中’，实际：{hb.pet._status_text}"
     finally:
-        hb.kernel.stop()
-        tmp.cleanup()
-        core.gather = orig_gather
+        _cleanup(tmp, hb, orig_gather)
 
 
 
@@ -187,9 +227,7 @@ def test_events_written_for_chat_and_tick():
         # started/finished 同 trace
         assert chat_events[0]["trace_id"] == chat_events[1]["trace_id"] == chat_trace
     finally:
-        hb.kernel.stop()
-        tmp.cleanup()
-        core.gather = orig_gather
+        _cleanup(tmp, hb, orig_gather)
 
 
 def test_chat_busy_queues_next_message():
@@ -221,9 +259,7 @@ def test_chat_busy_queues_next_message():
         assert hb._chat_pending == []
         assert not rt.is_busy("chat")
     finally:
-        hb.kernel.stop()
-        tmp.cleanup()
-        core.gather = orig_gather
+        _cleanup(tmp, hb, orig_gather)
 
 
 def test_session_switch_and_dir_binding():
@@ -246,6 +282,9 @@ def test_session_switch_and_dir_binding():
         hb.agent.append_chat("user", "默认会话消息", session_id="default")
         hb._switch_session("default")
         assert hb.current_session_id == "default"
+        assert hb.cfg["project_dir"] == "", (
+            f"切到未绑定会话应清空 project_dir，实际：{hb.cfg['project_dir']!r}"
+        )
         assert [m["text"] for m in hb.agent.chat_history(session_id="default")] == ["默认会话消息"]
         # 新建会话：名称带序号
         hb._new_session()
@@ -260,9 +299,116 @@ def test_session_switch_and_dir_binding():
         hb._delete_session("default")
         assert hb.db.session("default") is not None
     finally:
-        hb.kernel.stop()
-        tmp.cleanup()
-        core.gather = orig_gather
+        _cleanup(tmp, hb, orig_gather)
+
+
+def test_coding_completion_uses_pet_bubble(tmp_path, monkeypatch):
+    """编码完成：宠物气泡播报一句话摘要 + happy 动画，聊天窗关了也看得见。"""
+    tmp, hb, orig_gather = _make_app()
+    try:
+        bubbles = []
+        animations = []
+        monkeypatch.setattr(
+            hb.pet, "show_bubble",
+            lambda text, seconds=8, animation="talk": bubbles.append(text),
+        )
+        monkeypatch.setattr(
+            hb.pet, "play", lambda *args, **kwargs: animations.append(args[0])
+        )
+        hb._show_coding_reply(("default", "搞定了：改了 main.py\n测试通过"))
+        assert any("搞定了" in b for b in bubbles)
+        assert "happy" in animations
+        assert hb._coding_status_text == ""
+    finally:
+        _cleanup(tmp, hb, orig_gather)
+
+
+def test_coding_progress_question_answered_directly(tmp_path, monkeypatch):
+    """编码中问“你在干嘛”：宠物直接用当前步骤回答，不排队走聊天。"""
+    tmp, hb, orig_gather = _make_app()
+    try:
+        hb._coding_status_text = "正在修改 main.py"
+        hb.chat_win = _ChatStub()
+        monkeypatch.setattr(
+            hb.kernel.runtime, "is_busy", lambda name: name == "coding"
+        )
+        hb._send_chat("你在干嘛")
+        assert any(
+            "正在修改 main.py" in text
+            for _, text in hb.chat_win.received
+        ), hb.chat_win.received
+    finally:
+        _cleanup(tmp, hb, orig_gather)
+
+
+def test_cancel_coding_stops_task_and_skips_reply(tmp_path, monkeypatch):
+    """手动停止：busy 释放、排队清空、在途结果不再落库为 assistant。"""
+    tmp, hb, orig_gather = _make_app()
+    try:
+        gate = threading.Event()
+
+        def fake_coding_task(text, on_status=None, on_delta=None, max_rounds=None,
+                             session_id="default", cancel_event=None):
+            gate.wait(3)
+            return "done"
+
+        hb.agent.coding_task = fake_coding_task
+        hb.cfg["project_dir"] = str(Path(tmp.name) / "proj")
+        hb.chat_win = _ChatStub()
+        hb._send_chat("写一个 html 页面")
+        rt = hb.kernel.runtime
+        deadline = time.time() + 3
+        while time.time() < deadline and not rt.is_busy("coding"):
+            wait(20)
+        assert rt.is_busy("coding")
+        hb._cancel_coding()
+        assert not rt.is_busy("coding")
+        gate.set()
+        wait(300)
+        history = hb.agent.chat_history(session_id="default")
+        assert not any(
+            m["role"] == "assistant" and m["text"] == "done" for m in history
+        ), history
+        assert any(
+            m["role"] == "system" and "手动停止" in m["text"] for m in history
+        ), history
+    finally:
+        _cleanup(tmp, hb, orig_gather)
+
+
+def test_coding_continues_after_session_switch(tmp_path):
+    """并发策略：编码任务归属发起会话，切换会话只影响显示，不打断执行。"""
+    tmp, hb, orig_gather = _make_app()
+    try:
+        gate = threading.Event()
+
+        def fake_coding_task(text, on_status=None, on_delta=None, max_rounds=None,
+                             session_id="default", cancel_event=None, confirm_plan=None):
+            gate.wait(3)
+            return "done"
+
+        hb.agent.coding_task = fake_coding_task
+        hb.cfg["project_dir"] = str(Path(tmp.name) / "proj")
+        hb._send_chat("写一个 html 页面")
+        rt = hb.kernel.runtime
+        deadline = time.time() + 3
+        while time.time() < deadline and not rt.is_busy("coding"):
+            wait(20)
+        origin = hb._coding_task_session
+        assert origin == "default"
+
+        other = hb.db.create_session("其他会话")
+        hb._switch_session(other)
+        assert hb.current_session_id == other
+        assert rt.is_busy("coding"), "切换会话不应打断编码任务"
+        assert hb._coding_task_session == origin
+
+        hb._cancel_coding()
+        gate.set()
+        wait(300)
+        assert not rt.is_busy("coding")
+    finally:
+        _cleanup(tmp, hb, orig_gather)
 
 
 def _run_all():

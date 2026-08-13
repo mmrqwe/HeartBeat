@@ -130,6 +130,23 @@ class Runtime(QObject):
         """任务当前 epoch（子线程可安全读取：GIL 下 int 读原子）。"""
         return self._epochs.get(name, 0)
 
+    def cancel(self, name):
+        """主动取消正在运行的任务。
+
+        与超时清理等价（epoch +1、释放 busy、取消 future），但不触发
+        on_timeout/on_result/on_error；在途线程的结果会被 epoch 丢弃。
+        """
+        spec = self._tasks.get(name)
+        if not spec or name not in self._busy:
+            return False
+        self._epochs[name] += 1
+        self._busy.discard(name)
+        spec["watchdog"].stop()
+        future = spec.get("future")
+        if future is not None:
+            future.cancel()
+        return True
+
     def _on_interval(self, name):
         """定时器到点：有 on_timer 时交给回调（由回调负责重排/触发/状态）；
 

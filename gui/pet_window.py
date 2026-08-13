@@ -51,6 +51,7 @@ class PetWindow(QWidget):
     say_requested = Signal()
     settings_requested = Signal()
     search_requested = Signal()
+    stop_coding_requested = Signal()
     quit_requested = Signal()
 
     def __init__(self, cfg):
@@ -253,6 +254,7 @@ class PetWindow(QWidget):
         menu.addAction("打声招呼", self.say_requested.emit)
         menu.addAction("设置…", self.settings_requested.emit)
         menu.addAction("搜索…", self.search_requested.emit)
+        menu.addAction("停止编码任务", self.stop_coding_requested.emit)
         menu.addSeparator()
         menu.addAction("退出", self.quit_requested.emit)
         menu.exec(event.globalPos())

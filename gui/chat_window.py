@@ -66,7 +66,9 @@ class ChatInput(QTextEdit):
 
 class ChatWindow(QWidget):
     def __init__(self, pet_name, on_send, on_clear, on_pick_dir=None,
-                 on_new_session=None, on_switch_session=None, on_delete_session=None):
+                 on_new_session=None, on_switch_session=None,
+                 on_delete_session=None, on_rename_session=None,
+                 on_cancel_coding=None):
         super().__init__()
         self.pet_name = pet_name
         self.on_send = on_send
@@ -75,6 +77,8 @@ class ChatWindow(QWidget):
         self.on_new_session = on_new_session
         self.on_switch_session = on_switch_session
         self.on_delete_session = on_delete_session
+        self.on_rename_session = on_rename_session
+        self.on_cancel_coding = on_cancel_coding
         self.messages = []
         self._last_bubble = None
         self._streaming = False
@@ -113,9 +117,14 @@ class ChatWindow(QWidget):
         del_btn.setToolTip("删除选中的对话")
         del_btn.setFixedWidth(34)
         del_btn.clicked.connect(self._on_delete_session)
+        rename_btn = QPushButton("✏️")
+        rename_btn.setToolTip("重命名选中的对话")
+        rename_btn.setFixedWidth(34)
+        rename_btn.clicked.connect(self._on_rename_session)
         side_header.addWidget(side_title)
         side_header.addStretch(1)
         side_header.addWidget(new_btn)
+        side_header.addWidget(rename_btn)
         side_header.addWidget(del_btn)
         side_layout.addLayout(side_header)
         self.session_list = QListWidget()
@@ -156,11 +165,19 @@ class ChatWindow(QWidget):
         header_layout.addWidget(self.stats_label)
         main.addWidget(header)
 
+        coding_row = QHBoxLayout()
+        coding_row.setContentsMargins(12, 2, 12, 2)
         self.coding_status_label = QLabel("")
         self.coding_status_label.setObjectName("CodingStatus")
         self.coding_status_label.setWordWrap(True)
         self.coding_status_label.hide()
-        main.addWidget(self.coding_status_label)
+        self.stop_coding_btn = QPushButton("■ 停止")
+        self.stop_coding_btn.setToolTip("停止当前编码任务（改过的文件都有备份）")
+        self.stop_coding_btn.hide()
+        self.stop_coding_btn.clicked.connect(self._on_stop_coding)
+        coding_row.addWidget(self.coding_status_label, 1)
+        coding_row.addWidget(self.stop_coding_btn)
+        main.addLayout(coding_row)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -235,6 +252,17 @@ class ChatWindow(QWidget):
         )
         if answer == QMessageBox.Yes and self.on_delete_session is not None:
             self.on_delete_session(sid)
+
+    def _on_rename_session(self):
+        item = self.session_list.currentItem()
+        if item is None:
+            return
+        idx = self.session_list.row(item)
+        if not (0 <= idx < len(self._session_ids)):
+            return
+        sid = self._session_ids[idx]
+        if self.on_rename_session is not None:
+            self.on_rename_session(sid)
 
     # ---------- 消息 ----------
 
@@ -346,9 +374,12 @@ class ChatWindow(QWidget):
         布局未就绪（real=0）时重试一帧——QTextEdit 的文档 relayout 与
         singleShot 回调的调度顺序不保证，必须等到真实高度可用。
         """
-        if bubble is None or not bubble.window() or not bubble.window().isVisible():
-            return
-        real = bubble.document().size().height()
+        try:
+            if bubble is None or not bubble.window() or not bubble.window().isVisible():
+                return
+            real = bubble.document().size().height()
+        except RuntimeError:
+            return  # 窗口已销毁：不再触碰已删除的 C++ 对象
         if real > 0:
             bubble.setFixedHeight(max(int(real) + 4, 24))
             self._scroll_to_bottom()
@@ -433,6 +464,14 @@ class ChatWindow(QWidget):
         else:
             self.coding_status_label.hide()
 
+    def set_coding_running(self, running):
+        """编码任务运行期间显示“停止”按钮。"""
+        self.stop_coding_btn.setVisible(bool(running))
+
+    def _on_stop_coding(self):
+        if self.on_cancel_coding is not None:
+            self.on_cancel_coding()
+
     def set_thinking(self, on):
         if on:
             self._think_dots = 0
@@ -459,8 +498,16 @@ class ChatWindow(QWidget):
 
     def _scroll_to_bottom(self):
         bar = self.scroll.verticalScrollBar()
-        QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
-        QTimer.singleShot(50, lambda: bar.setValue(bar.maximum()))
+
+        def _set():
+            try:
+                if bar is not None:
+                    bar.setValue(bar.maximum())
+            except RuntimeError:
+                pass  # 窗口已销毁：定时器晚到，不再触碰已删除的 C++ 对象
+
+        QTimer.singleShot(0, _set)
+        QTimer.singleShot(50, _set)
 
     def closeEvent(self, event):
         if self._think_timer:

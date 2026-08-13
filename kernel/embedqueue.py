@@ -37,6 +37,7 @@ class EmbedQueue:
         self._worker = None  # fn(kind, item_id, text) -> None（宿主注入）
         self._thread = None
         self._started = False
+        self._stopped = False
         self._lock = threading.Lock()
         self._processing = 0    # worker 正在处理的任务数（flush 需等它归零）
         self._counter_lock = threading.Lock()
@@ -45,12 +46,14 @@ class EmbedQueue:
 
     def set_worker(self, worker):
         """注入 worker 并启动单 worker 线程（幂等）。"""
+        if self._stopped:
+            return
         self._worker = worker
         self._ensure_started()
 
     def _ensure_started(self):
         with self._lock:
-            if self._started or self._worker is None:
+            if self._started or self._worker is None or self._stopped:
                 return
             self._started = True
             self._thread = threading.Thread(
@@ -62,7 +65,7 @@ class EmbedQueue:
 
     def enqueue(self, kind, item_id, text) -> bool:
         """入队一个向量索引任务。返回是否真正入队（worker 未注入返回 False）。"""
-        if self._worker is None:
+        if self._worker is None or self._stopped:
             return False
         self._ensure_started()
         try:
@@ -84,8 +87,11 @@ class EmbedQueue:
     # ---------- worker ----------
 
     def _loop(self):
-        while True:
-            kind, item_id, text = self._q.get()
+        while not self._stopped:
+            item = self._q.get()
+            if item is None:
+                return
+            kind, item_id, text = item
             worker = self._worker
             if worker is None:
                 continue
@@ -125,6 +131,33 @@ class EmbedQueue:
             time.sleep(0.01)
         with self._counter_lock:
             return self._q.empty() and self._processing == 0
+
+    def stop(self, timeout=3.0) -> bool:
+        """停止 worker：置停止标志 + 发哨兵唤醒，join 线程后清空队列。
+
+        stop 后可安全重复调用；已入队未处理任务直接丢弃（向量缺口由 reindex 补齐）。
+        """
+        with self._lock:
+            if self._stopped and self._thread is None:
+                return True
+            self._stopped = True
+            try:
+                self._q.put_nowait(None)
+            except queue.Full:
+                self.clear()
+                try:
+                    self._q.put_nowait(None)
+                except queue.Full:
+                    pass
+            thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+        with self._lock:
+            self.clear()
+            self._worker = None
+            self._thread = None
+            self._started = False
+        return thread is None or not thread.is_alive()
 
     def pending(self) -> int:
         return self._q.qsize()

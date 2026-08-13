@@ -9,7 +9,11 @@
 
 import json
 import os
+import re
+import shlex
 import subprocess as sp
+import sys
+import threading
 import time
 from pathlib import Path
 
@@ -26,8 +30,13 @@ def _signals_permitted():
     CodePapr 沙箱等受限环境会返回 EPERM（连 kill(pid, 0) 都拒绝）——
     这种环境下 kill 类断言必须跳过；真实桌面应用无此限制。
     """
+    if os.name == "nt":
+        # Windows 没有 POSIX kill/signal 限制，processpool 也走 proc.kill()，
+        # 无需（也无法用）sleep 子进程探测。
+        return True
     proc = sp.Popen(
-        ["sleep", "5"], stdout=sp.PIPE, stderr=sp.STDOUT, stdin=sp.DEVNULL,
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        stdout=sp.PIPE, stderr=sp.STDOUT, stdin=sp.DEVNULL,
     )
     try:
         os.kill(proc.pid, 0)
@@ -86,6 +95,36 @@ def _make_project(tmp_path):
     (proj / ".git").mkdir()  # 应被目录遍历跳过
     (proj / "bin.dat").write_bytes(b"\x00\x01\x02" + b"x" * 20)
     return proj
+
+
+def _python_cmd(script):
+    """跨平台：用当前解释器执行脚本（Windows=PowerShell 兼容，POSIX=bash 兼容）。"""
+    if os.name == "nt":
+        return sp.list2cmdline([sys.executable, script])
+    return shlex.join([sys.executable, script])
+
+
+def test_coding_system_includes_persona(tmp_path):
+    """编码上下文必须注入宠物人设：换技能不换性格。"""
+    proj = _make_project(tmp_path)
+    cfg = _cfg(project_dir=str(proj))
+    cfg["pet_name"] = "测试猫"
+    messages = coding_agent._build_messages(cfg, "改一下")
+    content = messages[0]["content"]
+    assert "测试猫" in content
+    assert "编程时你依然是同一只宠物" in content
+
+
+def test_coding_loop_cancel_event(tmp_path):
+    """cancel_event 置位后，coding 循环在轮次边界立即停止。"""
+    proj = _make_project(tmp_path)
+    cfg = _cfg(project_dir=str(proj))
+    cancel = threading.Event()
+    cancel.set()
+    reply = coding_agent.run_coding_task(
+        None, cfg, "改一下", lambda name, args: "ok", cancel_event=cancel
+    )
+    assert "取消" in reply
 
 
 # ---------- 只读文件工具 ----------
@@ -235,25 +274,40 @@ def test_write_file_confirm_declined(tmp_path, monkeypatch):
     assert "def hello()" in (proj / "src" / "main.py").read_text(encoding="utf-8")
 
 
-def test_write_file_full_mode_auto_approve(tmp_path, monkeypatch):
+def test_write_file_full_mode_new_auto_approve_overwrite_confirms(tmp_path, monkeypatch):
     proj = _make_project(tmp_path)
     monkeypatch.setattr(tools, "user_data_dir", lambda: str(tmp_path))
-    # full 档与 run_bash 语义一致：不弹确认（confirm_cb 返回 False 也不拦）
+    # full 档新建文件自动放行
+    text = _exec(
+        "write_file", {"path": "new_auto.txt", "content": "AUTO"},
+        mode="full", project_dir=proj, confirm=lambda _d: False,
+    )
+    assert "已写入" in text
+    assert (proj / "new_auto.txt").read_text(encoding="utf-8") == "AUTO"
+    # 覆盖已有文件属于破坏性操作：full 档也必须确认
     text = _exec(
         "write_file", {"path": "src/main.py", "content": "AUTO"},
         mode="full", project_dir=proj, confirm=lambda _d: False,
     )
-    assert "已写入" in text
-    assert (proj / "src" / "main.py").read_text(encoding="utf-8") == "AUTO"
+    assert "未确认" in text
+    assert "def hello()" in (proj / "src" / "main.py").read_text(encoding="utf-8")
 
 
-def test_edit_file_full_mode_auto_approve(tmp_path, monkeypatch):
+def test_edit_file_full_mode_still_confirms(tmp_path, monkeypatch):
     proj = _make_project(tmp_path)
     monkeypatch.setattr(tools, "user_data_dir", lambda: str(tmp_path))
+    # 编辑已有文件=破坏性操作：full 档也先确认
     text = _exec(
         "edit_file",
         {"path": "src/main.py", "search": "return 'hi'", "replace": "return 'auto'"},
         mode="full", project_dir=proj, confirm=lambda _d: False,
+    )
+    assert "未确认" in text
+    assert "return 'hi'" in (proj / "src" / "main.py").read_text(encoding="utf-8")
+    text = _exec(
+        "edit_file",
+        {"path": "src/main.py", "search": "return 'hi'", "replace": "return 'auto'"},
+        mode="full", project_dir=proj, confirm=lambda _d: True,
     )
     assert "已编辑" in text
     assert "return 'auto'" in (proj / "src" / "main.py").read_text(encoding="utf-8")
@@ -360,7 +414,7 @@ def test_edit_file_no_change(tmp_path):
 # ---------- 声明 ----------
 
 
-def test_coding_declarations_include_9_tools():
+def test_coding_declarations_include_all_tools():
     cfg = _cfg("confirm")
     names = {d["function"]["name"] for d in tools.coding_declarations(cfg)}
     for t in tools.CODING_TOOLS:
@@ -387,12 +441,201 @@ def test_tool_declarations_coding_gated_by_project_dir():
     assert "bg_exec" in names
 
 
+def test_todo_tool_add_list_done_clear(tmp_path, monkeypatch):
+    proj = _make_project(tmp_path)
+    monkeypatch.setattr(tools, "user_data_dir", lambda: str(tmp_path))
+    out = _exec("todo", {"action": "add", "item": "读 main.py"}, project_dir=proj)
+    assert "已添加待办 #1" in out
+    _exec("todo", {"action": "add", "item": "跑测试"}, project_dir=proj)
+    out = _exec("todo", {"action": "list"}, project_dir=proj)
+    assert "读 main.py" in out and "跑测试" in out
+    out = _exec("todo", {"action": "done", "id": 1}, project_dir=proj)
+    assert "已完成待办 #1" in out
+    assert "✅" in _exec("todo", {"action": "list"}, project_dir=proj)
+    other = tmp_path / "other"
+    other.mkdir()
+    assert "空的" in _exec("todo", {"action": "list"}, project_dir=other)
+    assert "已清空" in _exec("todo", {"action": "clear"}, project_dir=proj)
+
+
+def test_list_and_restore_backup(tmp_path, monkeypatch):
+    proj = _make_project(tmp_path)
+    monkeypatch.setattr(tools, "user_data_dir", lambda: str(tmp_path))
+    _exec(
+        "write_file", {"path": "src/main.py", "content": "V2"},
+        project_dir=proj,
+    )
+    out = _exec("list_backups", {"path": "src/main.py"}, project_dir=proj)
+    assert "src/main.py" in out
+    backup_id = out.split("[")[1].split("]")[0]
+    (proj / "src" / "main.py").write_text("BROKEN", encoding="utf-8")
+    out = _exec(
+        "restore_backup",
+        {"backup_id": backup_id, "path": "src/main.py"},
+        project_dir=proj,
+        confirm=lambda _d: True,
+    )
+    assert "已从备份" in out
+    assert "def hello()" in (proj / "src" / "main.py").read_text(encoding="utf-8")
+
+
+def test_plan_confirm_true_appends_plan(tmp_path):
+    proj = _make_project(tmp_path)
+    cfg = _cfg("confirm", project_dir=str(proj))
+    brain = _FakeBrain([("", [])], final_reply="我的计划")
+    approved = []
+    reply = coding_agent.run_coding_task(
+        brain, cfg, "改一下", lambda n, a: "x",
+        confirm_plan=lambda p: approved.append(p) or True,
+    )
+    assert approved == ["我的计划"]
+    assert reply == "我的计划"
+
+
+def test_plan_confirm_false_cancels(tmp_path):
+    proj = _make_project(tmp_path)
+    cfg = _cfg("confirm", project_dir=str(proj))
+    brain = _FakeBrain([("", [])], final_reply="我的计划")
+    reply = coding_agent.run_coding_task(
+        brain, cfg, "改一下", lambda n, a: "x",
+        confirm_plan=lambda p: False,
+    )
+    assert "计划没确认" in reply
+    assert all(c[0] == "complete" for c in brain.calls)
+
+
+def test_coding_context_includes_readme(tmp_path):
+    proj = _make_project(tmp_path)
+    (proj / "README.md").write_text(
+        "# 测试项目\n这是项目说明", encoding="utf-8"
+    )
+    cfg = _cfg("confirm", project_dir=str(proj))
+    messages = coding_agent._build_messages(cfg, "x")
+    content = messages[0]["content"]
+    assert "README 摘要" in content
+    assert "测试项目" in content
+
+
+def test_coding_context_includes_shell_hint(tmp_path):
+    proj = _make_project(tmp_path)
+    cfg = _cfg("confirm", project_dir=str(proj))
+    messages = coding_agent._build_messages(cfg, "x")
+    content = messages[0]["content"]
+    assert "Shell 环境" in content
+    expected = "Windows PowerShell" if os.name == "nt" else "Bash"
+    assert expected in content
+
+
+def test_bg_check_streams_tail_to_status(tmp_path):
+    proj = _make_project(tmp_path)
+    cfg = _cfg("confirm", project_dir=str(proj))
+    brain = _FakeBrain([
+        ("", [_tc("bg_exec", {"command": "build"})]),
+        ("", [_tc("bg_check", {"task_id": "abc"})]),
+        ("构建完成", []),
+    ])
+
+    def run_tool(name, arguments):
+        if name == "bg_check":
+            return "状态：running\n最近输出：\n编译中..."
+        return "已启动 abc"
+
+    statuses = []
+    coding_agent.run_coding_task(
+        brain, cfg, "构建", run_tool, on_status=statuses.append,
+    )
+    assert any("后台输出：编译中" in s for s in statuses)
+
+
+def test_redact_secrets():
+    assert tools.redact_secrets("key=sk-abc123456789") == "key=***"
+    assert "sk-***" in tools.redact_secrets("token sk-abcdef123456")
+    assert tools.redact_secrets("Bearer abcdef123456") == "Bearer ***"
+
+
+def test_e2e_edit_verify_fail_rollback(tmp_path, monkeypatch):
+    """端到端：真实改文件 → 真实跑验证失败 → list_backups + restore_backup 回滚 → 再验证通过。"""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "main.py").write_text(
+        "def add(a, b):\n    return a + b\n", encoding="utf-8"
+    )
+    (proj / "verify.py").write_text(
+        "from main import add\n"
+        "assert add(1, 2) == 3\n"
+        "print('VERIFY_OK')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tools, "user_data_dir", lambda: str(tmp_path))
+    cfg = _cfg("confirm", project_dir=str(proj))
+    cmd = _python_cmd("verify.py")
+    brain = _FakeBrain([
+        ("", [_tc("read_file", {"path": "main.py"})]),
+        (
+            "",
+            [_tc(
+                "edit_file",
+                {
+                    "path": "main.py",
+                    "search": "return a + b",
+                    "replace": "return a - b",
+                },
+            )],
+        ),
+        ("", [_tc("bg_exec", {"command": cmd})]),
+        ("", [_tc("bg_check", {"task_id": "e2e"})]),
+        ("验证失败，我来回滚", []),
+    ])
+    real_pid = {"value": None}
+
+    def run_tool(name, arguments):
+        if name == "bg_exec":
+            out = tools.execute(
+                name, arguments, mode="confirm", source=tools.SOURCE_USER,
+                confirm_cb=lambda _d: True, project_dir=str(proj),
+            )
+            m = re.search(r"后台任务已启动：([0-9a-f]+)", out)
+            if m:
+                real_pid["value"] = m.group(1)
+            return out
+        if name == "bg_check":
+            args = json.loads(arguments)
+            args["task_id"] = real_pid["value"] or "e2e"
+            arguments = json.dumps(args)
+        return tools.execute(
+            name, arguments, mode="confirm", source=tools.SOURCE_USER,
+            confirm_cb=lambda _d: True, project_dir=str(proj),
+        )
+
+    reply = coding_agent.run_coding_task(brain, cfg, "把加法改成减法", run_tool)
+    assert "验证失败" in reply
+    assert "return a - b" in (proj / "main.py").read_text(encoding="utf-8")
+
+    out = tools.execute(
+        "list_backups", json.dumps({"path": "main.py"}),
+        mode="confirm", source=tools.SOURCE_USER, project_dir=str(proj),
+    )
+    backup_id = out.split("[")[1].split("]")[0]
+    tools.execute(
+        "restore_backup",
+        json.dumps({"backup_id": backup_id, "path": "main.py"}),
+        mode="confirm", source=tools.SOURCE_USER,
+        confirm_cb=lambda _d: True, project_dir=str(proj),
+    )
+    assert "return a + b" in (proj / "main.py").read_text(encoding="utf-8")
+    proc = sp.run(
+        [sys.executable, "verify.py"], cwd=str(proj),
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0 and "VERIFY_OK" in proc.stdout
+
+
 # ---------- 后台进程工具（kernel.processpool） ----------
 
 
 def test_bg_exec_check_done(tmp_path):
     proj = _make_project(tmp_path)
-    pid_text = _exec("bg_exec", {"command": "sleep 0.3 && echo DONE_MARK"},
+    pid_text = _exec("bg_exec", {"command": "sleep 0.3; echo DONE_MARK"},
                      project_dir=proj)
     assert "后台任务已启动" in pid_text
     pid = pid_text.split("：")[1].split("（")[0].strip()

@@ -110,6 +110,20 @@ def test_coding_status_show_hide():
     assert w.coding_status_label.isHidden()
 
 
+def test_stop_coding_button():
+    """编码运行中显示停止按钮，点击回调宿主。"""
+    calls = []
+    w = _make_window()
+    w.on_cancel_coding = lambda: calls.append(1)
+    assert w.stop_coding_btn.isHidden()
+    w.set_coding_running(True)
+    assert not w.stop_coding_btn.isHidden()
+    w._on_stop_coding()
+    assert calls == [1]
+    w.set_coding_running(False)
+    assert w.stop_coding_btn.isHidden()
+
+
 def test_sessions_sidebar_render_and_switch():
     """会话侧边栏：渲染/高亮/📁 标记；点击非当前会话回调宿主。"""
     w = _make_window()

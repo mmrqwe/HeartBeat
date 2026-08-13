@@ -1,6 +1,6 @@
 """kernel.runtime 行为验证：epoch 竞态 / busy 保护 / watchdog 超时 / 定时重排。
 
-用 QCoreApplication（offscreen，无需 GUI）验证 Runtime 的关键机制与旧
+用 QApplication（offscreen，无需真实窗口）验证 Runtime 的关键机制与旧
 HeartBeatApp 手写 QTimer+线程逻辑的行为等价性。可直接运行，也可用 pytest：
     python test_runtime.py
 """
@@ -8,7 +8,7 @@ HeartBeatApp 手写 QTimer+线程逻辑的行为等价性。可直接运行，�
 import sys
 import time
 
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 
 from kernel.runtime import Runtime
 
@@ -18,7 +18,9 @@ _app = None
 def _ensure_app():
     global _app
     if _app is None:
-        _app = QCoreApplication.instance() or QCoreApplication(sys.argv)
+        # 用 QApplication 而非 QCoreApplication：若本文件先跑，
+        # 不能留下“非 GUI 单例”挡住后续 app_integration 的 QWidget。
+        _app = QApplication.instance() or QApplication(sys.argv)
     return _app
 
 
@@ -143,6 +145,27 @@ def test_error_callback_receives_exception_object():
     wait(200)
     assert len(errors) == 1 and isinstance(errors[0], ValueError), f"errors: {errors}"
     assert str(errors[0]) == "boom"
+
+
+def test_cancel_clears_busy_and_drops_result():
+    """主动取消：busy 立即释放，在途结果被 epoch 丢弃，不触发 on_timeout。"""
+    rt = Runtime()
+    results = []
+    timeouts = []
+    rt.add_task(
+        "c1",
+        work=lambda epoch: time.sleep(0.2) or "late",
+        timeout_ms=5000,
+        on_result=lambda r: results.append(r),
+        on_timeout=lambda: timeouts.append(1),
+    )
+    assert rt.trigger("c1")
+    assert rt.cancel("c1") is True
+    assert not rt.is_busy("c1")
+    assert rt.cancel("c1") is False
+    wait(400)
+    assert results == []
+    assert timeouts == []
 
 
 def test_stop_all_cancels_queued_and_silences_inflight():

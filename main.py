@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import re
 import sys
 import threading
 import time
@@ -10,12 +11,19 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon
-from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
+from PySide6.QtWidgets import (
+    QApplication,
+    QInputDialog,
+    QMenu,
+    QMessageBox,
+    QSystemTrayIcon,
+)
 
 import agent
 import core
 import db
 import kernel
+import tools
 from brain.coding_agent import is_coding_intent
 from gui import skins, theme
 from gui.chat_window import ChatWindow
@@ -37,12 +45,14 @@ class Bridge(QObject):
     这里只保留子线程实时事件：流式增量、状态、工具确认。
     """
 
-    delta = Signal(object, str)
+    delta = Signal(object, str, str)  # (epoch, text, session_id)
     status = Signal(str)
     # 主动打招呼回复（后台线程生成 → 主线程气泡）
     greet_reply = Signal(str)
     # Coding 任务步骤进度（agent 子线程 → 主线程状态行）
-    coding_status = Signal(str)
+    coding_status = Signal(str, str)  # (text, session_id)
+    # 编码计划确认：plan, event, result_holder（子线程 emit 后阻塞等 event）
+    plan_confirm = Signal(str, object, object)
     # 工具确认：cmdline, event, result_holder（子线程 emit 后阻塞等 event）
     tool_confirm = Signal(str, object, object)
 
@@ -76,10 +86,13 @@ class HeartBeatApp:
         self.bridge.status.connect(self._set_status)
         self.bridge.greet_reply.connect(self._show_greet_reply)
         self.bridge.coding_status.connect(self._on_coding_status)
+        self.bridge.plan_confirm.connect(self._on_plan_confirm)
         self.bridge.tool_confirm.connect(self._on_tool_confirm)
         self._setup_runtime()
         # 注入工具确认回调：confirm 档写命令由主线程弹窗决定（60s 超时拒绝）
         self.agent.tool_confirm_cb = self._confirm_tool
+        # 注入编码计划确认：开始动手前先给主人看 3-5 步计划
+        self.agent.confirm_plan_cb = self._confirm_plan
 
         self.pet = PetWindow(self.cfg)
         self.pet.open_chat_requested.connect(self._open_chat)
@@ -87,7 +100,8 @@ class HeartBeatApp:
         self.pet.say_requested.connect(self._on_greet_requested)
         self.pet.settings_requested.connect(self._open_settings)
         self.pet.search_requested.connect(self._open_search)
-        self.pet.quit_requested.connect(QApplication.instance().quit)
+        self.pet.stop_coding_requested.connect(self._cancel_coding)
+        self.pet.quit_requested.connect(self._quit)
         self.pet.set_status(f"你好，我是{self.cfg['pet_name']}")
         role = self.cfg.get("role") or "小宠物"
         self.pet.show_bubble(
@@ -100,6 +114,11 @@ class HeartBeatApp:
         self.search_win = None
         self._chat_pending = []
         self._coding_pending = []
+        self._coding_cancel_event = threading.Event()
+        self._coding_status_text = ""
+        # 当前正在执行任务归属的会话（超时/失败回调仍要写回正确的会话）
+        self._chat_task_session = "default"
+        self._coding_task_session = "default"
         # 当前活跃会话（多对话）：任务入队时随 payload 透传，回复归属不会串
         self.current_session_id = "default"
 
@@ -272,7 +291,37 @@ class HeartBeatApp:
             self._toggle_pet()
 
     def _quit(self):
+        self.close()
         QApplication.instance().quit()
+
+    def close(self):
+        """优雅关闭：停任务调度 → 停向量队列 → 关闭数据库。
+
+        Windows 上 SQLite 文件会因连接未关闭而锁死临时目录/重命名，
+        macOS/Linux 虽可删除打开中的文件，也会留下未收尾的线程，统一走这里。
+        """
+        for win in (self.pet, self.chat_win, self.settings_win, self.search_win):
+            if win is not None:
+                try:
+                    win.close()
+                except Exception:
+                    pass
+                try:
+                    win.deleteLater()
+                except Exception:
+                    pass
+        try:
+            self.kernel.runtime.stop_all()
+        except Exception:
+            pass
+        try:
+            self.embed_queue.stop(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            self.db.close()
+        except Exception:
+            pass
 
     # ---------- 自主循环（调度在 kernel.runtime） ----------
 
@@ -409,6 +458,8 @@ class HeartBeatApp:
                 on_new_session=self._new_session,
                 on_switch_session=self._switch_session,
                 on_delete_session=self._delete_session,
+                on_rename_session=self._rename_session,
+                on_cancel_coding=self._cancel_coding,
             )
             for entry in self.agent.chat_history(session_id=self.current_session_id):
                 self.chat_win.add_message(entry["role"], entry["text"], entry.get("time"))
@@ -417,6 +468,15 @@ class HeartBeatApp:
             self._refresh_sessions()
         self.chat_win.set_daily_stats(self._daily_stats_text())
         self.chat_win.show()
+        self.chat_win.set_coding_running(self.kernel.runtime.is_busy("coding"))
+        if (
+            self.kernel.runtime.is_busy("coding")
+            and self._coding_task_session != self.current_session_id
+        ):
+            info = self.db.session(self._coding_task_session) or {}
+            self.chat_win.set_coding_status(
+                f"编码任务正在「{info.get('name') or '其他会话'}」会话运行，可在此停止"
+            )
         self.chat_win.raise_()
         self.chat_win.activateWindow()
 
@@ -459,8 +519,11 @@ class HeartBeatApp:
             self._refresh_sessions()
             return
         self.current_session_id = session_id
-        if info and info.get("project_dir"):
-            self.cfg["project_dir"] = info["project_dir"]
+        target_dir = info.get("project_dir") if info else None
+        if str(self.cfg.get("project_dir", "") or "") != str(target_dir or ""):
+            # 绑定目录的会话切过去，未绑定会话切回来（含默认会话）必须清空，
+            # 否则编码任务会继续在旧项目目录里执行。
+            self.cfg["project_dir"] = target_dir or ""
             self.kernel.save_settings(self.cfg)  # 持久化 + config.saved 广播
         if self.chat_win is not None:
             self.chat_win.clear()
@@ -486,11 +549,31 @@ class HeartBeatApp:
             return
         if not self.db.delete_session(session_id):
             return
+        # 会话删除后同步清掉它的滚动摘要状态
+        self.agent.state.pop(f"conversation_summary:{session_id}", None)
+        self.agent.db.delete_state(f"conversation_summary:{session_id}")
+        self.agent._save_state()
         if self.current_session_id == session_id:
             self._switch_session("default")
         else:
             self._refresh_sessions()
         self._set_status("会话已删除")
+
+    def _rename_session(self, session_id):
+        info = self.db.session(session_id)
+        if info is None:
+            return
+        name, ok = QInputDialog.getText(
+            self.chat_win if self.chat_win is not None else None,
+            "重命名对话",
+            "新名称：",
+            text=str(info.get("name") or ""),
+        )
+        if not ok or not str(name or "").strip():
+            return
+        self.db.rename_session(session_id, name.strip())
+        self._refresh_sessions()
+        self._set_status("会话已重命名")
 
     # ---------- 工具确认（子线程 → 主线程弹窗） ----------
 
@@ -502,21 +585,82 @@ class HeartBeatApp:
         event.wait(60)
         return bool(holder.get("approved", False))
 
+    def _confirm_plan(self, plan):
+        """子线程调用：编码动手前请主人确认计划（超时按取消）。"""
+        event = threading.Event()
+        holder = {}
+        self.bridge.plan_confirm.emit(
+            tools.redact_secrets(str(plan or "")), event, holder
+        )
+        event.wait(120)
+        return bool(holder.get("approved", False))
+
+    def _format_confirm_text(self, cmdline):
+        """确认弹窗文案：diff 载荷转成“改前/改后”预览，并打码密钥。"""
+        if isinstance(cmdline, dict):
+            action = {
+                "write_file": "写入文件",
+                "edit_file": "编辑文件",
+            }.get(cmdline.get("action"), "修改文件")
+            path = str(cmdline.get("path", ""))
+            before = str(cmdline.get("before", ""))
+            after = str(cmdline.get("after", ""))
+
+            def snippet(text, lines=30):
+                parts = text.splitlines()
+                body = "\n".join(parts[:lines])
+                return body + ("\n…" if len(parts) > lines else "")
+
+            text = "\n".join([
+                f"桌宠想{action}：{path}",
+                "",
+                "修改前：",
+                snippet(before),
+                "",
+                "修改后：",
+                snippet(after),
+            ])
+            return tools.redact_secrets(text)
+        return tools.redact_secrets(str(cmdline))
+
+    def _on_plan_confirm(self, plan, event, holder):
+        """主线程槽：显示编码计划，等待主人确认/拒绝。"""
+        try:
+            box = QMessageBox(None)
+            box.setWindowTitle("编码计划确认")
+            box.setText(
+                f"桌宠打算这样改：\n\n{plan}\n\n"
+                "确认按这个计划动手吗？点「否」或等待超时会取消。"
+            )
+            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            box.setDefaultButton(QMessageBox.No)
+            box.setWindowFlags(box.windowFlags() | Qt.WindowStaysOnTopHint)
+            box.setWindowModality(Qt.WindowModal)
+            answer = box.exec()
+            holder["approved"] = answer == QMessageBox.Yes
+        except Exception:
+            holder["approved"] = False
+        finally:
+            event.set()
+
     def _on_tool_confirm(self, cmdline, event, holder):
         """主线程槽：弹窗显示命令全文，用户允许/拒绝。"""
         try:
             box = QMessageBox(None)
             box.setWindowTitle("桌宠请求确认")
-            is_auth = "skill_auth" in cmdline or "认证" in cmdline
+            is_auth = isinstance(cmdline, str) and (
+                "skill_auth" in cmdline or "认证" in cmdline
+            )
+            detail = self._format_confirm_text(cmdline)
             if is_auth:
                 box.setText(
                     f"桌宠要配置技能认证（如知乎），这不是危险操作，"
-                    f"请点「是」允许完成配置：\n\n{cmdline}\n\n"
+                    f"请点「是」允许完成配置：\n\n{detail}\n\n"
                     "点「是」= 允许；点「否」或等待超时 = 取消。"
                 )
             else:
                 box.setText(
-                    f"桌宠想在你的电脑上执行：\n\n{cmdline}\n\n"
+                    f"桌宠想在你的电脑上执行：\n\n{detail}\n\n"
                     "请确认这是你要求的操作。点「否」或等待超时都会取消执行。"
                 )
             box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
@@ -534,9 +678,22 @@ class HeartBeatApp:
 
     def _send_chat(self, text):
         self.pet.play("think")
+        # 编码任务跑着的时候，用户问进度/要求停止，直接由宠物回答，不排队走聊天
+        if self.kernel.runtime.is_busy("coding"):
+            low = str(text).strip().lower()
+            if re.search(r"停止|取消|别写了", low):
+                self._cancel_coding()
+                return
+            if re.search(r"在干嘛|干嘛|进度|到哪|完成|好了吗|怎么样|还在吗", low):
+                status = self._coding_status_text or "正在处理你的编码任务"
+                self._reply_direct(f"我正在：{status}。还要一会儿，好了我叫你～")
+                return
         # 编程任务自然路由（自进化已移除）：强信号关键词命中即走 coding；
         # 未选项目目录时给出引导，不静默降级为闲聊。
         if is_coding_intent(text):
+            # Coding 走平行路径，不经过 agent.chat，用户消息需要宿主落库，
+            # 否则会话历史里只有 assistant 回复、没有对应提问。
+            self.agent.append_chat("user", text, session_id=self.current_session_id)
             if not str(self.cfg.get("project_dir", "") or "").strip():
                 self._reply_direct(
                     "这是编程任务，但我还不知道项目目录在哪～\n"
@@ -545,13 +702,20 @@ class HeartBeatApp:
                 return
             if not self.kernel.runtime.trigger("coding", text, self.current_session_id):
                 self._coding_pending.append((text, self.current_session_id))
+                self._coding_status_text = "任务已排队，等上一条完成"
                 self._set_status("编码任务还在执行，已排队")
+            else:
+                self._coding_task_session = self.current_session_id
+                self._coding_status_text = "任务已开始"
+                if self.chat_win:
+                    self.chat_win.set_coding_running(True)
             self._refresh_sessions()
             return
         if not self.kernel.runtime.trigger("chat", text, self.current_session_id):
             self._chat_pending.append((text, self.current_session_id))
             self._set_status("上一条还在回复中，已排队")
             return
+        self._chat_task_session = self.current_session_id
         self._refresh_sessions()
 
     def _reply_direct(self, text):
@@ -561,6 +725,7 @@ class HeartBeatApp:
             self.chat_win.add_message("assistant", text)
             self.chat_win.set_thinking(False)
         self.pet.show_bubble(text.splitlines()[0], seconds=6)
+        self._refresh_sessions()
 
     def _chat_work(self, epoch, text, session_id="default"):
         """聊天任务体（子线程执行）：带工具循环的 LLM 回复（归属入队时的会话）。"""
@@ -571,11 +736,12 @@ class HeartBeatApp:
         )
         t0 = time.time()
         try:
-            return self.agent.chat(
+            reply = self.agent.chat(
                 text,
-                on_delta=lambda t, e=epoch: self._stream_delta(e, t),
+                on_delta=lambda t, e=epoch, sid=session_id: self._stream_delta(e, t, sid),
                 session_id=session_id,
             )
+            return session_id, reply
         except Exception as exc:
             # 失败消息归属任务会话（子线程直接落库）；主线程回调只做 UI 提示
             self.agent.append_chat(
@@ -588,24 +754,27 @@ class HeartBeatApp:
                 {"elapsed_ms": int((time.time() - t0) * 1000)}, trace,
             )
 
-    def _stream_delta(self, epoch, text):
+    def _stream_delta(self, epoch, text, session_id):
         if epoch != self.kernel.runtime.current_epoch("chat"):
             return
-        self.bridge.delta.emit(epoch, text)
+        self.bridge.delta.emit(epoch, text, session_id)
 
-    def _apply_stream_delta(self, epoch, text):
+    def _apply_stream_delta(self, epoch, text, session_id):
         if epoch != self.kernel.runtime.current_epoch("chat"):
             return
+        if session_id != self.current_session_id:
+            return  # 用户已切到别的会话：不往错误窗口里流式渲染
         if self.chat_win:
             self.chat_win.begin_stream()
             self.chat_win.update_last_message(text)
             if self.pet._mode != "talk":
                 self.pet.play("talk")
 
-    def _show_reply(self, reply):
-        """主线程回调（kernel.runtime 已过滤过期 epoch）。"""
+    def _show_reply(self, result):
+        """主线程回调（kernel.runtime 已过滤过期 epoch）；result=(session_id, reply)。"""
+        session_id, reply = result
         self.pet.play("talk", 1600)
-        if self.chat_win:
+        if self.chat_win and session_id == self.current_session_id:
             if self.chat_win.is_streaming():
                 # 流式已渲染占位气泡：用最终完整文本收尾，避免重复追加
                 self.chat_win.finish_stream(reply)
@@ -615,6 +784,7 @@ class HeartBeatApp:
             self.chat_win.set_mood(self.agent.state.get("mood", "平静"))
             self.chat_win.set_daily_stats(self._daily_stats_text())
         self._set_status("陪我聊天中")
+        self._refresh_sessions()
         self._drain_chat_pending()
 
     # ---------- Coding 模式（平行路径：见 brain/coding_agent.py） ----------
@@ -622,6 +792,7 @@ class HeartBeatApp:
     def _coding_work(self, epoch, text, session_id="default"):
         """编码任务体（子线程执行）：coding 循环 + 步骤状态回传（回复归属任务会话）。"""
         trace = f"coding_{uuid.uuid4().hex[:8]}"
+        self._coding_cancel_event.clear()
         self.agent._trace_id = trace
         self.db.log_event(
             db.EventType.CHAT_STARTED, "main.coding", {"text_len": len(text)}, trace,
@@ -630,39 +801,78 @@ class HeartBeatApp:
         try:
             reply = self.agent.coding_task(
                 text,
-                on_status=self.bridge.coding_status.emit,
+                on_status=lambda s, sid=session_id: self.bridge.coding_status.emit(s, sid),
                 session_id=session_id,
+                cancel_event=self._coding_cancel_event,
             )
-            self.agent.append_chat("assistant", reply, session_id=session_id)
-            return reply
+            if epoch == self.kernel.runtime.current_epoch("coding"):
+                # 用户手动取消后 epoch 已 +1：不再落库半途结果
+                self.agent.append_chat("assistant", reply, session_id=session_id)
+            return session_id, reply
         finally:
             self.db.log_event(
                 db.EventType.CHAT_FINISHED, "main.coding",
                 {"elapsed_ms": int((time.time() - t0) * 1000)}, trace,
             )
 
-    def _on_coding_status(self, text):
-        """编码任务步骤进度（agent 子线程 → 主线程）：聊天窗状态行。"""
-        if self.chat_win:
+    def _on_coding_status(self, text, session_id):
+        """编码任务步骤进度（agent 子线程 → 主线程）：只写归属会话的聊天窗。"""
+        text = tools.redact_secrets(str(text or ""))
+        self._coding_status_text = text
+        if self.chat_win and session_id == self.current_session_id:
             self.chat_win.set_coding_status(text)
-        preview = text if len(text) <= 16 else text[:15] + "…"
+            self.chat_win.set_coding_running(True)
+        preview = f"编码中：{text}"
+        if len(preview) > 20:
+            preview = preview[:19] + "…"
         self._set_status(preview)
 
-    def _show_coding_reply(self, reply):
-        """编码任务完成（主线程回调，runtime 已过滤过期 epoch）。"""
-        self.pet.play("talk", 1600)
-        if self.chat_win:
+    def _show_coding_reply(self, result):
+        """编码任务完成（主线程回调，runtime 已过滤过期 epoch）；result=(session_id, reply)。"""
+        session_id, reply = result
+        self.pet.play("happy", 1600)
+        self.pet.show_bubble(self._coding_bubble_text(reply), seconds=6)
+        if self.chat_win and session_id == self.current_session_id:
             self.chat_win.add_message("assistant", reply)
             self.chat_win.set_thinking(False)
             self.chat_win.set_coding_status("任务完成")
-        self._set_status("编码任务完成")
+            self.chat_win.set_coding_running(False)
+        self._coding_status_text = ""
+        self._set_status("编码任务完成～")
+        self._refresh_sessions()
         self._drain_coding_pending()
 
+    def _coding_bubble_text(self, reply):
+        """把编码最终回复压缩成宠物气泡的一句话（不贴日志/JSON）。"""
+        text = tools.redact_secrets(str(reply or "")).strip()
+        lines = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("```")
+        ]
+        if not lines:
+            return "搞定啦～"
+        summary = " ".join(lines[:2])
+        if len(summary) > 80:
+            summary = summary[:80] + "…"
+        return summary
+
     def _coding_timeout(self):
-        self._set_status("编码任务超时，已停止等待")
-        if self.chat_win:
+        self._set_status("呜，编码任务超时了")
+        session_id = self._coding_task_session
+        self.agent.append_chat(
+            "system", f"{time.strftime('%H:%M')} 编码任务超时（45 分钟）。", session_id=session_id
+        )
+        self.pet.show_bubble(
+            "呜，任务跑超时了……别担心，改过的文件都有备份。",
+            seconds=6,
+            animation="think",
+        )
+        self._coding_status_text = ""
+        if self.chat_win and session_id == self.current_session_id:
             self.chat_win.set_thinking(False)
             self.chat_win.set_coding_status("任务超时")
+            self.chat_win.set_coding_running(False)
             self.chat_win.add_message(
                 "system",
                 f"{time.strftime('%H:%M')} 编码任务超时（45 分钟）。"
@@ -671,14 +881,55 @@ class HeartBeatApp:
         self._drain_coding_pending()
 
     def _coding_error(self, error):
+        session_id = self._coding_task_session
         stamp = time.strftime("%H:%M")
         text = f"{stamp} 编码任务失败：{error}"
-        self._set_status("编码任务失败")
-        if self.chat_win:
+        self.agent.append_chat("system", text, session_id=session_id)
+        self._set_status("呜，编码任务失败了")
+        self.pet.show_bubble(
+            "呜，任务失败了……别怕，改过的文件都有备份，要我回滚吗？",
+            seconds=8,
+            animation="think",
+        )
+        self._coding_status_text = ""
+        if self.chat_win and session_id == self.current_session_id:
             self.chat_win.set_thinking(False)
             self.chat_win.set_coding_status("任务失败")
+            self.chat_win.set_coding_running(False)
             self.chat_win.add_message("system", text)
         self._drain_coding_pending()
+
+    def _cancel_coding(self):
+        """用户主动停止：取消 runtime 任务、清排队、杀后台进程、宠物气泡确认。"""
+        session_id = self._coding_task_session
+        running = self.kernel.runtime.cancel("coding")
+        had_pending = bool(self._coding_pending)
+        self._coding_pending.clear()
+        self._coding_cancel_event.set()
+        tools.cancel_all_background()
+        if not running and not had_pending:
+            self._reply_direct("现在没有编码任务在跑呢～")
+            return
+        self._coding_status_text = ""
+        if self.chat_win and session_id == self.current_session_id:
+            self.chat_win.set_thinking(False)
+            self.chat_win.set_coding_status("任务已停止")
+            self.chat_win.set_coding_running(False)
+            self.chat_win.add_message(
+                "system", f"{time.strftime('%H:%M')} 编码任务已手动停止"
+            )
+        self.agent.append_chat(
+            "system",
+            f"{time.strftime('%H:%M')} 编码任务已手动停止",
+            session_id=session_id,
+        )
+        self.pet.show_bubble(
+            "好，我停下来了～改到一半的文件都有备份。",
+            seconds=6,
+            animation="wave",
+        )
+        self._set_status("编码任务已停止")
+        self._refresh_sessions()
 
     def _drain_coding_pending(self):
         """coding 空闲后取出排队任务（FIFO，含会话归属）。"""
@@ -687,11 +938,21 @@ class HeartBeatApp:
         text, session_id = self._coding_pending[0]
         if self.kernel.runtime.trigger("coding", text, session_id):
             self._coding_pending.pop(0)
+            self._coding_task_session = session_id
+            self._coding_status_text = "任务已开始"
+            if self.chat_win:
+                self.chat_win.set_coding_running(True)
             self.pet.play("think")
 
     def _chat_timeout(self):
         self._set_status("回复超时，已停止等待")
-        if self.chat_win:
+        session_id = self._chat_task_session
+        self.agent.append_chat(
+            "system",
+            f"{time.strftime('%H:%M')} 回复超时，网络可能卡住了，请重试",
+            session_id=session_id,
+        )
+        if self.chat_win and session_id == self.current_session_id:
             self.chat_win.cancel_stream()  # 清理流式占位气泡，避免影响下次回复
             self.chat_win.set_thinking(False)
             self.chat_win.add_message(
@@ -701,10 +962,11 @@ class HeartBeatApp:
 
     def _chat_error(self, error):
         """chat 任务异常（主线程回调）：UI 提示（消息已由任务体落库到任务会话）。"""
+        session_id = self._chat_task_session
         stamp = time.strftime("%H:%M")
         text = f"{stamp} 回复失败：{error}"
         self._set_status("回复失败，请稍后重试")
-        if self.chat_win:
+        if self.chat_win and session_id == self.current_session_id:
             self.chat_win.cancel_stream()
             self.chat_win.set_thinking(False)
             self.chat_win.add_message("system", text)
@@ -717,6 +979,7 @@ class HeartBeatApp:
         text, session_id = self._chat_pending[0]
         if self.kernel.runtime.trigger("chat", text, session_id):
             self._chat_pending.pop(0)
+            self._chat_task_session = session_id
             self.pet.play("think")
 
     def _clear_chat(self):

@@ -36,6 +36,8 @@ IGNORED_DIR_NAMES = frozenset({
 BACKUP_MAX_COUNT = 50
 BACKUP_MAX_BYTES = 500 * 1024 * 1024  # 500MB
 
+_backup_seq = 0  # 进程内序号：Windows 时钟粒度下同一 tick 多次备份也能保证唯一
+
 
 class PathGuardError(Exception):
     """路径校验/备份失败（工具层捕获后转成给 LLM 的文本，不抛到循环外）。"""
@@ -86,14 +88,21 @@ def backup_before_write(project_dir, rel, backups_root):
         return None
     if not target.is_file():
         raise PathGuardError(f"目标是目录，拒绝覆盖写：{rel}")
-    # 时间片精确到微秒：同一秒内多次备份不得互相覆盖（目录名保持可排序）
-    micro = time.time_ns() // 1000 % 1_000_000
-    ts_dir = Path(backups_root) / (
-        time.strftime("%Y%m%d-%H%M%S") + f"-{micro:06d}"
-    )
+    # 时间片 = 纳秒时间戳 + 进程内序号：Windows 时钟粒度粗，单纯微秒会碰撞；
+    # 固定宽度保证按名字排序 == 按时间排序。
+    global _backup_seq
+    _backup_seq += 1
+    ts_dir = Path(backups_root) / f"{time.time_ns():020d}-{_backup_seq:06d}"
     backup_path = ts_dir / Path(rel).as_posix().strip("/")
     try:
         backup_path.parent.mkdir(parents=True, exist_ok=True)
+        # 记录项目根目录，供备份浏览/恢复工具确认归属，避免跨项目误恢复
+        try:
+            (ts_dir / ".project").write_text(
+                str(Path(project_dir).resolve()), encoding="utf-8"
+            )
+        except OSError:
+            pass
         shutil.copy2(target, backup_path)
         _prune_backups(backups_root)
     except OSError as exc:

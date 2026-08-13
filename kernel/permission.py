@@ -41,6 +41,26 @@ BASH_TIMEOUT = 15  # 秒
 BASH_MAX_OUTPUT = 4096  # 字符
 
 
+def shell_name():
+    """当前命令执行 Shell 的名称（用于提示词/工具声明）。"""
+    return "PowerShell（Windows）" if os.name == "nt" else "Bash（macOS/Linux）"
+
+
+def shell_hint():
+    """给 LLM 的跨平台命令习惯提示。"""
+    if os.name == "nt":
+        return (
+            "当前 Shell 是 Windows PowerShell。"
+            "命令之间用分号 ; 连接，不要用 &&（PowerShell 5.1 不支持）；"
+            "路径用反斜杠或正斜杠都可以；"
+            "查看目录可用 ls / Get-ChildItem，删除用 Remove-Item。"
+        )
+    return (
+        "当前 Shell 是 Bash。"
+        "命令可以用 && 连接；查看目录用 ls，删除用 rm。"
+    )
+
+
 def run_process(argv, **kwargs):
     """subprocess.run 封装：Windows 下隐藏子进程控制台窗口。
 
@@ -159,4 +179,12 @@ def human_brief(name, arguments):
         return ("检查后台任务：" + str(args.get("task_id", "")))[:80]
     if name == "bg_cancel":
         return ("取消后台任务：" + str(args.get("task_id", "")))[:80]
+    if name == "todo":
+        action = str(args.get("action", "list"))
+        item = str(args.get("item", "") or "")
+        return ("待办清单：" + action + (f" {item}" if item else ""))[:80]
+    if name == "list_backups":
+        return ("查看备份：" + str(args.get("path", "") or "全部"))[:80]
+    if name == "restore_backup":
+        return ("恢复备份：" + str(args.get("path", "")))[:80]
     return f"调用工具 {name}"[:80]

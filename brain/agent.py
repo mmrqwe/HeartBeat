@@ -40,6 +40,7 @@ class Agent(ChatMixin, ThinkMixin):
         self._embed_sig = (cfg.get("embedding_enabled"), cfg.get("embedding_model"))
         self._reindex_pending = False
         self.tool_confirm_cb: Optional[Callable[[str], bool]] = None  # GUI 注入：confirm 档写命令的用户确认回调
+        self.confirm_plan_cb = None  # GUI 注入：编码任务开始前确认执行计划
         self.eventbus = None  # GUI 注入：kernel.eventbus（工具执行旁路通知）
         # 向量索引异步队列（kernel.embedqueue，GUI 注入）：embedding 不再同步
         # 阻塞聊天/记忆写入；None（测试/CLI 直连）时保持同步旧行为
@@ -215,6 +216,19 @@ class Agent(ChatMixin, ThinkMixin):
     def clear_chat_history(self, session_id=None):
         """清空聊天记录：session_id=None 全清（旧语义），否则只清该会话。"""
         self.db.clear_chat(session_id)
+        # 会话级摘要状态同步清掉，避免“刚清空的会话”又把旧摘要注入上下文
+        if session_id is None:
+            stale_keys = [
+                key for key in self.state
+                if key == "conversation_summary"
+                or key.startswith("conversation_summary:")
+            ]
+        else:
+            stale_keys = [f"conversation_summary:{session_id}"]
+        for key in stale_keys:
+            self.state.pop(key, None)
+            self.db.delete_state(key)
+        self._save_state()
 
     # ---------- 聊天入口 ----------
 
@@ -411,13 +425,15 @@ class Agent(ChatMixin, ThinkMixin):
     # ---------- Coding 协作（P0：同步循环） ----------
 
     def coding_task(self, user_text, on_status=None, on_delta=None, max_rounds=None,
-                    session_id="default"):
+                    session_id="default", cancel_event=None, confirm_plan=None):
         """Coding 模式入口：在 project_dir 项目内完成编程任务。
 
         安全基座在 kernel（pathguard/processpool/权限判定），控制循环在
         brain.coding_agent（策略层）。工具以 SOURCE_USER 执行——写操作
         走 confirm 档用户确认，与聊天路径的 confirm_cb 共用同一弹窗。
         session_id：任务发起的会话（回复归属，不回写历史，由宿主落库）。
+        cancel_event：threading.Event；置位后 coding 循环在轮次边界停止。
+        confirm_plan：callable(plan)->bool；None 时用宿主注入的 confirm_plan_cb。
         """
         from brain.coding_agent import run_coding_task
 
@@ -428,4 +444,6 @@ class Agent(ChatMixin, ThinkMixin):
             self.brain, self.cfg, user_text, run,
             on_status=on_status, on_delta=on_delta, max_rounds=max_rounds,
             history=self.chat_history(session_id=session_id, limit=12),
+            cancel_event=cancel_event,
+            confirm_plan=confirm_plan if confirm_plan is not None else self.confirm_plan_cb,
         )

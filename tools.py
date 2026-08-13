@@ -14,7 +14,9 @@ import json
 import locale
 import os
 import re
+import shutil
 import subprocess
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -54,9 +56,28 @@ from kernel.permission import (  # noqa: F401
     run_process,
     resolve_workdir,
     run_bash,
+    shell_name,
+    shell_hint,
 )
 from kernel.permission import _filter_env  # noqa: F401  （test_tools 直接引用）
 from kernel.boot import user_data_dir  # noqa: F401
+
+_SECRET_KEY_RE = re.compile(
+    r"(?i)((?:sk-|key|api[_-]?key|token|password|passwd|secret|authorization)"
+    r"\s*[:=]\s*)([A-Za-z0-9_\-\.]{6,})"
+)
+_SECRET_BEARER_RE = re.compile(r"(?i)(bearer\s+)([A-Za-z0-9_\-\.]{6,})")
+_SECRET_SK_RE = re.compile(r"(?i)\b(sk-[A-Za-z0-9_\-]{8,})")
+
+
+def redact_secrets(text):
+    """把日志/状态行/气泡里的疑似密钥打码（key=xxx、Bearer xxx、sk-...）。"""
+    if not text:
+        return text
+    out = _SECRET_KEY_RE.sub(r"\1***", str(text))
+    out = _SECRET_BEARER_RE.sub(r"\1***", out)
+    out = _SECRET_SK_RE.sub("sk-***", out)
+    return out
 
 # ---------- 搜索工具（只读） ----------
 
@@ -620,6 +641,7 @@ def _exec_sandbox_run(args, source, confirm_cb, audit, mode):
 CODING_TOOLS = frozenset({
     "read_file", "list_files", "search_files", "glob_match",
     "write_file", "edit_file", "bg_exec", "bg_check", "bg_cancel",
+    "todo", "list_backups", "restore_backup",
 })
 
 READ_MAX_BYTES = 256 * 1024
@@ -884,8 +906,10 @@ def _exec_write_file(args, source, confirm_cb, audit, mode, project_dir):
             before = target.read_text(encoding="utf-8", errors="replace")
         except OSError:
             before = ""
-    # 4 档语义与 run_bash 一致：confirm 档弹窗；full 档自动放行
-    if mode == SHELL_MODE_CONFIRM:
+    # confirm 档弹窗；full 档新建文件自动放行，但覆盖已有文件必须确认
+    if mode == SHELL_MODE_CONFIRM or (
+        mode == SHELL_MODE_FULL and target.exists()
+    ):
         approved, denied = _confirm(
             _diff_payload("write_file", rel, before, content),
             confirm_cb, audit, source, "write_file", rel, mode,
@@ -961,8 +985,8 @@ def _exec_edit_file(args, source, confirm_cb, audit, mode, project_dir):
         backup = pathguard.backup_before_write(project_dir, rel, _backups_root())
     except pathguard.PathGuardError as exc:
         return _guard_error(audit, source, "edit_file", rel, mode, exc)
-    # 4 档语义与 run_bash 一致：confirm 档弹窗；full 档自动放行
-    if mode == SHELL_MODE_CONFIRM:
+    # 编辑已有文件本身就是破坏性操作：任何档位都必须确认
+    if mode in (SHELL_MODE_CONFIRM, SHELL_MODE_FULL):
         approved, denied = _confirm(
             _diff_payload("edit_file", rel, text, new_text),
             confirm_cb, audit, source, "edit_file", rel, mode,
@@ -993,6 +1017,11 @@ def _bg_pool():
     if _BG_POOL is None:
         _BG_POOL = processpool.BgPool()
     return _BG_POOL
+
+
+def cancel_all_background():
+    """取消所有后台进程（用户主动停止编码任务时调用，幂等）。"""
+    return _bg_pool().cancel_all()
 
 
 def _exec_bg_exec(args, source, confirm_cb, audit, mode, project_dir):
@@ -1065,8 +1094,208 @@ def _exec_bg_cancel(args, source, audit, mode):
     return text
 
 
+# ---------- 待办清单（按项目持久化到用户数据目录，不污染项目仓库） ----------
+
+_TODO_LOCK = threading.Lock()
+
+
+def _todo_store_path():
+    return Path(user_data_dir()) / "coding_todos.json"
+
+
+def _todo_load():
+    path = _todo_store_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _todo_save(data):
+    path = _todo_store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    os.replace(tmp, path)
+
+
+def _exec_todo(args, source, audit, project_dir):
+    """todo：list / add / done / clear，按项目根目录隔离。"""
+    try:
+        root = _coding_project(project_dir)
+    except pathguard.PathGuardError as exc:
+        return _guard_error(audit, source, "todo", str(args), "readonly", exc)
+    action = str(args.get("action", "list") or "list").strip().lower()
+    key = str(root)
+    with _TODO_LOCK:
+        data = _todo_load()
+        todos = data.get(key, [])
+        if action == "add":
+            item = str(args.get("item", "") or "").strip()
+            if not item:
+                return "缺少待办内容（item）"
+            next_id = max((t.get("id", 0) for t in todos), default=0) + 1
+            todos.append({"id": next_id, "text": item, "done": False})
+            data[key] = todos
+            _todo_save(data)
+            text = f"已添加待办 #{next_id}：{item}"
+        elif action == "done":
+            try:
+                tid = int(args.get("id", 0) or 0)
+            except (TypeError, ValueError):
+                return "done 需要数字 id"
+            for t in todos:
+                if t.get("id") == tid:
+                    t["done"] = True
+                    data[key] = todos
+                    _todo_save(data)
+                    text = f"已完成待办 #{tid}：{t['text']}"
+                    break
+            else:
+                return f"待办不存在：{tid}"
+        elif action == "clear":
+            data[key] = []
+            _todo_save(data)
+            text = "待办清单已清空"
+        else:
+            if not todos:
+                return "待办清单是空的"
+            lines = [
+                ("✅" if t.get("done") else "⬜") + f" #{t['id']} {t['text']}"
+                for t in todos
+            ]
+            text = "待办清单：\n" + "\n".join(lines)
+    if audit:
+        audit(source, "todo", str(args), "readonly", True, True, text[:200])
+    return text
+
+
+# ---------- 备份浏览与恢复 ----------
+
+
+def _backup_entries(project_dir, rel=""):
+    """列出当前项目最近的备份（按时间片倒序，最多 20 条）。"""
+    try:
+        root = _coding_project(project_dir)
+    except pathguard.PathGuardError:
+        return []
+    backups_root = Path(_backups_root())
+    if not backups_root.is_dir():
+        return []
+    entries = []
+    for ts_dir in sorted(backups_root.iterdir(), reverse=True):
+        if not ts_dir.is_dir():
+            continue
+        marker = ts_dir / ".project"
+        try:
+            if marker.is_file() and marker.read_text(
+                encoding="utf-8", errors="replace"
+            ).strip() != str(root):
+                continue
+        except OSError:
+            continue
+        rel_path = rel.strip("/") if rel else ""
+        if rel_path:
+            candidate = ts_dir / rel_path
+            if candidate.is_file():
+                entries.append({
+                    "id": ts_dir.name,
+                    "path": rel,
+                    "size": candidate.stat().st_size,
+                })
+        else:
+            for f in sorted(ts_dir.rglob("*")):
+                if not f.is_file() or f.name == ".project":
+                    continue
+                entries.append({
+                    "id": ts_dir.name,
+                    "path": f.relative_to(ts_dir).as_posix(),
+                    "size": f.stat().st_size,
+                })
+                if len(entries) >= 20:
+                    break
+        if len(entries) >= 20:
+            break
+    return entries
+
+
+def _exec_list_backups(args, source, audit, project_dir):
+    rel = str(args.get("path", "") or "").strip()
+    entries = _backup_entries(project_dir, rel)
+    if not entries:
+        return "没有找到该项目的备份"
+    lines = [
+        f"[{e['id']}] {e['path']}（{e['size']} 字节）"
+        for e in entries
+    ]
+    text = "最近备份：\n" + "\n".join(lines)
+    if audit:
+        audit(source, "list_backups", rel, "readonly", True, True, text[:200])
+    return text
+
+
+def _exec_restore_backup(args, source, confirm_cb, audit, mode, project_dir):
+    """从备份恢复文件：先校验归属项目，恢复前再备份当前状态。"""
+    backup_id = str(args.get("backup_id", "") or "").strip()
+    rel = str(args.get("path", "") or "").strip()
+    if not re.fullmatch(r"\d{20}-\d{6}", backup_id):
+        return "备份 ID 格式不正确（用 list_backups 获取）"
+    if not rel:
+        return "缺少路径（path）"
+    if source != SOURCE_USER:
+        return _deny(audit, source, "restore_backup", rel, mode,
+                     "自主触发不允许恢复文件（需要主人在场）")
+    if mode in (SHELL_MODE_OFF, SHELL_MODE_READONLY):
+        return _deny(audit, source, "restore_backup", rel, mode,
+                     f"当前工具档位（{mode}）不允许写文件")
+    try:
+        root = _coding_project(project_dir)
+        target = pathguard.resolve_project_path(
+            project_dir, rel, SENSITIVE_PATH_MARKERS
+        )
+    except pathguard.PathGuardError as exc:
+        return _guard_error(audit, source, "restore_backup", rel, mode, exc)
+    ts_dir = Path(_backups_root()) / backup_id
+    marker = ts_dir / ".project"
+    try:
+        if marker.is_file() and marker.read_text(
+            encoding="utf-8", errors="replace"
+        ).strip() != str(root):
+            return "该备份不属于当前项目，已拒绝恢复"
+    except OSError:
+        return "备份元数据不可读，已拒绝恢复"
+    src = ts_dir / rel.strip("/")
+    if not src.is_file():
+        return f"备份文件不存在：{rel}"
+    approved, denied = _confirm(
+        (
+            f"从备份恢复文件：{rel}\n"
+            f"备份时间片：{backup_id}\n"
+            "恢复前会把当前文件再备份一次，确认覆盖吗？"
+        ),
+        confirm_cb, audit, source, "restore_backup", rel, mode,
+    )
+    if not approved:
+        return denied
+    try:
+        pathguard.backup_before_write(project_dir, rel, _backups_root())
+        shutil.copy2(src, target)
+    except OSError as exc:
+        if audit:
+            audit(source, "restore_backup", rel, mode, True, False, str(exc)[:200])
+        return f"恢复失败：{exc}"
+    text = f"已从备份 {backup_id} 恢复 {rel}"
+    if audit:
+        audit(source, "restore_backup", rel, mode, True, True, text[:200])
+    return text
+
+
 def _coding_declarations():
-    """Coding 模式附加工具声明（9 个：6 文件 + 3 后台）。"""
+    """Coding 模式附加工具声明（12 个：6 文件 + 3 后台 + 待办/备份）。"""
     return [
         {
             "type": "function",
@@ -1174,6 +1403,7 @@ def _coding_declarations():
                 "name": "bg_exec",
                 "description": (
                     f"在项目目录后台执行构建/测试类命令（最长 {processpool.MAX_TIMEOUT}s），"
+                    f"当前 Shell 是 {shell_name()}，命令必须符合该 Shell 语法。"
                     "立即返回任务 ID。用 bg_check 轮询状态与输出。"
                     "并发最多 3 个；写类命令需要主人确认。"
                 ),
@@ -1201,6 +1431,63 @@ def _coding_declarations():
                 "name": "bg_cancel",
                 "description": "取消后台任务（SIGTERM，宽限后强杀）。",
                 "parameters": _params_decl("task_id", "bg_exec 返回的任务 ID"),
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "todo",
+                "description": (
+                    "管理本次编码任务的待办清单（按项目隔离，存在用户数据目录）。"
+                    "action 支持 list / add / done / clear；add 需要 item，done 需要 id。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["list", "add", "done", "clear"],
+                            "description": "操作类型",
+                        },
+                        "item": {"type": "string", "description": "add 时的待办内容"},
+                        "id": {"type": "integer", "description": "done 时的待办编号"},
+                    },
+                    "required": ["action"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_backups",
+                "description": (
+                    "列出当前项目最近的写前备份（按时间倒序，最多 20 条）。"
+                    "可选 path 只查某个文件。"
+                ),
+                "parameters": _params_decl(
+                    "path", "可选：项目内相对路径，只列该文件的备份"
+                ),
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "restore_backup",
+                "description": (
+                    "从 list_backups 返回的备份 ID 恢复文件到项目里。"
+                    "恢复前会自动再备份当前状态；需要主人确认。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "backup_id": {
+                            "type": "string",
+                            "description": "list_backups 返回的 [ID]",
+                        },
+                        "path": {"type": "string", "description": "项目内相对路径"},
+                    },
+                    "required": ["backup_id", "path"],
+                },
             },
         },
     ]
@@ -1238,6 +1525,7 @@ def _run_bash_decl(cwd):
             "name": "run_bash",
             "description": (
                 f"在主人的电脑上执行 shell 命令（工作目录：{cwd}）。"
+                f"当前 Shell 是 {shell_name()}，命令必须符合该 Shell 语法。"
                 "只读命令（ls/cat/date/git status 等）可直接执行；"
                 "写操作（rm/mv/编辑文件等）需要主人确认。"
                 "一次只执行一条简单命令：参数用空格分隔，"
@@ -1447,4 +1735,12 @@ def execute(name, arguments, *, mode, source, confirm_cb=None, cwd=None, audit=N
             return _exec_bg_check(args, source, audit, mode)
         if name == "bg_cancel":
             return _exec_bg_cancel(args, source, audit, mode)
+        if name == "todo":
+            return _exec_todo(args, source, audit, project_dir)
+        if name == "list_backups":
+            return _exec_list_backups(args, source, audit, project_dir)
+        if name == "restore_backup":
+            return _exec_restore_backup(
+                args, source, confirm_cb, audit, mode, project_dir
+            )
     return f"未知工具：{name}"

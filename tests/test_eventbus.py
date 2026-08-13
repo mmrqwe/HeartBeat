@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 
 from kernel.eventbus import EventBus
 
@@ -18,7 +18,9 @@ _app = None
 def _ensure_app():
     global _app
     if _app is None:
-        _app = QCoreApplication.instance() or QCoreApplication(sys.argv)
+        # 用 QApplication 而非 QCoreApplication：若本文件先跑，
+        # 不能留下“非 GUI 单例”挡住后续 app_integration 的 QWidget。
+        _app = QApplication.instance() or QApplication(sys.argv)
     return _app
 
 

@@ -274,6 +274,12 @@ class Database:
             self._conn.execute(
                 "DELETE FROM chat_messages WHERE session_id = ?", (session_id,)
             )
+            if self.vec_ready:
+                # 会话消息已删，顺手清掉对应 chat_vec 孤儿向量
+                self._conn.execute(
+                    "DELETE FROM chat_vec WHERE rowid NOT IN "
+                    "(SELECT id FROM chat_messages)"
+                )
             self._conn.commit()
             return cur.rowcount > 0
 
@@ -534,12 +540,18 @@ class Database:
         with self._lock:
             if session_id is None:
                 self._conn.execute("DELETE FROM chat_messages")
+                if self.vec_ready:
+                    self._conn.execute("DELETE FROM chat_vec")
             else:
                 self._conn.execute(
                     "DELETE FROM chat_messages WHERE session_id = ?", (session_id,)
                 )
-            if self.vec_ready:
-                self._conn.execute("DELETE FROM chat_vec")
+                if self.vec_ready:
+                    # 只清该会话消息对应的向量，其他会话的 chat_vec 保留
+                    self._conn.execute(
+                        "DELETE FROM chat_vec WHERE rowid NOT IN "
+                        "(SELECT id FROM chat_messages)"
+                    )
             self._conn.commit()
 
     def chat_after(self, message_id, limit=100):
@@ -607,6 +619,11 @@ class Database:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, json.dumps(value, ensure_ascii=False)),
             )
+            self._conn.commit()
+
+    def delete_state(self, key):
+        with self._lock:
+            self._conn.execute("DELETE FROM agent_state WHERE key = ?", (key,))
             self._conn.commit()
 
     # ---------- 统计 ----------
