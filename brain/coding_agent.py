@@ -23,9 +23,14 @@ from brain import context as context_mgr
 MAX_ROUNDS = 30           # 工具循环硬上限
 TOOL_RESULT_LIMIT = 4000  # 单次工具结果注入上下文的上限（字符）
 HISTORY_STEP_LIMIT = 24   # 上下文里保留的最近消息条数（truncate keep_recent）
-BUDGET_TOKENS = 24000     # 每轮 LLM 调用的消息 token 预算
-SUMMARY_MAX_TOKENS = 600  # 最终总结的输出预算
-TOOL_OUTPUT_TOKENS = 8192  # 每轮工具调用的输出上限（写文件等长参数需要大值）
+BUDGET_TOKENS = 24000     # 每轮 LLM 调用的消息 token 预算（输入侧上下文截断）
+
+
+def _output_budget(brain):
+    """输出 token 预算：取用户设置（max_output_tokens，默认 100k）。
+    对无 cfg 的轻量 fake brain 兜底（测试替身）。"""
+    cfg = getattr(brain, "cfg", None) or {}
+    return int(cfg.get("max_output_tokens", 100000) or 100000)
 CONTEXT_CACHE_TTL = 300  # 项目树/README/git 状态缓存秒数
 _context_cache = {}
 
@@ -173,7 +178,7 @@ def _final_summary(brain, messages):
         ),
     })
     try:
-        reply = brain.complete(final, max_tokens=SUMMARY_MAX_TOKENS)
+        reply = brain.complete(final, max_tokens=_output_budget(brain))
     except Exception:
         return "任务已执行多步，但收尾总结失败（模型调用异常）。"
     return (reply or "").strip() or "任务已执行多步，但没有生成总结。"
@@ -194,9 +199,8 @@ def _ask_plan(brain, user_request):
                 },
                 {"role": "user", "content": user_request},
             ],
-            # 输出很短但推理模型会把隐藏推理计入预算：初始给足，
-            # 仍触发空内容时由 brain.complete 的 finish=length 重试兑底
-            max_tokens=2000,
+            # 输出长度由提示词引导（3-5 步简短计划），预算取用户输出上限作安全阀
+            max_tokens=_output_budget(brain),
         )
     except Exception:
         return None
@@ -258,7 +262,8 @@ def run_coding_task(brain, cfg, user_request, run_tool,
         )
         try:
             content, tool_calls = brain.complete_tools(
-                messages, decls, max_tokens=TOOL_OUTPUT_TOKENS
+                messages, decls,
+                max_tokens=int(cfg.get("max_output_tokens", 100000) or 100000),
             )
         except Exception as exc:
             if on_status:

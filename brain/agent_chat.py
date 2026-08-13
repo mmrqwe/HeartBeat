@@ -367,10 +367,9 @@ class ChatMixin:
                 "这次是知识/资讯类提问：回答可以详细些（一般200-400字），"
                 "讲清楚重点，可以用简短列表，但别啰嗦。"
             )
-            budget = 800
         else:
             system += "这次是闲聊：像朋友一样自然聊天，一般不超过80字，不要用列表和标题。"
-            budget = 300
+        budget = int(self.cfg.get("max_output_tokens", 100000) or 100000)
         system += (
             f"如果{owner}说了值得记住的事，在回复末尾另起一行写 [FACT] 简短描述。"
             "如果你想私下记下自己的念头，另起一行写 [THINK] 一行。"

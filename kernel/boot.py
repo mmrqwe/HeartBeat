@@ -35,6 +35,7 @@ DEFAULT_CONFIG = {
     "project_dir": "",  # Coding 协作项目根目录（文件工具/后台命令的边界）
     "memory_cap": 500,
     "max_context_tokens": 400000,
+    "max_output_tokens": 100000,  # 单次回复输出上限（长度由提示词引导，此为安全上限）
     "context_compress_ratio": 0.75,
     "keep_recent_messages": 20,
     "conversation_summary_enabled": True,

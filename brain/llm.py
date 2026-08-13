@@ -23,6 +23,28 @@ logger = logging.getLogger("heartbeat.llm")
 # 与 kernel.http.USER_AGENT 同步（有意重复，见模块 docstring）
 USER_AGENT = "HeartBeat/0.1 (desktop pet)"
 
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _estimate_messages_tokens(messages):
+    """保守输入 token 估算（与 brain/context 同公式，就地镜像保持本模块 stdlib 解耦）：
+    中文 1 字 1 token，其他 4 字符 1 token，每条消息 +4 固定开销。"""
+    total = 0
+    for msg in messages or []:
+        total += 4
+        content = str(msg.get("content") or "")
+        if content:
+            cjk = len(_CJK_RE.findall(content))
+            total += cjk + (len(content) - cjk + 3) // 4
+        for call in msg.get("tool_calls") or []:
+            fn = call.get("function") or {}
+            for part in (fn.get("name", ""), fn.get("arguments", "")):
+                text = str(part or "")
+                if text:
+                    cjk = len(_CJK_RE.findall(text))
+                    total += cjk + (len(text) - cjk + 3) // 4
+    return total
+
 
 def parse_usage(data):
     """从 LLM 响应里解析 token 用量，兼容 OpenAI / Anthropic 缓存字段。"""
@@ -234,6 +256,20 @@ class Brain:
             except Exception:
                 pass
 
+    def _effective_budget(self, max_tokens, messages):
+        """输出 token 预算：显式 max_tokens 优先，否则取用户设置的输出上限
+        （max_output_tokens，默认 100k）。再按上下文窗口软钳制：
+        输入+输出 超上限时压缩输出，避免 API 直接报错。
+        长度控制主要靠提示词引导，本预算只是安全上限。"""
+        budget = int(max_tokens) if max_tokens else int(
+            self.cfg.get("max_output_tokens", 100000) or 100000
+        )
+        ctx = int(self.cfg.get("max_context_tokens", 400000) or 400000)
+        est = _estimate_messages_tokens(messages)
+        if est + budget > ctx:
+            budget = max(4000, ctx - est)
+        return budget
+
     def _retry_cfg(self):
         """LLM 重连配置：config.json 的 retry 块（带默认值兜底）。"""
         cfg = self.cfg.get("retry") or {}
@@ -312,11 +348,12 @@ class Brain:
             "messages": messages,
             "stream": True,
         }
-        reasoning = self._reasoning_params(max_tokens or 300)
+        budget = self._effective_budget(max_tokens, messages)
+        reasoning = self._reasoning_params(budget)
         if reasoning:
             base_payload.update(reasoning)
         else:
-            base_payload.update({"temperature": 0.9, "max_tokens": max_tokens or 300})
+            base_payload.update({"temperature": 0.9, "max_tokens": budget})
         started = time.time()
         try:
             usage, finish, text = self._stream_read(
@@ -344,12 +381,12 @@ class Brain:
         if not text.strip() and finish == "length":
             # 流式下隐藏推理耗尽预算 → 一个内容块都没有；
             # 降级非流式一次性重试（非流式入口自带同签名重试保护）
-            budget = max((max_tokens or 300) * 4, 4000)
+            retry_budget = min(max(budget * 4, 4000), 65536)
             logger.warning(
                 "LLM 流式空内容（finish_reason=length），降级非流式重试（预算 %s，model=%s）",
-                budget, self.cfg["api"]["model"],
+                retry_budget, self.cfg["api"]["model"],
             )
-            reply = self.complete(messages, max_tokens=budget)
+            reply = self.complete(messages, max_tokens=retry_budget)
             if reply:
                 on_delta(reply)
         if self.stats:
@@ -585,7 +622,8 @@ class Brain:
         }
 
     def _chat_completion(self, messages, max_tokens=None, timeout=60):
-        reasoning = self._reasoning_params(max_tokens or 300)
+        budget = self._effective_budget(max_tokens, messages)
+        reasoning = self._reasoning_params(budget)
         payload = {
             "model": self.cfg["api"]["model"],
             "messages": messages,
@@ -593,21 +631,21 @@ class Brain:
         if reasoning:
             payload.update(reasoning)
         else:
-            payload.update({"temperature": 0.9, "max_tokens": max_tokens or 300})
+            payload.update({"temperature": 0.9, "max_tokens": budget})
         data = self._post_chat(payload, timeout=timeout)
         if not self._choice_content(data) and self._choice_finish(data) == "length":
             # 网关把隐藏推理计入 max_tokens 却不下发 content：预算被推理
             # 耗尽 → 空内容。用提高后的预算重试一次（仅此失败签名触发，
             # finish=stop 的空内容视为模型主动返回，不重试）。
-            budget = max((max_tokens or 300) * 4, 4000)
+            retry_budget = min(max(budget * 4, 4000), 65536)
             logger.warning(
                 "LLM 空内容（finish_reason=length），预算 %s → %s 重试（model=%s）",
-                max_tokens or 300, budget, self.cfg["api"]["model"],
+                budget, retry_budget, self.cfg["api"]["model"],
             )
             if reasoning:
-                payload["max_completion_tokens"] = budget
+                payload["max_completion_tokens"] = retry_budget
             else:
-                payload["max_tokens"] = budget
+                payload["max_tokens"] = retry_budget
             data = self._post_chat(payload, timeout=timeout)
         self._consume_energy()
         return self._choice_content(data).strip()
@@ -618,7 +656,8 @@ class Brain:
         max_tokens：输出 token 上限（默认 500 适合对话；长产物场景如编码
         写文件需要传大值，否则大参数 JSON 被截断后网关会丢 tool_calls）。
         """
-        reasoning = self._reasoning_params(max_tokens or 500)
+        budget = self._effective_budget(max_tokens, messages)
+        reasoning = self._reasoning_params(budget)
         payload = {
             "model": self.cfg["api"]["model"],
             "messages": messages,
@@ -628,7 +667,7 @@ class Brain:
         if reasoning:
             payload.update(reasoning)
         else:
-            payload.update({"temperature": 0.7, "max_tokens": max_tokens or 500})
+            payload.update({"temperature": 0.7, "max_tokens": budget})
         data = self._post_chat(payload)
         message = data["choices"][0]["message"]
         if (
@@ -637,15 +676,15 @@ class Brain:
             and self._choice_finish(data) == "length"
         ):
             # 同上：隐藏推理耗尽预算 → 空内容且无工具调用，提高预算重试
-            budget = max((max_tokens or 500) * 4, 4000)
+            retry_budget = min(max(budget * 4, 4000), 65536)
             logger.warning(
                 "LLM 工具调用空内容（finish_reason=length），预算 %s → %s 重试（model=%s）",
-                max_tokens or 500, budget, self.cfg["api"]["model"],
+                budget, retry_budget, self.cfg["api"]["model"],
             )
             if reasoning:
-                payload["max_completion_tokens"] = budget
+                payload["max_completion_tokens"] = retry_budget
             else:
-                payload["max_tokens"] = budget
+                payload["max_tokens"] = retry_budget
             data = self._post_chat(payload)
             message = data["choices"][0]["message"]
         self._consume_energy()
@@ -674,7 +713,7 @@ class Brain:
             "tool_choice": "auto",
             "stream": True,
             "temperature": 0.7,
-            "max_tokens": 500,
+            "max_tokens": self._effective_budget(None, messages),
         }
         started = time.time()
         try:
@@ -694,12 +733,12 @@ class Brain:
             raise
         if not (content or "").strip() and not tool_calls and finish == "length":
             # 隐藏推理耗尽预算 → 流式无内容无工具调用；降级非流式重试
-            # （非流式入口自带同签名重试保护）
+            # （非流式入口自带同签名重试保护，默认走用户输出上限）
             logger.warning(
                 "LLM 工具流空内容（finish_reason=length），降级非流式重试（model=%s）",
                 self.cfg["api"]["model"],
             )
-            return self.complete_tools(messages, tools, max_tokens=4000)
+            return self.complete_tools(messages, tools)
         if self.stats:
             prompt, completion, cached = parse_usage({"usage": usage} if usage else {})
             latency_ms = int((time.time() - started) * 1000)

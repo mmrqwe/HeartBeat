@@ -121,6 +121,7 @@ class SettingsWindow(QDialog):
         add_spin("daily_energy_budget", "每日体力（LLM 调用次数）", 1, 1000000)
         add_spin("proactive_energy_daily_cap", "主动思考每日上限", 0, 1000000)
         add_spin("max_context_tokens", "上下文上限（token）", 1000, 1000000)
+        add_spin("max_output_tokens", "输出上限（token，实际受模型限制）", 1000, 1000000)
         add_spin("quiet_start", "安静时段开始（小时）", 0, 23)
         add_spin("quiet_end", "安静时段结束（小时）", 0, 23)
 

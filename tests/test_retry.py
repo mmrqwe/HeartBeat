@@ -440,7 +440,9 @@ def test_complete_tools_retries_on_empty_length():
         assert content == "好的"
         assert calls == []
         assert len(fake.payloads) == 2
-        assert fake.payloads[1]["max_tokens"] == 4000
+        # 未显式传 max_tokens → 用户输出上限（默认 100k）；重试受 65536 封顶
+        assert fake.payloads[0]["max_tokens"] == 100000
+        assert fake.payloads[1]["max_tokens"] == 65536
     finally:
         patch.restore()
 

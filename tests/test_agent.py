@@ -558,14 +558,14 @@ def test_build_chat_messages_evolution_and_length(monkeypatch, tmp_path):
     persona = core.build_persona(cfg)
     assert "慢慢长大" in persona
     assert "记在心里" in persona
-    # 闲聊：短篇幅 + 300 预算
+    # 闲聊：短篇幅提示词 + 输出预算跟随用户设置（默认 100k）
     system, _, budget = a._build_chat_messages("今天好累呀")
     assert "不超过80字" in system
-    assert budget == 300
-    # 知识型：详细回答 + 800 预算
+    assert budget == int(cfg.get("max_output_tokens", 100000))
+    # 知识型：详细回答提示词 + 同样输出预算
     system, _, budget = a._build_chat_messages("黑洞是什么？为什么会有引力？")
     assert "200-400字" in system
-    assert budget == 800
+    assert budget == int(cfg.get("max_output_tokens", 100000))
     # 记忆注入带进化语义
     assert "不断学习、慢慢长大" in system
     # 空记忆文案自然化
