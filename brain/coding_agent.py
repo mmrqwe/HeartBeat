@@ -194,7 +194,9 @@ def _ask_plan(brain, user_request):
                 },
                 {"role": "user", "content": user_request},
             ],
-            max_tokens=400,
+            # 输出很短但推理模型会把隐藏推理计入预算：初始给足，
+            # 仍触发空内容时由 brain.complete 的 finish=length 重试兑底
+            max_tokens=2000,
         )
     except Exception:
         return None

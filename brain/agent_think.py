@@ -228,7 +228,9 @@ class ThinkMixin:
             messages, int(max_tokens * ratio), keep_recent=10
         )
         try:
-            raw = self.brain.complete(messages, max_tokens=400) or ""
+            # 输出很短但推理模型会把隐藏推理计入预算：初始给足，
+            # 仍触发空内容时由 brain.complete 的 finish=length 重试兑底
+            raw = self.brain.complete(messages, max_tokens=2000) or ""
         except Exception:
             return None
         plan = self._parse_life_reply(raw)
