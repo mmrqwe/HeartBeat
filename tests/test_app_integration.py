@@ -24,12 +24,18 @@ import core
 import db as dbmod
 import kernel
 import main as mainmod
-import plugins.quote as quote_mod
-import plugins.rss_news as rss_mod
-import plugins.weather as weather_mod
 
-_ORIG_COLLECTS = {}
 
+class _StubPlugin:
+    """规则聊天用的确定性内容插件（只替换测试实例，不改全局模块）。"""
+
+    def __init__(self, name, text):
+        self.META = {"name": name, "label": name, "default_enabled": True}
+        self.SETTINGS = []
+        self._text = text
+
+    def collect(self, settings):
+        return [{"title": self._text, "text": self._text}]
 
 def wait(ms):
     deadline = time.time() + ms / 1000
@@ -59,27 +65,20 @@ def _make_app():
     orig_gather = core.gather
     core.gather = lambda *a, **k: {"collections": [], "errors": []}
     # 规则聊天会直接调插件 collect（真实联网会残留网络线程，污染 Qt 事件循环）
-    _ORIG_COLLECTS.clear()
-    _ORIG_COLLECTS["weather"] = weather_mod.collect
-    _ORIG_COLLECTS["rss_news"] = rss_mod.collect
-    _ORIG_COLLECTS["quote"] = quote_mod.collect
-    weather_mod.collect = lambda settings: [{"title": "天气", "text": "晴，适合出门"}]
-    rss_mod.collect = lambda settings: [{"title": "新闻", "text": "本地测试新闻"}]
-    quote_mod.collect = lambda settings: [{"title": "一言", "text": "测试一言"}]
+    hb.plugins["weather"] = _StubPlugin("weather", "晴，适合出门")
+    hb.plugins["rss_news"] = _StubPlugin("rss_news", "本地测试新闻")
+    hb.plugins["quote"] = _StubPlugin("quote", "测试一言")
     return tmp, hb, orig_gather
 
 
 def _cleanup(tmp, hb, orig_gather):
     """统一清理：先还原 mock，再 close（关 DB/停线程），最后删临时目录。"""
     core.gather = orig_gather
-    for mod, orig in (
-        (weather_mod, _ORIG_COLLECTS.get("weather")),
-        (rss_mod, _ORIG_COLLECTS.get("rss_news")),
-        (quote_mod, _ORIG_COLLECTS.get("quote")),
-    ):
-        if orig is not None:
-            mod.collect = orig
     try:
+        try:
+            hb.embed_queue.stop(timeout=1)
+        except Exception:
+            pass
         hb.close()
     finally:
         tmp.cleanup()
@@ -450,6 +449,19 @@ def test_coding_continues_after_session_switch(tmp_path):
         gate.set()
         wait(300)
         assert not rt.is_busy("coding")
+    finally:
+        _cleanup(tmp, hb, orig_gather)
+
+
+def test_confirm_allowlist_skips_readonly(tmp_path):
+    """本次会话记住的只读命令直接放行；破坏性命令永远不能进白名单。"""
+    tmp, hb, orig_gather = _make_app()
+    try:
+        hb._confirm_allowlist.add("git status")
+        assert hb._confirm_tool("git status") is True
+        assert hb._is_destructive_confirm("rm -rf /tmp/x") is True
+        assert hb._is_destructive_confirm("git status") is False
+        assert hb._is_destructive_confirm({"kind": "diff"}) is True
     finally:
         _cleanup(tmp, hb, orig_gather)
 

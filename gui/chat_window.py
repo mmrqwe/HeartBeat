@@ -81,6 +81,7 @@ def _make_bubble(role):
     # 正常文本仍按词边界/中文逐字换行，不受影响。
     bubble.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
     bubble.document().setDocumentMargin(BUBBLE_MARGIN)  # 内边距（QSS padding 对 QTextEdit 无效）
+    bubble.document().setDefaultStyleSheet(theme.code_style())
     return bubble
 
 
@@ -119,6 +120,8 @@ class ChatWindow(QWidget):
         self.on_cancel_coding = on_cancel_coding
         self.messages = []
         self._bubble_items = []  # (bubble, text, markdown)：窗口缩放时按记录重排
+        self._bubble_roles = {}  # id(bubble) -> role：主题切换时重上色
+        self._last_date = None
         self._last_bubble = None
         self._streaming = False
         self._think_dots = 0
@@ -128,7 +131,7 @@ class ChatWindow(QWidget):
         self._session_ids = []
 
         self.setWindowTitle(f"和{pet_name}聊天")
-        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        self.setWindowFlags(Qt.Window)
         self.resize(680, 600)
         self.setMinimumSize(560, 420)
         self._build()
@@ -172,6 +175,7 @@ class ChatWindow(QWidget):
         self.session_list = QListWidget()
         self.session_list.setFrameShape(QFrame.NoFrame)
         self.session_list.itemClicked.connect(self._on_session_clicked)
+        self.session_list.itemDoubleClicked.connect(self._on_session_double_clicked)
         side_layout.addWidget(self.session_list, 1)
         root.addWidget(sidebar)
 
@@ -258,8 +262,16 @@ class ChatWindow(QWidget):
         for s in sessions:
             label = s.get("name") or "会话"
             item = QListWidgetItem(label)
+            tip_parts = []
+            if s.get("project_dir"):
+                tip_parts.append(f"目录：{s['project_dir']}")
+            else:
+                tip_parts.append("未绑定编程目录")
+            tip_parts.append(f"消息数：{s.get('message_count', 0)}")
+            if s.get("updated_at"):
+                tip_parts.append(f"最近活跃：{s['updated_at']}")
             item.setToolTip(
-                f"目录：{s['project_dir']}" if s.get("project_dir") else "未绑定编程目录"
+                "\n".join(tip_parts)
             )
             self.session_list.addItem(item)
             self._session_ids.append(s["id"])
@@ -306,29 +318,70 @@ class ChatWindow(QWidget):
         if self.on_rename_session is not None:
             self.on_rename_session(sid)
 
+    def _on_session_double_clicked(self, item):
+        """双击会话 = 重命名（和改名按钮一致）。"""
+        self._on_rename_session()
+
     # ---------- 消息 ----------
 
     def add_message(self, role, text, time_str=None):
         time_str = time_str or time.strftime("%H:%M")
         self.messages.append((role, text, time_str))
+        self._render_day_separator(time_str)
         self._render_message(role, text, time_str)
         self._scroll_to_bottom()
 
-    def _render_message(self, role, text, time_str):
-        if role == "system":
-            label = QLabel(text)
-            label.setObjectName("Hint")
-            label.setWordWrap(True)
-            label.setAlignment(Qt.AlignCenter)
-            self.content_layout.addWidget(label)
-            return None
+    def _date_of(self, time_str):
+        if time_str and len(time_str) >= 10 and time_str[4:5] == "-":
+            return time_str[:10]
+        return time.strftime("%Y-%m-%d")
 
-        align = Qt.AlignRight if role == "user" else Qt.AlignLeft
+    def _day_label(self, date_key):
+        today = time.strftime("%Y-%m-%d")
+        if date_key == today:
+            return "今天"
+        from datetime import datetime, timedelta
+
+        try:
+            if datetime.strptime(date_key, "%Y-%m-%d") == (
+                datetime.now() - timedelta(days=1)
+            ):
+                return "昨天"
+        except ValueError:
+            pass
+        return date_key[5:].replace("-", "月") + "日"
+
+    def _render_day_separator(self, time_str):
+        date_key = self._date_of(time_str)
+        if date_key == self._last_date:
+            return
+        self._last_date = date_key
+        label = QLabel(self._day_label(date_key))
+        label.setObjectName("Hint")
+        label.setAlignment(Qt.AlignCenter)
+        self.content_layout.addWidget(label)
+
+    def _render_message(self, role, text, time_str):
+        # 系统输出同样用气泡渲染，但居中且明显更宽；
+        # QLabel 对长中文/无空格文本不会换行，导致单行被横向裁剪。
+        align = (
+            Qt.AlignCenter
+            if role == "system"
+            else (Qt.AlignRight if role == "user" else Qt.AlignLeft)
+        )
         bubble = _make_bubble(role)
-        bubble.setMarkdown(text)
-        self._bubble_items.append((bubble, text, True))
+        if role == "system":
+            # 系统输出常含异常原文（如 <urlopen error ...>），
+            # Markdown 会把尖括号当 HTML 吞掉，统一按纯文本渲染。
+            bubble.setPlainText(text)
+            markdown = False
+        else:
+            bubble.setMarkdown(text)
+            markdown = True
+        self._bubble_roles[id(bubble)] = role
+        self._bubble_items.append((bubble, text, markdown))
         self.content_layout.addWidget(bubble, 0, align)
-        self._sync_bubble_height(bubble, text, markdown=True)
+        self._sync_bubble_height(bubble, text, markdown=markdown)
 
         time_label = QLabel(time_str)
         time_label.setObjectName("Hint")
@@ -351,7 +404,7 @@ class ChatWindow(QWidget):
         self._render_message("assistant", "", time.strftime("%H:%M"))
         self._scroll_to_bottom()
 
-    def _natural_bubble_width(self, bubble, text, markdown):
+    def _natural_bubble_width(self, bubble, text, markdown, max_width=None):
         """按内容自然宽度（不换行渲染）计算气泡宽度，clamp 到 [MIN, 窗口自适应上限]。
 
         短消息（“你好”/“在吗”）只占一小段，长消息撑到上限后换行，
@@ -370,13 +423,20 @@ class ChatWindow(QWidget):
             probe.setPlainText(text)
         probe.adjustSize()
         natural = int(probe.size().width()) + 2  # 边框缓冲
-        return max(BUBBLE_MIN_W, min(natural, self._max_bubble_width()))
+        cap = max_width if max_width is not None else self._max_bubble_width(
+            self._bubble_width_ratio(bubble)
+        )
+        return max(BUBBLE_MIN_W, min(natural, cap))
 
-    def _max_bubble_width(self):
-        """气泡最大宽度跟随聊天区宽度（约 78%，留出两侧边距），不写死。"""
+    def _max_bubble_width(self, ratio=0.78):
+        """气泡最大宽度跟随聊天区宽度（默认约 78%，留出两侧边距），不写死。"""
         viewport = self.scroll.viewport().width()
         base = viewport if viewport and viewport > 0 else self.width()
-        return max(BUBBLE_MIN_W, int(base * 0.78) - 24)
+        return max(BUBBLE_MIN_W, int(base * ratio) - 24)
+
+    def _bubble_width_ratio(self, bubble):
+        """系统输出气泡占满约 92% 宽度，普通对话保持约 78%。"""
+        return 0.92 if self._bubble_roles.get(id(bubble)) == "system" else 0.78
 
     def _set_bubble_item(self, bubble, text, markdown):
         for i, (b, _t, _m) in enumerate(self._bubble_items):
@@ -384,6 +444,13 @@ class ChatWindow(QWidget):
                 self._bubble_items[i] = (bubble, text, markdown)
                 return
         self._bubble_items.append((bubble, text, markdown))
+
+    def apply_theme(self):
+        """深色/浅色切换后，给已有气泡重新上色并刷新代码块样式。"""
+        for bubble, _text, _markdown in list(self._bubble_items):
+            role = self._bubble_roles.get(id(bubble), "assistant")
+            bubble.setStyleSheet(theme.bubble_style(role))
+            bubble.document().setDefaultStyleSheet(theme.code_style())
 
     def _relayout_bubbles(self):
         """窗口尺寸变化后按新上限重算所有气泡宽高。"""
@@ -414,14 +481,20 @@ class ChatWindow(QWidget):
     def _sync_bubble_height(self, bubble, text, markdown=True):
         """按内容自适应宽度 + 估算高度固定气泡（流式高频更新同样依赖此机制）。
 
-        宽度 = 内容自然宽度（上限跟随窗口），高度用独立探针估算；
+        普通气泡宽度 = 内容自然宽度（上限跟随窗口）；系统气泡直接撑满
+        92% 聊天区宽度。高度用独立探针估算；
         已显示且有真实布局高度时取两者较大值，再延迟一帧用真实布局修正，
         消除字体替换/宽度差异导致的估算偏差（任何环境下都不裁剪内容）。
         """
         if bubble is None:
             return
-        width = self._natural_bubble_width(bubble, text, markdown)
-        bubble.setMaximumWidth(self._max_bubble_width())
+        ratio = self._bubble_width_ratio(bubble)
+        max_width = self._max_bubble_width(ratio)
+        if self._bubble_roles.get(id(bubble)) == "system":
+            width = max_width
+        else:
+            width = self._natural_bubble_width(bubble, text, markdown, max_width)
+        bubble.setMaximumWidth(max_width)
         bubble.setFixedWidth(width)
         est = self._estimate_height(bubble, text, markdown, width)
         real = bubble.document().size().height()
@@ -482,6 +555,8 @@ class ChatWindow(QWidget):
     def clear(self):
         self.messages = []
         self._bubble_items = []
+        self._bubble_roles = {}
+        self._last_date = None
         self._last_bubble = None
         self._streaming = False
         while self.content_layout.count() > 1:

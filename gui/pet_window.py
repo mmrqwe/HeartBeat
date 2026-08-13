@@ -17,8 +17,9 @@ from gui import skins
 
 PIXEL = 5
 W, H = 250, 215
+STATUS_HEIGHT = 16  # 底部状态文字专用高度，避免与像素宠物重叠
 PET_X = (W - 20 * PIXEL) // 2
-PET_Y = H - 20 * PIXEL - 4
+PET_Y = H - 20 * PIXEL - 4 - STATUS_HEIGHT
 
 ANIM_DELAYS = {
     "idle": 700,
@@ -64,7 +65,9 @@ class PetWindow(QWidget):
         # macOS：应用失活（切到其他程序）时 Qt 会自动隐藏 Tool 窗口，
         # 加此属性强制保持可见，否则桌宠一切换程序就消失、无法找回
         self.setAttribute(Qt.WA_MacAlwaysShowToolWindow)
-        self.setFixedSize(W, H)
+        # 高分屏（DPR≥2）放大 1.5 倍绘制，避免像素宠物/文字发虚
+        self._ui_scale = 1.5 if self.devicePixelRatioF() >= 2 else 1.0
+        self.setFixedSize(int(W * self._ui_scale), int(H * self._ui_scale))
 
         self._mode = "idle"
         self._frame = 0
@@ -161,7 +164,9 @@ class PetWindow(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        if time.time() < self._bubble_until and self._bubble_text:
+        painter.scale(self._ui_scale, self._ui_scale)
+        bubble_active = time.time() < self._bubble_until and bool(self._bubble_text)
+        if bubble_active:
             self._draw_bubble(painter)
         draw_grid(
             painter,
@@ -171,9 +176,14 @@ class PetWindow(QWidget):
             PET_Y,
             PIXEL,
         )
-        painter.setFont(self._small_font)
-        painter.setPen(QColor("#999999"))
-        painter.drawText(4, H - 5, self._status_text)
+        if not bubble_active:
+            painter.setFont(self._small_font)
+            painter.setPen(QColor("#999999"))
+            painter.drawText(4, H - 5, self._status_text)
+
+    def status_visible(self):
+        """底部状态是否显示：有气泡时隐藏，避免双文字。"""
+        return not (time.time() < self._bubble_until and bool(self._bubble_text))
 
     def _draw_bubble(self, painter):
         metrics = QFontMetrics(self._font)

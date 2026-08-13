@@ -13,6 +13,7 @@ from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QInputDialog,
     QMenu,
     QMessageBox,
@@ -62,6 +63,7 @@ class HeartBeatApp:
         # 内核：迁移/配置/插件发现/运行时调度（Kernel 门面）
         self.kernel = kernel.Kernel(config_path, data_dir=data_dir)
         self.cfg = self.kernel.cfg
+        self._apply_theme()
         self.plugins = self.kernel.plugins
         self.data_dir = self.kernel.data_dir
         self.db = db.Database(self.data_dir / "heartbeat.db")
@@ -114,6 +116,7 @@ class HeartBeatApp:
         self.search_win = None
         self._chat_pending = []
         self._coding_pending = []
+        self._confirm_allowlist = set()  # 本次会话记住的只读/低风险命令
         self._coding_cancel_event = threading.Event()
         self._coding_status_text = ""
         # 当前正在执行任务归属的会话（超时/失败回调仍要写回正确的会话）
@@ -300,6 +303,10 @@ class HeartBeatApp:
         Windows 上 SQLite 文件会因连接未关闭而锁死临时目录/重命名，
         macOS/Linux 虽可删除打开中的文件，也会留下未收尾的线程，统一走这里。
         """
+        try:
+            self._save_window_state()
+        except Exception:
+            pass
         for win in (self.pet, self.chat_win, self.settings_win, self.search_win):
             if win is not None:
                 try:
@@ -320,6 +327,36 @@ class HeartBeatApp:
             pass
         try:
             self.db.close()
+        except Exception:
+            pass
+
+    def _save_window_state(self):
+        """把聊天/设置/搜索窗口几何保存进配置，下次打开恢复。"""
+        state = dict(self.cfg.get("window_state") or {})
+        for key, win in (
+            ("chat", getattr(self, "chat_win", None)),
+            ("settings", getattr(self, "settings_win", None)),
+            ("search", getattr(self, "search_win", None)),
+        ):
+            if win is not None:
+                try:
+                    state[key] = [win.x(), win.y(), win.width(), win.height()]
+                except Exception:
+                    pass
+        self.cfg["window_state"] = state
+        try:
+            self.kernel.save_settings(self.cfg)
+        except Exception:
+            pass
+
+    def _restore_window_geometry(self, win, key):
+        try:
+            state = (self.cfg.get("window_state") or {}).get(key)
+            if state and len(state) == 4:
+                win.setGeometry(
+                    int(state[0]), int(state[1]),
+                    int(state[2]), int(state[3]),
+                )
         except Exception:
             pass
 
@@ -468,6 +505,7 @@ class HeartBeatApp:
             self._refresh_sessions()
         self.chat_win.set_daily_stats(self._daily_stats_text())
         self.chat_win.show()
+        self._restore_window_geometry(self.chat_win, "chat")
         self.chat_win.set_coding_running(self.kernel.runtime.is_busy("coding"))
         if (
             self.kernel.runtime.is_busy("coding")
@@ -603,11 +641,28 @@ class HeartBeatApp:
 
     def _confirm_tool(self, cmdline):
         """子线程调用：请求主线程弹窗确认，阻塞等待结果（超时按拒绝）。"""
+        if (
+            isinstance(cmdline, str)
+            and cmdline in self._confirm_allowlist
+            and not self._is_destructive_confirm(cmdline)
+        ):
+            return True
         event = threading.Event()
         holder = {}
         self.bridge.tool_confirm.emit(cmdline, event, holder)
         event.wait(60)
         return bool(holder.get("approved", False))
+
+    def _is_destructive_confirm(self, cmdline):
+        """写/删除/编辑/恢复类操作永远不能进“记住”白名单。"""
+        if not isinstance(cmdline, str):
+            return True
+        low = cmdline.lower()
+        markers = (
+            "rm ", "rm -", "mv ", "del ", "remove-item", "write_file",
+            "edit_file", "restore", "sudo", ">", ">>", "|",
+        )
+        return any(m in low for m in markers)
 
     def _confirm_plan(self, plan):
         """子线程调用：编码动手前请主人确认计划（超时按取消）。"""
@@ -676,6 +731,8 @@ class HeartBeatApp:
                 "skill_auth" in cmdline or "认证" in cmdline
             )
             detail = self._format_confirm_text(cmdline)
+            remember = QCheckBox("本次会话记住（只读/低风险命令）")
+            box.setCheckBox(remember)
             if is_auth:
                 box.setText(
                     f"桌宠要配置技能认证（如知乎），这不是危险操作，"
@@ -695,6 +752,13 @@ class HeartBeatApp:
             box.setWindowModality(Qt.WindowModal)
             answer = box.exec()
             holder["approved"] = answer == QMessageBox.Yes
+            if (
+                answer == QMessageBox.Yes
+                and remember.isChecked()
+                and isinstance(cmdline, str)
+                and not self._is_destructive_confirm(cmdline)
+            ):
+                self._confirm_allowlist.add(cmdline)
         except Exception:
             holder["approved"] = False
         finally:
@@ -1018,6 +1082,7 @@ class HeartBeatApp:
         if self.settings_win is None:
             self.settings_win = SettingsWindow(self)
         self.settings_win.show()
+        self._restore_window_geometry(self.settings_win, "settings")
         self.settings_win.raise_()
         self.settings_win.activateWindow()
 
@@ -1025,6 +1090,7 @@ class HeartBeatApp:
         if self.search_win is None:
             self.search_win = SearchWindow()
         self.search_win.show()
+        self._restore_window_geometry(self.search_win, "search")
         self.search_win.raise_()
         self.search_win.activateWindow()
 
@@ -1049,6 +1115,7 @@ class HeartBeatApp:
     def save_settings(self, cfg):
         self.cfg = cfg
         self.kernel.save_settings(cfg)
+        self._apply_theme()
         self.agent.reload(cfg, self.plugins)
         # 向量补索引放后台线程，避免保存设置卡顿十几秒
         threading.Thread(target=self.agent.reindex_async, daemon=True).start()
@@ -1057,6 +1124,16 @@ class HeartBeatApp:
             self.chat_win.setWindowTitle(f"和{cfg['pet_name']}聊天")
             self.chat_win.set_daily_stats(self._daily_stats_text())
         self._set_status("设置已保存")
+
+    def _apply_theme(self):
+        """按配置应用深色模式与全局字体（聊天气泡同步刷新）。"""
+        theme.set_dark(bool(self.cfg.get("dark_mode", False)))
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(theme.build_stylesheet())
+        chat_win = getattr(self, "chat_win", None)
+        if chat_win is not None and hasattr(chat_win, "apply_theme"):
+            chat_win.apply_theme()
 
     def apply_skin(self, name, sync_role=True):
         if name not in skins.SKINS:

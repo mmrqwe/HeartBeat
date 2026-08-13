@@ -27,6 +27,8 @@ DEFAULT_CONFIG = {
     "embedding_model": "BAAI/bge-small-zh-v1.5",
     "skin": "orange_cat",
     "stream": True,
+    "dark_mode": False,
+    "window_state": {},
     "thinking_enabled": True,
     "thinking_effort": "medium",
     "tools_enabled": True,
@@ -55,9 +57,9 @@ DEFAULT_CONFIG = {
     },
     # LLM 网络重连：连接失败/SSL 被掐断/5xx/429 时指数退避重试
     "retry": {
-        "max_attempts": 3,    # 总尝试次数（含首次）
-        "backoff_base": 0.5,  # 退避基数（秒），指数增长
-        "backoff_max": 8.0,   # 退避上限（秒）
+        "max_attempts": 11,   # 总尝试次数（含首次；断联至少重拨 10 次）
+        "backoff_base": 3.0,  # 退避下限（秒）：每次重拨至少隔几秒
+        "backoff_max": 10.0,  # 退避上限（秒）
     },
 }
 

@@ -204,7 +204,7 @@ def test_stream_read_reconnects_on_connect_failure():
 
 
 def test_stream_read_connect_failure_exhausted_raises():
-    """连接阶段持续失败：重试耗尽后抛原异常（max_attempts=3 → 尝试 3 次）。"""
+    """连接阶段持续失败：重试耗尽后抛原异常（默认 11 次 → 尝试 11 次）。"""
     patch = _Patch()
     patch.setattr(core.time, "sleep", lambda s: None)
     try:
@@ -222,9 +222,31 @@ def test_stream_read_connect_failure_exhausted_raises():
         except ssl.SSLError:
             raised = True
         assert raised
-        assert len(calls) == 3
+        assert len(calls) == 11
     finally:
         patch.restore()
+
+
+def test_retry_backoff_has_minimum_delay():
+    """每次重拨至少等 backoff_base 秒，避免近乎立即重连。"""
+    patch = _Patch()
+    patch.setattr(core.random, "uniform", lambda a, b: 0.0)
+    try:
+        assert core._retry_backoff(0, base=3.0, cap=10.0) == 3.0
+        patch.setattr(core.random, "uniform", lambda a, b: 7.0)
+        assert core._retry_backoff(9, base=3.0, cap=10.0) == 10.0
+    finally:
+        patch.restore()
+
+
+def test_retry_cfg_defaults_allow_ten_redials():
+    """retry 配置缺失时默认至少 10 次重拨，间隔下限为 3 秒。"""
+    cfg = _cfg()
+    cfg.pop("retry", None)
+    rc = core.Brain(cfg, {})._retry_cfg()
+    assert rc["max_attempts"] == 11
+    assert rc["backoff_base"] == 3.0
+    assert rc["backoff_max"] == 10.0
 
 
 def test_stream_read_retry_config_honored():

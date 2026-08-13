@@ -97,15 +97,22 @@ def _is_retryable_error(exc):
     return False
 
 
-def _retry_backoff(attempt, base=0.5, cap=8.0):
-    """指数退避 + full jitter：第 attempt 次重试前等待 0~min(cap, base*2^attempt) 秒。"""
-    return random.uniform(0, min(cap, base * (2 ** attempt)))
+def _retry_backoff(attempt, base=3.0, cap=10.0):
+    """指数退避，但至少等待 base 秒（“隔几秒重拨”）。
+
+    第 attempt 次重试前等待 base~min(cap, base*2^attempt) 秒；
+    base 作为下限，避免 full jitter 出现近乎立即重连的无效重拨。
+    """
+    span = min(cap, base * (2 ** attempt))
+    extra = max(0.0, span - base)
+    return min(cap, base + random.uniform(0, extra))
 
 
-def _request_with_retry(fn, retries=2, base_delay=0.5, max_delay=8.0, on_retry=None):
+def _request_with_retry(fn, retries=10, base_delay=3.0, max_delay=10.0, on_retry=None):
     """指数退避重试：SSL 断连/超时/连接失败/5xx/429 自动重试，其余错误直接抛。
 
-    retries=重试次数（总尝试 = retries+1）；每次重试前等待 full jitter 退避；
+    retries=重试次数（总尝试 = retries+1）；每次重试前等待 base_delay 起步的
+    jitter 退避，确保“隔几秒重拨”而不是立即重连；
     on_retry(attempt, exc) 回调用于可观测（日志/UI 提示）。
     401/403/400 等参数/鉴权错误、证书校验失败不重试（重试也没用）。
     """
@@ -274,9 +281,9 @@ class Brain:
         """LLM 重连配置：config.json 的 retry 块（带默认值兜底）。"""
         cfg = self.cfg.get("retry") or {}
         return {
-            "max_attempts": max(1, int(cfg.get("max_attempts", 3))),
-            "backoff_base": max(0.1, float(cfg.get("backoff_base", 0.5))),
-            "backoff_max": max(0.2, float(cfg.get("backoff_max", 8.0))),
+            "max_attempts": max(1, int(cfg.get("max_attempts", 11))),
+            "backoff_base": max(0.1, float(cfg.get("backoff_base", 3.0))),
+            "backoff_max": max(0.2, float(cfg.get("backoff_max", 10.0))),
         }
 
     # ---------- 自主发言 ----------

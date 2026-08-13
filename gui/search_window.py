@@ -37,7 +37,7 @@ class SearchWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("HeartBeat 搜索")
-        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        self.setWindowFlags(Qt.Window)
         self.resize(520, 520)
         self.setMinimumSize(420, 380)
         self._bridge = SearchBridge()
@@ -58,12 +58,12 @@ class SearchWindow(QWidget):
         self.category_combo = QComboBox()
         for label, value in CATEGORIES:
             self.category_combo.addItem(label, value)
-        search_btn = QPushButton("搜索")
-        search_btn.setObjectName("Primary")
-        search_btn.clicked.connect(self._do_search)
+        self.search_btn = QPushButton("搜索")
+        self.search_btn.setObjectName("Primary")
+        self.search_btn.clicked.connect(self._do_search)
         bar.addWidget(self.query_edit, 1)
         bar.addWidget(self.category_combo)
-        bar.addWidget(search_btn)
+        bar.addWidget(self.search_btn)
         root.addLayout(bar)
 
         self.status_label = QLabel("输入关键词，回车或点搜索。")
@@ -76,10 +76,14 @@ class SearchWindow(QWidget):
 
         actions = QHBoxLayout()
         actions.addStretch(1)
+        self.retry_btn = QPushButton("重试")
+        self.retry_btn.hide()
+        self.retry_btn.clicked.connect(self._retry)
         open_btn = QPushButton("在浏览器打开")
         open_btn.clicked.connect(self._open_selected)
         copy_btn = QPushButton("复制链接")
         copy_btn.clicked.connect(self._copy_selected)
+        actions.addWidget(self.retry_btn)
         actions.addWidget(open_btn)
         actions.addWidget(copy_btn)
         root.addLayout(actions)
@@ -89,11 +93,19 @@ class SearchWindow(QWidget):
         if not query:
             return
         category = self.category_combo.currentData()
+        self._last_query = query
+        self._last_category = category
         self.results.clear()
         self.status_label.setText("搜索中…")
+        self.search_btn.setEnabled(False)
+        self.retry_btn.hide()
         threading.Thread(
             target=self._worker, args=(query, category), daemon=True
         ).start()
+
+    def _retry(self):
+        if getattr(self, "_last_query", ""):
+            self._do_search()
 
     def _worker(self, query, category):
         try:
@@ -104,26 +116,47 @@ class SearchWindow(QWidget):
 
     def _show_results(self, entries, error):
         self.results.clear()
+        self.search_btn.setEnabled(True)
         if error:
             self.status_label.setText(f"搜索失败：{error}")
+            self.retry_btn.show()
             return
         if not entries:
             self.status_label.setText("没有找到结果。")
+            self.retry_btn.hide()
             return
+        self.retry_btn.hide()
         self.status_label.setText(f"找到 {len(entries)} 条结果，双击可打开。")
         for entry in entries:
-            title = entry.get("title", "")
-            snippet = entry.get("snippet", "")
-            url = entry.get("url", "")
-            text = title
-            if snippet:
-                text += "\n" + snippet
-            if url:
-                text += "\n" + url
-            item = QListWidgetItem(text)
-            item.setData(Qt.UserRole, url)
-            item.setToolTip(url or title)
+            item, widget = self._make_result_item(entry)
             self.results.addItem(item)
+            self.results.setItemWidget(item, widget)
+
+    def _make_result_item(self, entry):
+        """结果项：标题加粗、摘要次要、URL 弱化，视觉分层。"""
+        item = QListWidgetItem()
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(2)
+        title = QLabel(str(entry.get("title", "")))
+        title.setObjectName("Title")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+        snippet = QLabel(str(entry.get("snippet", "")))
+        snippet.setObjectName("Hint")
+        snippet.setWordWrap(True)
+        if snippet.text():
+            layout.addWidget(snippet)
+        url = QLabel(str(entry.get("url", "")))
+        url.setObjectName("Hint")
+        url.setStyleSheet("font-size: 11px;")
+        if url.text():
+            layout.addWidget(url)
+        item.setSizeHint(widget.sizeHint())
+        item.setData(Qt.UserRole, entry.get("url", ""))
+        item.setToolTip(entry.get("url") or entry.get("title", ""))
+        return item, widget
 
     def _open_selected(self):
         item = self.results.currentItem()

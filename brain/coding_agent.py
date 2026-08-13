@@ -216,6 +216,19 @@ def _bg_tail_brief(result):
     return lines[-1][:80]
 
 
+def _tool_failed(result):
+    """判断工具返回是否属于“失败且值得熔断”（拒绝/未确认/不存在/异常）。"""
+    r = str(result or "")
+    return (
+        r.startswith("工具执行失败")
+        or r.startswith("用户未确认")
+        or r.startswith("已拒绝")
+        or "失败：" in r
+        or "不存在" in r
+        or "未找到" in r
+    )
+
+
 def run_coding_task(brain, cfg, user_request, run_tool,
                     on_status=None, on_delta=None, max_rounds=None,
                     history=None, cancel_event=None, confirm_plan=None):
@@ -240,6 +253,7 @@ def run_coding_task(brain, cfg, user_request, run_tool,
         return f"项目目录不存在：{project_dir}。请在设置里重新选择。"
     decls = tools.coding_declarations(cfg)
     messages = _build_messages(cfg, user_request, history=history)
+    fail_counts = {}
     if confirm_plan is not None:
         plan = _ask_plan(brain, user_request)
         if not plan:
@@ -296,6 +310,16 @@ def run_coding_task(brain, cfg, user_request, run_tool,
             except Exception as exc:
                 result = f"工具执行失败：{exc}"
             result = str(result or "")
+            if _tool_failed(result):
+                key = (name, str(arguments))
+                fail_counts[key] = fail_counts.get(key, 0) + 1
+                if fail_counts[key] >= 3:
+                    if on_status:
+                        on_status("⚠️ 同一操作连续失败，停止重试")
+                    return (
+                        "同一个操作连续失败 3 次，我先停下来了。"
+                        "改过的文件都有备份，需要回滚随时叫我。"
+                    )
             if name == "bg_check":
                 tail = _bg_tail_brief(result)
                 if tail and on_status:

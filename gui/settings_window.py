@@ -2,10 +2,11 @@
 
 import copy
 import json
+import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -32,6 +33,11 @@ from PySide6.QtWidgets import (
 )
 
 from gui import skins
+
+class _ApiTestBridge(QObject):
+    done = Signal(str, bool)
+
+
 from gui.pet_window import draw_grid
 
 
@@ -52,9 +58,11 @@ class SettingsWindow(QDialog):
         self.plugins = controller.plugins
         self.stats = controller.stats
         self.setWindowTitle("HeartBeat 设置")
-        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        self.setWindowFlags(Qt.Window)
         self.resize(660, 640)
         self.setMinimumSize(560, 520)
+        self._api_test_bridge = _ApiTestBridge()
+        self._api_test_bridge.done.connect(self._show_api_test_result)
         self._build()
         self._refresh_stats_tab()
 
@@ -91,85 +99,105 @@ class SettingsWindow(QDialog):
 
     # ---------- 基本设置 ----------
 
+    def _section_form(self, title):
+        """设置分组卡片：标题 + 表单行。"""
+        card = QFrame()
+        card.setObjectName("Card")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 12, 14, 12)
+        head = QLabel(title)
+        head.setObjectName("Title")
+        layout.addWidget(head)
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(8)
+        layout.addLayout(form)
+        return card, form
+
     def _build_basic_tab(self):
         tab = QWidget()
-        form = QFormLayout(tab)
-        form.setContentsMargins(18, 16, 18, 16)
-        form.setSpacing(10)
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(12)
         self._basic = {}
 
-        def add_text(key, label, secret=False):
+        def add_text(form, key, label, secret=False):
             edit = QLineEdit(str(self.cfg.get(key, "")))
             if secret:
                 edit.setEchoMode(QLineEdit.Password)
             form.addRow(label, edit)
             self._basic[key] = edit
 
-        def add_spin(key, label, minimum, maximum):
+        def add_spin(form, key, label, minimum, maximum):
             spin = QSpinBox()
             spin.setRange(minimum, maximum)
             spin.setValue(int(self.cfg.get(key, minimum)))
             form.addRow(label, spin)
             self._basic[key] = spin
 
-        add_text("pet_name", "宠物名字")
-        add_text("owner_title", "对你的称呼（留空自动：人物类角色用“你”，其他用“主人”）")
-        add_text("role", "自我认知（角色）")
-        add_text("personality", "性格底色")
-        add_text("speaking_style", "说话方式（可选，留空跟随皮肤）")
-        add_spin("interval_minutes", "生活循环间隔（分钟）", 1, 1440)
-        add_spin("daily_energy_budget", "每日体力（LLM 调用次数）", 1, 1000000)
-        add_spin("proactive_energy_daily_cap", "主动思考每日上限", 0, 1000000)
-        add_spin("max_context_tokens", "上下文上限（token）", 1000, 1000000)
-        add_spin("max_output_tokens", "输出上限（token，实际受模型限制）", 1000, 1000000)
-        add_spin("quiet_start", "安静时段开始（小时）", 0, 23)
-        add_spin("quiet_end", "安静时段结束（小时）", 0, 23)
+        card, form = self._section_form("角色与性格")
+        add_text(form, "pet_name", "宠物名字")
+        add_text(form, "owner_title", "对你的称呼（留空自动）")
+        add_text(form, "role", "自我认知（角色）")
+        add_text(form, "personality", "性格底色")
+        add_text(form, "speaking_style", "说话方式（可选）")
+        outer.addWidget(card)
 
-        form.addRow(QLabel("大脑模型（OpenAI 兼容接口，Key 留空用规则模式）"))
-        add_text("base_url", "API 地址", secret=False)
-        add_text("api_key", "API Key", secret=True)
-        add_text("model", "模型")
+        card, form = self._section_form("生活循环与精力")
+        add_spin(form, "interval_minutes", "生活循环间隔（分钟）", 1, 1440)
+        add_spin(form, "quiet_start", "安静时段开始（小时）", 0, 23)
+        add_spin(form, "quiet_end", "安静时段结束（小时）", 0, 23)
+        add_spin(form, "daily_energy_budget", "每日体力（LLM 调用次数）", 1, 1000000)
+        add_spin(form, "proactive_energy_daily_cap", "主动思考每日上限", 0, 1000000)
+        outer.addWidget(card)
+
+        card, form = self._section_form("模型与 API")
+        add_text(form, "base_url", "API 地址")
+        add_text(form, "api_key", "API Key", secret=True)
+        add_text(form, "model", "模型")
         api = self.cfg["api"]
         self._basic["base_url"].setText(api.get("base_url", ""))
         self._basic["api_key"].setText(api.get("api_key", ""))
         self._basic["model"].setText(api.get("model", ""))
-
-        self._basic["embedding_enabled"] = QCheckBox("启用本地向量记忆（RAG）")
-        self._basic["embedding_enabled"].setChecked(
-            bool(self.cfg.get("embedding_enabled", True))
-        )
-        form.addRow(self._basic["embedding_enabled"])
-        add_text("embedding_model", "向量模型")
-
+        test_btn = QPushButton("测试连接")
+        test_btn.clicked.connect(self._test_api_connection)
+        form.addRow(test_btn)
+        add_spin(form, "max_context_tokens", "上下文上限（token）", 1000, 1000000)
+        add_spin(form, "max_output_tokens", "输出上限（token）", 1000, 1000000)
         self._basic["stream"] = QCheckBox("流式输出回复（逐字显示）")
         self._basic["stream"].setChecked(bool(self.cfg.get("stream", True)))
         form.addRow(self._basic["stream"])
-
-        self._basic["thinking_enabled"] = QCheckBox(
-            "LLM 思考/推理模式（模型支持时发送 reasoning_effort；关闭则普通模式）"
-        )
+        self._basic["thinking_enabled"] = QCheckBox("LLM 思考/推理模式")
         self._basic["thinking_enabled"].setChecked(
             bool(self.cfg.get("thinking_enabled", True))
         )
         form.addRow(self._basic["thinking_enabled"])
-
         self._basic["thinking_effort"] = QComboBox()
-        for label, value in [("低（low）", "low"), ("中（medium）", "medium"), ("高（high）", "high")]:
+        for label, value in [
+            ("低（low）", "low"),
+            ("中（medium）", "medium"),
+            ("高（high）", "high"),
+        ]:
             self._basic["thinking_effort"].addItem(label, value)
         idx = self._basic["thinking_effort"].findData(
             self.cfg.get("thinking_effort", "medium")
         )
         self._basic["thinking_effort"].setCurrentIndex(max(idx, 0))
         form.addRow("思考强度", self._basic["thinking_effort"])
+        outer.addWidget(card)
 
-        self._basic["tools_enabled"] = QCheckBox(
-            "允许桌宠自主调用搜索工具（自己选话题主动搜索）"
+        card, form = self._section_form("能力与安全")
+        self._basic["embedding_enabled"] = QCheckBox("启用本地向量记忆（RAG）")
+        self._basic["embedding_enabled"].setChecked(
+            bool(self.cfg.get("embedding_enabled", True))
         )
+        form.addRow(self._basic["embedding_enabled"])
+        add_text(form, "embedding_model", "向量模型")
+        self._basic["tools_enabled"] = QCheckBox("允许桌宠自主调用搜索工具")
         self._basic["tools_enabled"].setChecked(
             bool(self.cfg.get("tools_enabled", True))
         )
         form.addRow(self._basic["tools_enabled"])
-
         self._basic["shell_tools_mode"] = QComboBox()
         for label, value in [
             ("关闭（off）", "off"),
@@ -182,14 +210,12 @@ class SettingsWindow(QDialog):
             self.cfg.get("shell_tools_mode", "confirm")
         )
         self._basic["shell_tools_mode"].setCurrentIndex(max(idx, 0))
-        form.addRow("Shell 工具（bash 命令执行）", self._basic["shell_tools_mode"])
-
+        form.addRow("Shell 工具", self._basic["shell_tools_mode"])
         self._basic["shell_workdir"] = QLineEdit(
             str(self.cfg.get("shell_workdir", "") or "")
         )
         self._basic["shell_workdir"].setPlaceholderText("留空 = 用户主目录")
         form.addRow("Shell 工作目录", self._basic["shell_workdir"])
-
         self._basic["project_dir"] = QLineEdit(
             str(self.cfg.get("project_dir", "") or "")
         )
@@ -201,8 +227,49 @@ class SettingsWindow(QDialog):
         browse_btn = QPushButton("浏览…")
         browse_btn.clicked.connect(self._browse_project_dir)
         project_layout.addWidget(browse_btn)
-        form.addRow("编码项目目录（coding 文件读写边界）", project_row)
+        form.addRow("编码项目目录", project_row)
+        outer.addWidget(card)
+
+        outer.addStretch(1)
         return self._wrap_scroll(tab)
+
+    def _test_api_connection(self):
+        """用当前表单里的 API 字段发一条最小请求验证连通性。"""
+        from brain.llm import Brain
+
+        base = self._basic["base_url"].text().strip()
+        key = self._basic["api_key"].text().strip()
+        model = self._basic["model"].text().strip()
+        if not base or not key or not model:
+            QMessageBox.warning(
+                self, "测试连接", "请先填写 API 地址、API Key 和模型。"
+            )
+            return
+        cfg = copy.deepcopy(self.cfg)
+        cfg["api"].update({"base_url": base, "api_key": key, "model": model})
+
+        def worker():
+            try:
+                brain = Brain(cfg, self.plugins, None)
+                reply = brain.complete(
+                    [{"role": "user", "content": "ping"}],
+                    max_tokens=1,
+                    timeout=15,
+                )
+                ok = bool(reply)
+                msg = "连接成功，模型可响应" if ok else "连接成功但模型无响应"
+            except Exception as exc:
+                ok = False
+                msg = f"连接失败：{exc}"
+            self._api_test_bridge.done.emit(msg, ok)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_api_test_result(self, msg, ok):
+        if ok:
+            QMessageBox.information(self, "测试连接", msg)
+        else:
+            QMessageBox.warning(self, "测试连接", msg)
 
     def _browse_project_dir(self):
         current = str(self._basic["project_dir"].text() or "").strip()
@@ -309,6 +376,9 @@ class SettingsWindow(QDialog):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(12, 12, 12, 12)
+        self.dark_mode = QCheckBox("深色模式（保存后立即生效）")
+        self.dark_mode.setChecked(bool(self.cfg.get("dark_mode", False)))
+        layout.addWidget(self.dark_mode)
         self.sync_role = QCheckBox("切换皮肤时同步人设（角色/性格/说话方式，开箱即用）")
         self.sync_role.setChecked(True)
         layout.addWidget(self.sync_role)
@@ -597,7 +667,11 @@ class SettingsWindow(QDialog):
         try:
             for key in ("pet_name", "role", "personality", "speaking_style"):
                 cfg[key] = self._basic[key].text().strip() or cfg[key]
-            for key in ("interval_minutes", "quiet_start", "quiet_end"):
+            for key in (
+                "interval_minutes", "quiet_start", "quiet_end",
+                "daily_energy_budget", "proactive_energy_daily_cap",
+                "max_context_tokens", "max_output_tokens",
+            ):
                 cfg[key] = self._basic[key].value()
             api = cfg["api"]
             api["base_url"] = self._basic["base_url"].text().strip() or api["base_url"]
@@ -615,6 +689,7 @@ class SettingsWindow(QDialog):
             cfg["shell_tools_mode"] = self._basic["shell_tools_mode"].currentData()
             cfg["shell_workdir"] = self._basic["shell_workdir"].text().strip()
             cfg["project_dir"] = self._basic["project_dir"].text().strip()
+            cfg["dark_mode"] = self.dark_mode.isChecked()
 
             for name, data in self._plugin_widgets.items():
                 module = self.plugins[name]

@@ -890,6 +890,27 @@ def test_coding_loop_tool_exception_isolated(tmp_path):
     assert "工具失败了，我来说明" == reply
 
 
+def test_coding_loop_same_tool_failure_breaker(tmp_path):
+    """同一工具+同参数连续失败 3 次：强制熔断，不再死循环。"""
+    proj = _make_project(tmp_path)
+    cfg = _cfg("confirm", project_dir=str(proj))
+    brain = _FakeBrain([
+        ("", [_tc("edit_file", {"path": "a.txt", "search": "x", "replace": "y"})]),
+        ("", [_tc("edit_file", {"path": "a.txt", "search": "x", "replace": "y"})]),
+        ("", [_tc("edit_file", {"path": "a.txt", "search": "x", "replace": "y"})]),
+        ("", [_tc("edit_file", {"path": "a.txt", "search": "x", "replace": "y"})]),
+    ])
+    calls = []
+
+    def run_tool(name, arguments):
+        calls.append(name)
+        raise RuntimeError("boom")
+
+    reply = coding_agent.run_coding_task(brain, cfg, "任务", run_tool)
+    assert "连续失败" in reply
+    assert len(calls) == 3
+
+
 def test_coding_loop_empty_final_falls_to_summary(tmp_path):
     proj = _make_project(tmp_path)
     cfg = _cfg("confirm", project_dir=str(proj))

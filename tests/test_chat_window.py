@@ -63,6 +63,23 @@ def test_long_message_capped():
     assert _bubble_width(w, 0) == w._max_bubble_width()
 
 
+def test_system_message_uses_wide_bubble():
+    """系统输出：用更宽的气泡渲染，短文本也撑满约 92% 聊天区宽度，
+    且异常原文里的尖括号不被 Markdown 吞掉。"""
+    w = _make_window()
+    w.resize(800, 600)
+    error_text = "回复失败：<urlopen error [SSL: UNEXPECTED_EOF]>"
+    w.add_message("system", error_text)
+    assert _bubble_width(w, 0) == w._max_bubble_width(0.92)
+
+    bubble = next(
+        w.content_layout.itemAt(i).widget()
+        for i in range(w.content_layout.count())
+        if isinstance(w.content_layout.itemAt(i).widget(), chat_window.QTextBrowser)
+    )
+    assert "<urlopen error" in bubble.toPlainText()
+
+
 def test_stream_grows_then_caps():
     """流式：文字变长 → 气泡宽度递增，超过上限后封顶。"""
     w = _make_window()
@@ -193,6 +210,32 @@ def test_sidebar_buttons_have_icons_and_tooltips():
     assert w.delete_session_btn.toolTip() == "删除选中的对话"
 
 
+def test_chat_window_not_always_on_top():
+    """聊天窗不应始终置顶（只有宠物窗需要置顶）。"""
+    w = _make_window()
+    assert w.windowFlags() & chat_window.Qt.WindowStaysOnTopHint == 0
+
+
+def test_day_separators():
+    """跨天消息之间插入日期分隔，同一天不重复插入。"""
+    w = _make_window()
+    w.add_message("user", "a", "2026-08-12 10:00")
+    w.add_message("assistant", "b", "2026-08-12 10:01")
+    w.add_message("user", "c", "2026-08-13 09:00")
+
+    def labels():
+        out = []
+        for i in range(w.content_layout.count()):
+            widget = w.content_layout.itemAt(i).widget()
+            if isinstance(widget, chat_window.QLabel):
+                out.append(widget.text())
+        return out
+
+    texts = labels()
+    assert texts.count("08月12日") == 1
+    assert any(t in ("今天", "昨天") for t in texts)
+
+
 def test_sessions_new_and_delete_callbacks():
     """新建/删除按钮回调宿主；默认会话删除弹信息框（不回调）。"""
     w = _make_window()
@@ -225,6 +268,19 @@ def test_sessions_new_and_delete_callbacks():
     finally:
         cw.QMessageBox.question = orig
     assert del_calls == ["xyz"]
+
+
+def test_session_double_click_renames():
+    w = _make_window()
+    calls = []
+    w.on_rename_session = lambda sid: calls.append(sid)
+    w.set_sessions(
+        [{"id": "default", "name": "默认对话", "project_dir": None},
+         {"id": "xyz", "name": "临时", "project_dir": None}],
+        "xyz",
+    )
+    w._on_session_double_clicked(w.session_list.item(1))
+    assert calls == ["xyz"]
 
 
 def _run_plain():
