@@ -24,6 +24,11 @@ import core
 import db as dbmod
 import kernel
 import main as mainmod
+import plugins.quote as quote_mod
+import plugins.rss_news as rss_mod
+import plugins.weather as weather_mod
+
+_ORIG_COLLECTS = {}
 
 
 def wait(ms):
@@ -53,12 +58,27 @@ def _make_app():
     # 屏蔽真实采集与思考（不碰网络/LLM）
     orig_gather = core.gather
     core.gather = lambda *a, **k: {"collections": [], "errors": []}
+    # 规则聊天会直接调插件 collect（真实联网会残留网络线程，污染 Qt 事件循环）
+    _ORIG_COLLECTS.clear()
+    _ORIG_COLLECTS["weather"] = weather_mod.collect
+    _ORIG_COLLECTS["rss_news"] = rss_mod.collect
+    _ORIG_COLLECTS["quote"] = quote_mod.collect
+    weather_mod.collect = lambda settings: [{"title": "天气", "text": "晴，适合出门"}]
+    rss_mod.collect = lambda settings: [{"title": "新闻", "text": "本地测试新闻"}]
+    quote_mod.collect = lambda settings: [{"title": "一言", "text": "测试一言"}]
     return tmp, hb, orig_gather
 
 
 def _cleanup(tmp, hb, orig_gather):
     """统一清理：先还原 mock，再 close（关 DB/停线程），最后删临时目录。"""
     core.gather = orig_gather
+    for mod, orig in (
+        (weather_mod, _ORIG_COLLECTS.get("weather")),
+        (rss_mod, _ORIG_COLLECTS.get("rss_news")),
+        (quote_mod, _ORIG_COLLECTS.get("quote")),
+    ):
+        if orig is not None:
+            mod.collect = orig
     try:
         hb.close()
     finally:
