@@ -17,8 +17,11 @@ def _normalize_project_dir(path):
     if not str(path or "").strip():
         return None
     try:
+        # Windows 反斜杠在 POSIX 上是合法文件名字符，先统一为 '/'，
+        # 保证从 Windows 复制的路径（含尾部 '\'）也能归一化命中
+        s = str(path).strip().replace("\\", "/")
         return os.path.normcase(
-            os.path.normpath(os.path.abspath(os.path.expanduser(str(path).strip())))
+            os.path.normpath(os.path.abspath(os.path.expanduser(s)))
         )
     except Exception:
         return str(path).strip()
