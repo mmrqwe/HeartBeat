@@ -319,7 +319,7 @@ class Brain:
             base_payload.update({"temperature": 0.9, "max_tokens": max_tokens or 300})
         started = time.time()
         try:
-            usage = self._stream_read(
+            usage, finish, text = self._stream_read(
                 url,
                 headers,
                 {**base_payload, "stream_options": {"include_usage": True}},
@@ -332,7 +332,7 @@ class Brain:
                 raise
             # 部分兼容接口不认识 stream_options，去掉重试
             try:
-                usage = self._stream_read(url, headers, base_payload, on_delta)
+                usage, finish, text = self._stream_read(url, headers, base_payload, on_delta)
             except Exception:
                 if self.stats:
                     self.stats.record_llm(ok=False)
@@ -341,6 +341,17 @@ class Brain:
             if self.stats:
                 self.stats.record_llm(ok=False)
             raise
+        if not text.strip() and finish == "length":
+            # 流式下隐藏推理耗尽预算 → 一个内容块都没有；
+            # 降级非流式一次性重试（非流式入口自带同签名重试保护）
+            budget = max((max_tokens or 300) * 4, 4000)
+            logger.warning(
+                "LLM 流式空内容（finish_reason=length），降级非流式重试（预算 %s，model=%s）",
+                budget, self.cfg["api"]["model"],
+            )
+            reply = self.complete(messages, max_tokens=budget)
+            if reply:
+                on_delta(reply)
         if self.stats:
             prompt, completion, cached = parse_usage({"usage": usage} if usage else {})
             latency_ms = int((time.time() - started) * 1000)
@@ -370,6 +381,7 @@ class Brain:
             chunks = 0
             texts = []
             usage = None
+            finish = None
             try:
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     buffer = b""
@@ -382,7 +394,7 @@ class Brain:
                                 continue
                             data = line[5:].strip()
                             if data == b"[DONE]":
-                                return usage
+                                return usage, finish, "".join(texts)
                             try:
                                 obj = json.loads(data)
                             except ValueError:
@@ -391,13 +403,15 @@ class Brain:
                                 usage = obj["usage"]
                             choices = obj.get("choices") or []
                             if choices:
+                                if choices[0].get("finish_reason"):
+                                    finish = choices[0]["finish_reason"]
                                 delta = choices[0].get("delta") or {}
                                 content = delta.get("content")
                                 if content:
                                     chunks += 1
                                     texts.append(content)
                                     on_delta(content)
-                return usage
+                return usage, finish, "".join(texts)
             except Exception as exc:  # noqa: BLE001
                 if not _is_retryable_error(exc):
                     raise
@@ -498,6 +512,22 @@ class Brain:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    @staticmethod
+    def _choice_content(data):
+        """响应正文（缺省/None 归一为空串，避免 None.strip() 崩溃）。"""
+        choices = data.get("choices") or []
+        if not choices:
+            return ""
+        message = choices[0].get("message") or {}
+        return message.get("content") or ""
+
+    @staticmethod
+    def _choice_finish(data):
+        choices = data.get("choices") or []
+        if not choices:
+            return None
+        return choices[0].get("finish_reason")
+
     def _post_chat(self, payload, timeout=60):
         api = self.cfg["api"]
         url = api["base_url"].rstrip("/") + "/chat/completions"
@@ -565,8 +595,22 @@ class Brain:
         else:
             payload.update({"temperature": 0.9, "max_tokens": max_tokens or 300})
         data = self._post_chat(payload, timeout=timeout)
+        if not self._choice_content(data) and self._choice_finish(data) == "length":
+            # 网关把隐藏推理计入 max_tokens 却不下发 content：预算被推理
+            # 耗尽 → 空内容。用提高后的预算重试一次（仅此失败签名触发，
+            # finish=stop 的空内容视为模型主动返回，不重试）。
+            budget = max((max_tokens or 300) * 4, 4000)
+            logger.warning(
+                "LLM 空内容（finish_reason=length），预算 %s → %s 重试（model=%s）",
+                max_tokens or 300, budget, self.cfg["api"]["model"],
+            )
+            if reasoning:
+                payload["max_completion_tokens"] = budget
+            else:
+                payload["max_tokens"] = budget
+            data = self._post_chat(payload, timeout=timeout)
         self._consume_energy()
-        return data["choices"][0]["message"]["content"].strip()
+        return self._choice_content(data).strip()
 
     def complete_tools(self, messages, tools, max_tokens=None):
         """带工具声明的一次模型调用，返回 (content, tool_calls)。
@@ -586,8 +630,25 @@ class Brain:
         else:
             payload.update({"temperature": 0.7, "max_tokens": max_tokens or 500})
         data = self._post_chat(payload)
-        self._consume_energy()
         message = data["choices"][0]["message"]
+        if (
+            not (message.get("content") or "").strip()
+            and not message.get("tool_calls")
+            and self._choice_finish(data) == "length"
+        ):
+            # 同上：隐藏推理耗尽预算 → 空内容且无工具调用，提高预算重试
+            budget = max((max_tokens or 500) * 4, 4000)
+            logger.warning(
+                "LLM 工具调用空内容（finish_reason=length），预算 %s → %s 重试（model=%s）",
+                max_tokens or 500, budget, self.cfg["api"]["model"],
+            )
+            if reasoning:
+                payload["max_completion_tokens"] = budget
+            else:
+                payload["max_tokens"] = budget
+            data = self._post_chat(payload)
+            message = data["choices"][0]["message"]
+        self._consume_energy()
         return message.get("content"), message.get("tool_calls") or []
 
     def complete_tools_stream(self, messages, tools, on_delta):
@@ -617,7 +678,9 @@ class Brain:
         }
         started = time.time()
         try:
-            content, tool_calls, usage = self._stream_read_tools(url, headers, payload, on_delta)
+            content, tool_calls, usage, finish = self._stream_read_tools(
+                url, headers, payload, on_delta
+            )
         except urllib.error.HTTPError as exc:
             if exc.code != 400:
                 if self.stats:
@@ -629,6 +692,14 @@ class Brain:
             if self.stats:
                 self.stats.record_llm(ok=False)
             raise
+        if not (content or "").strip() and not tool_calls and finish == "length":
+            # 隐藏推理耗尽预算 → 流式无内容无工具调用；降级非流式重试
+            # （非流式入口自带同签名重试保护）
+            logger.warning(
+                "LLM 工具流空内容（finish_reason=length），降级非流式重试（model=%s）",
+                self.cfg["api"]["model"],
+            )
+            return self.complete_tools(messages, tools, max_tokens=4000)
         if self.stats:
             prompt, completion, cached = parse_usage({"usage": usage} if usage else {})
             latency_ms = int((time.time() - started) * 1000)
@@ -657,6 +728,7 @@ class Brain:
             parts = []
             tool_calls = []
             usage = None
+            finish = None
             chunks = 0
             try:
                 with urllib.request.urlopen(req, timeout=60) as resp:
@@ -670,7 +742,7 @@ class Brain:
                                 continue
                             data = line[5:].strip()
                             if data == b"[DONE]":
-                                return "".join(parts), tool_calls, usage
+                                return "".join(parts), tool_calls, usage, finish
                             try:
                                 obj = json.loads(data)
                             except ValueError:
@@ -680,6 +752,8 @@ class Brain:
                             choices = obj.get("choices") or []
                             if not choices:
                                 continue
+                            if choices[0].get("finish_reason"):
+                                finish = choices[0]["finish_reason"]
                             delta = choices[0].get("delta") or {}
                             content = delta.get("content")
                             if content:
@@ -702,14 +776,14 @@ class Brain:
                                     slot["function"]["name"] = fn["name"]
                                 if fn.get("arguments"):
                                     slot["function"]["arguments"] += fn["arguments"]
-                return "".join(parts), tool_calls, usage
+                return "".join(parts), tool_calls, usage, finish
             except Exception as exc:  # noqa: BLE001
                 if not _is_retryable_error(exc):
                     raise
                 if chunks > 0:
                     # 已推送过内容：保留部分内容、丢弃半截工具调用
                     logger.warning("工具流中断，保留已输出内容: %s", exc)
-                    return "".join(parts), [], usage
+                    return "".join(parts), [], usage, finish
                 if attempt >= attempts - 1:
                     raise
                 rc = self._retry_cfg()

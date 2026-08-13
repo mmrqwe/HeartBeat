@@ -192,11 +192,13 @@ def test_stream_read_reconnects_on_connect_failure():
         patch.setattr(urllib.request, "urlopen", urlopen)
         brain = _brain()
         deltas = []
-        usage = brain._stream_read("http://x/v1/chat/completions", {"A": "B"}, {"model": "m"}, deltas.append)
+        usage, finish, text = brain._stream_read("http://x/v1/chat/completions", {"A": "B"}, {"model": "m"}, deltas.append)
         assert len(calls) == 2
         # 文本流 on_delta 是增量语义（agent 层累积成全量后推 UI）
         assert deltas == ["你好", "，我", "在"]
         assert usage is None
+        assert finish is None
+        assert text == "你好，我在"
     finally:
         patch.restore()
 
@@ -307,7 +309,7 @@ def test_stream_read_tools_interrupted_keeps_content():
         patch.setattr(urllib.request, "urlopen", urlopen)
         brain = _brain()
         deltas = []
-        content, tool_calls, usage = brain._stream_read_tools(
+        content, tool_calls, usage, finish = brain._stream_read_tools(
             "http://x", {}, {"model": "m"}, deltas.append
         )
         assert content == "好的"
@@ -340,7 +342,7 @@ def test_stream_read_tools_reconnects_on_connect_failure():
         patch.setattr(urllib.request, "urlopen", urlopen)
         brain = _brain()
         deltas = []
-        content, tool_calls, usage = brain._stream_read_tools(
+        content, tool_calls, usage, finish = brain._stream_read_tools(
             "http://x", {}, {"model": "m"}, deltas.append
         )
         assert len(calls) == 2
@@ -370,6 +372,127 @@ def _run_plain():
     if failures:
         raise SystemExit(1)
     print("ALL TESTS PASSED")
+
+
+# ---------- 空内容（finish_reason=length）→ 提高预算重试 ----------
+
+
+class _FakePostChat:
+    """脚本化 _post_chat：依次返回响应，并记录每次 payload。"""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.payloads = []
+
+    def __call__(self, payload, timeout=60):
+        self.payloads.append(dict(payload))
+        return self.script.pop(0)
+
+
+def _resp(content, finish):
+    return {"choices": [{"finish_reason": finish, "message": {"content": content}}]}
+
+
+def test_complete_retries_on_empty_length():
+    """隐藏推理耗尽预算 → 空内容 + finish=length：提高预算重试一次。"""
+    fake = _FakePostChat([_resp("", "length"), _resp("计划：1 2 3", "stop")])
+    patch = _Patch()
+    patch.setattr(core.Brain, "_post_chat", fake)
+    try:
+        brain = _brain()
+        reply = brain.complete([{"role": "user", "content": "hi"}], max_tokens=400)
+        assert reply == "计划：1 2 3"
+        assert len(fake.payloads) == 2
+        assert fake.payloads[0]["max_tokens"] == 400
+        assert fake.payloads[1]["max_tokens"] == 4000
+    finally:
+        patch.restore()
+
+
+def test_complete_no_retry_on_stop_empty():
+    """finish=stop 的空内容视为模型主动返回，不重试。"""
+    fake = _FakePostChat([_resp("", "stop")])
+    patch = _Patch()
+    patch.setattr(core.Brain, "_post_chat", fake)
+    try:
+        brain = _brain()
+        reply = brain.complete([{"role": "user", "content": "hi"}])
+        assert reply == ""
+        assert len(fake.payloads) == 1
+    finally:
+        patch.restore()
+
+
+def test_complete_tools_retries_on_empty_length():
+    """工具调用空内容无 tool_calls + finish=length：提高预算重试。"""
+    fake = _FakePostChat([
+        {"choices": [{"finish_reason": "length", "message": {}}]},
+        {"choices": [{"finish_reason": "stop",
+                      "message": {"content": "好的", "tool_calls": []}}]},
+    ])
+    patch = _Patch()
+    patch.setattr(core.Brain, "_post_chat", fake)
+    try:
+        brain = _brain()
+        content, calls = brain.complete_tools(
+            [{"role": "user", "content": "hi"}], [{}]
+        )
+        assert content == "好的"
+        assert calls == []
+        assert len(fake.payloads) == 2
+        assert fake.payloads[1]["max_tokens"] == 4000
+    finally:
+        patch.restore()
+
+
+def test_complete_stream_falls_back_on_empty_length():
+    """流式空内容 + finish=length：降级非流式 complete 一次性重试。"""
+    calls = {"n": 0}
+
+    def fake_stream_read(self, url, headers, payload, on_delta):
+        calls["n"] += 1
+        return None, "length", ""
+
+    patch = _Patch()
+    patch.setattr(core.Brain, "_stream_read", fake_stream_read)
+    patch.setattr(
+        core.Brain,
+        "complete",
+        lambda self, messages, max_tokens=None, timeout=60: "非流式重试成功",
+    )
+    try:
+        brain = _brain()
+        deltas = []
+        brain.complete_stream([{"role": "user", "content": "hi"}], deltas.append)
+        assert calls["n"] == 1
+        assert deltas == ["非流式重试成功"]
+    finally:
+        patch.restore()
+
+
+def test_complete_tools_stream_falls_back_on_empty_length():
+    """工具流空内容无工具调用 + finish=length：降级非流式重试。"""
+    patch = _Patch()
+    patch.setattr(
+        core.Brain,
+        "_stream_read_tools",
+        lambda self, url, headers, payload, on_delta: ("", [], None, "length"),
+    )
+    patch.setattr(
+        core.Brain,
+        "complete_tools",
+        lambda self, messages, tools, max_tokens=None: ("非流式", []),
+    )
+    try:
+        brain = _brain()
+        deltas = []
+        content, calls = brain.complete_tools_stream(
+            [{"role": "user", "content": "hi"}], [{}], deltas.append
+        )
+        assert content == "非流式"
+        assert calls == []
+    finally:
+        patch.restore()
 
 
 if __name__ == "__main__":
