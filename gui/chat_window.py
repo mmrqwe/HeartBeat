@@ -2,8 +2,18 @@
 
 import time
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QKeyEvent, QTextDocument, QTextOption
+from PySide6.QtCore import QPointF, Qt, QTimer
+from PySide6.QtGui import (
+    QColor,
+    QIcon,
+    QKeyEvent,
+    QPainter,
+    QPen,
+    QPixmap,
+    QPolygonF,
+    QTextDocument,
+    QTextOption,
+)
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -23,8 +33,38 @@ from gui import theme
 
 
 BUBBLE_MIN_W = 72    # 气泡最小宽度（短消息窄气泡，按内容自适应）
-BUBBLE_MAX_W = 380   # 气泡最大宽度（超过后换行，受窗口宽度约束）
 BUBBLE_MARGIN = 10   # 气泡内边距（与 documentMargin 一致）
+
+
+def _make_action_icon(kind):
+    """侧边栏操作按钮的小图标：new=加号，rename=铅笔，delete=垃圾桶。"""
+    pm = QPixmap(20, 20)
+    pm.fill(Qt.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(QColor("#666666"), 2)
+    pen.setCapStyle(Qt.RoundCap)
+    painter.setPen(pen)
+    if kind == "new":
+        painter.drawLine(10, 4, 10, 16)
+        painter.drawLine(4, 10, 16, 10)
+    elif kind == "rename":
+        painter.setBrush(QColor("#666666"))
+        painter.setPen(Qt.NoPen)
+        painter.drawPolygon(QPolygonF([
+            QPointF(15, 3),
+            QPointF(18, 6),
+            QPointF(6, 18),
+            QPointF(3, 15),
+        ]))
+    elif kind == "delete":
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(5, 7, 10, 11)
+        painter.drawLine(4, 6, 16, 6)
+        painter.drawLine(9, 9, 9, 16)
+        painter.drawLine(13, 9, 13, 16)
+    painter.end()
+    return QIcon(pm)
 
 
 def _make_bubble(role):
@@ -36,9 +76,7 @@ def _make_bubble(role):
     bubble.viewport().setAutoFillBackground(False)  # QSS 背景作用于 frame，viewport 需透明
     bubble.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
     bubble.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-    # 宽度不固定：由 _sync_bubble_height 按内容自然宽度自适应（短消息窄气泡），
-    # 超长内容最多撑到 BUBBLE_MAX_W 后换行，避免超宽单词横向溢出。
-    bubble.setMaximumWidth(BUBBLE_MAX_W)
+    # 宽度不固定：由 _sync_bubble_height 按内容自然宽度 + 窗口宽度自适应。
     # 超长无空格单词（URL/代码串）按任意位置断行，避免横向溢出被裁剪；
     # 正常文本仍按词边界/中文逐字换行，不受影响。
     bubble.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
@@ -80,6 +118,7 @@ class ChatWindow(QWidget):
         self.on_rename_session = on_rename_session
         self.on_cancel_coding = on_cancel_coding
         self.messages = []
+        self._bubble_items = []  # (bubble, text, markdown)：窗口缩放时按记录重排
         self._last_bubble = None
         self._streaming = False
         self._think_dots = 0
@@ -102,25 +141,28 @@ class ChatWindow(QWidget):
         # 左侧：会话列表（多对话：新增/删除/切换；📁 表示绑定了编程目录）
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(168)
+        sidebar.setFixedWidth(164)
         side_layout = QVBoxLayout(sidebar)
         side_layout.setContentsMargins(8, 8, 8, 8)
         side_layout.setSpacing(6)
         side_header = QHBoxLayout()
         side_title = QLabel("对话")
         side_title.setObjectName("Hint")
-        new_btn = QPushButton("➕")
+        new_btn = QPushButton(_make_action_icon("new"), "")
         new_btn.setToolTip("新建对话")
-        new_btn.setFixedWidth(34)
+        new_btn.setFixedWidth(30)
         new_btn.clicked.connect(self._on_new_session)
-        del_btn = QPushButton("🗑")
+        del_btn = QPushButton(_make_action_icon("delete"), "")
         del_btn.setToolTip("删除选中的对话")
-        del_btn.setFixedWidth(34)
+        del_btn.setFixedWidth(30)
         del_btn.clicked.connect(self._on_delete_session)
-        rename_btn = QPushButton("✏️")
+        rename_btn = QPushButton(_make_action_icon("rename"), "")
         rename_btn.setToolTip("重命名选中的对话")
-        rename_btn.setFixedWidth(34)
+        rename_btn.setFixedWidth(30)
         rename_btn.clicked.connect(self._on_rename_session)
+        self.new_session_btn = new_btn
+        self.rename_session_btn = rename_btn
+        self.delete_session_btn = del_btn
         side_header.addWidget(side_title)
         side_header.addStretch(1)
         side_header.addWidget(new_btn)
@@ -215,10 +257,10 @@ class ChatWindow(QWidget):
         self.session_list.clear()
         for s in sessions:
             label = s.get("name") or "会话"
-            if s.get("project_dir"):
-                label = f"📁 {label}"
             item = QListWidgetItem(label)
-            item.setToolTip(s.get("project_dir") or "未绑定编程目录")
+            item.setToolTip(
+                f"目录：{s['project_dir']}" if s.get("project_dir") else "未绑定编程目录"
+            )
             self.session_list.addItem(item)
             self._session_ids.append(s["id"])
             if s["id"] == current_session_id:
@@ -284,6 +326,7 @@ class ChatWindow(QWidget):
         align = Qt.AlignRight if role == "user" else Qt.AlignLeft
         bubble = _make_bubble(role)
         bubble.setMarkdown(text)
+        self._bubble_items.append((bubble, text, True))
         self.content_layout.addWidget(bubble, 0, align)
         self._sync_bubble_height(bubble, text, markdown=True)
 
@@ -309,7 +352,7 @@ class ChatWindow(QWidget):
         self._scroll_to_bottom()
 
     def _natural_bubble_width(self, bubble, text, markdown):
-        """按内容自然宽度（不换行渲染）计算气泡宽度，clamp 到 [MIN, MAX]。
+        """按内容自然宽度（不换行渲染）计算气泡宽度，clamp 到 [MIN, 窗口自适应上限]。
 
         短消息（“你好”/“在吗”）只占一小段，长消息撑到上限后换行，
         避免固定宽度气泡在界面里显得生硬。流式半成品用纯文本估算会
@@ -327,7 +370,25 @@ class ChatWindow(QWidget):
             probe.setPlainText(text)
         probe.adjustSize()
         natural = int(probe.size().width()) + 2  # 边框缓冲
-        return max(BUBBLE_MIN_W, min(natural, BUBBLE_MAX_W))
+        return max(BUBBLE_MIN_W, min(natural, self._max_bubble_width()))
+
+    def _max_bubble_width(self):
+        """气泡最大宽度跟随聊天区宽度（约 78%，留出两侧边距），不写死。"""
+        viewport = self.scroll.viewport().width()
+        base = viewport if viewport and viewport > 0 else self.width()
+        return max(BUBBLE_MIN_W, int(base * 0.78) - 24)
+
+    def _set_bubble_item(self, bubble, text, markdown):
+        for i, (b, _t, _m) in enumerate(self._bubble_items):
+            if b is bubble:
+                self._bubble_items[i] = (bubble, text, markdown)
+                return
+        self._bubble_items.append((bubble, text, markdown))
+
+    def _relayout_bubbles(self):
+        """窗口尺寸变化后按新上限重算所有气泡宽高。"""
+        for bubble, text, markdown in list(self._bubble_items):
+            self._sync_bubble_height(bubble, text, markdown)
 
     def _estimate_height(self, bubble, text, markdown, width):
         """用独立 QTextDocument 探针估算气泡高度。
@@ -353,13 +414,14 @@ class ChatWindow(QWidget):
     def _sync_bubble_height(self, bubble, text, markdown=True):
         """按内容自适应宽度 + 估算高度固定气泡（流式高频更新同样依赖此机制）。
 
-        宽度 = 内容自然宽度（上限 BUBBLE_MAX_W），高度用独立探针估算；
+        宽度 = 内容自然宽度（上限跟随窗口），高度用独立探针估算；
         已显示且有真实布局高度时取两者较大值，再延迟一帧用真实布局修正，
         消除字体替换/宽度差异导致的估算偏差（任何环境下都不裁剪内容）。
         """
         if bubble is None:
             return
         width = self._natural_bubble_width(bubble, text, markdown)
+        bubble.setMaximumWidth(self._max_bubble_width())
         bubble.setFixedWidth(width)
         est = self._estimate_height(bubble, text, markdown, width)
         real = bubble.document().size().height()
@@ -390,6 +452,7 @@ class ChatWindow(QWidget):
         if self._last_bubble is not None:
             # 流式中用纯文本：markdown 半成品（未闭合 **、``` 等）会闪烁/误渲染
             self._last_bubble.setPlainText(text)
+            self._set_bubble_item(self._last_bubble, text, False)
             self._sync_bubble_height(self._last_bubble, text, markdown=False)
             self._scroll_to_bottom()
 
@@ -397,6 +460,7 @@ class ChatWindow(QWidget):
         """流式结束：用最终完整文本收尾（Markdown 渲染），并复位流式状态。"""
         if self._last_bubble is not None:
             self._last_bubble.setMarkdown(text)
+            self._set_bubble_item(self._last_bubble, text, True)
             self._sync_bubble_height(self._last_bubble, text, markdown=True)
             self._scroll_to_bottom()
         self._streaming = False
@@ -407,6 +471,9 @@ class ChatWindow(QWidget):
     def cancel_stream(self):
         """取消流式：移除当前占位气泡并复位状态（超时/中断等场景）。"""
         if self._last_bubble is not None:
+            self._bubble_items = [
+                item for item in self._bubble_items if item[0] is not self._last_bubble
+            ]
             self.content_layout.removeWidget(self._last_bubble)
             self._last_bubble.deleteLater()
             self._last_bubble = None
@@ -414,6 +481,7 @@ class ChatWindow(QWidget):
 
     def clear(self):
         self.messages = []
+        self._bubble_items = []
         self._last_bubble = None
         self._streaming = False
         while self.content_layout.count() > 1:
@@ -421,6 +489,10 @@ class ChatWindow(QWidget):
             widget = item.widget()
             if widget:
                 widget.deleteLater()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._relayout_bubbles()
 
     def _confirm_clear(self):
         answer = QMessageBox.question(

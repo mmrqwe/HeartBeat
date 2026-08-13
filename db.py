@@ -1,6 +1,7 @@
 """SQLite 存储层：记忆、聊天、状态、统计、向量检索（sqlite-vec）。"""
 
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -9,6 +10,18 @@ from pathlib import Path
 
 VEC_DIM = 512  # BAAI/bge-small-zh-v1.5 的向量维度
 DEFAULT_MEMORY_CAP = 500  # 记忆条数上限（可被配置 memory_cap 覆盖）
+
+
+def _normalize_project_dir(path):
+    """项目目录规范化：去首尾空白/尾部分隔符，Windows 大小写不敏感。"""
+    if not str(path or "").strip():
+        return None
+    try:
+        return os.path.normcase(
+            os.path.normpath(os.path.abspath(os.path.expanduser(str(path).strip())))
+        )
+    except Exception:
+        return str(path).strip()
 
 
 def _merge_replace(text, old, new):
@@ -228,21 +241,24 @@ class Database:
 
     def find_session_by_project_dir(self, project_dir):
         """按项目目录找会话（目录为主键绑定）；无匹配返回 None。"""
-        if not str(project_dir or "").strip():
+        target = _normalize_project_dir(project_dir)
+        if target is None:
             return self.session("default")
         with self._lock:
-            row = self._conn.execute(
+            rows = self._conn.execute(
                 "SELECT id, name, project_dir, created_at, updated_at "
-                "FROM sessions WHERE project_dir = ?",
-                (str(project_dir),),
-            ).fetchone()
-        return dict(row) if row else None
+                "FROM sessions WHERE project_dir IS NOT NULL"
+            ).fetchall()
+        for row in rows:
+            if _normalize_project_dir(row["project_dir"]) == target:
+                return dict(row)
+        return None
 
     def create_session(self, name, project_dir=None):
         """新建会话；project_dir 已存在会话时直接返回已有会话（目录↔会话一对一）。"""
         import uuid
 
-        project_dir = str(project_dir or "").strip() or None
+        project_dir = _normalize_project_dir(project_dir)
         existing = self.find_session_by_project_dir(project_dir) if project_dir else None
         if existing is not None:
             return existing["id"]
@@ -256,6 +272,20 @@ class Database:
             )
             self._conn.commit()
         return sid
+
+    def bind_session_project_dir(self, session_id, project_dir):
+        """把尚未绑定目录的会话绑定到项目目录（已绑定返回 False）。"""
+        project_dir = _normalize_project_dir(project_dir)
+        if not project_dir:
+            return False
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE sessions SET project_dir = ? "
+                "WHERE id = ? AND project_dir IS NULL",
+                (project_dir, session_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def rename_session(self, session_id, name):
         with self._lock:

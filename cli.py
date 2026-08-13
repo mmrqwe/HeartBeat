@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -95,6 +96,47 @@ def _make_parser():
     db_sub.add_parser("info", help="数据库统计")
     db_sub.add_parser("chat-clear", help="清空聊天记录")
 
+    p_session = sub.add_parser("session", help="多对话会话管理")
+    session_sub = p_session.add_subparsers(dest="session_cmd", required=True)
+    session_sub.add_parser("list", help="列出所有会话")
+    p_session_new = session_sub.add_parser("new", help="新建会话")
+    p_session_new.add_argument("name")
+    p_session_rename = session_sub.add_parser("rename", help="重命名会话")
+    p_session_rename.add_argument("id")
+    p_session_rename.add_argument("name")
+    p_session_delete = session_sub.add_parser("delete", help="删除会话（默认会话不可删）")
+    p_session_delete.add_argument("id")
+
+    p_todo = sub.add_parser("todo", help="编码待办清单（按项目隔离）")
+    todo_sub = p_todo.add_subparsers(dest="todo_cmd", required=True)
+    p_todo_list = todo_sub.add_parser("list", help="列出待办")
+    p_todo_list.add_argument("--project-dir", default=None, help="项目目录（默认用配置）")
+    p_todo_add = todo_sub.add_parser("add", help="添加待办")
+    p_todo_add.add_argument("item")
+    p_todo_add.add_argument("--project-dir", default=None, help="项目目录（默认用配置）")
+    p_todo_done = todo_sub.add_parser("done", help="完成待办")
+    p_todo_done.add_argument("id", type=int)
+    p_todo_done.add_argument("--project-dir", default=None, help="项目目录（默认用配置）")
+    p_todo_clear = todo_sub.add_parser("clear", help="清空待办")
+    p_todo_clear.add_argument("--project-dir", default=None, help="项目目录（默认用配置）")
+    p_todo.add_argument("--project-dir", default=None, help="项目目录（默认用配置）")
+
+    p_backup = sub.add_parser("backup", help="编码备份浏览/恢复")
+    backup_sub = p_backup.add_subparsers(dest="backup_cmd", required=True)
+    p_backup_list = backup_sub.add_parser("list", help="列出最近备份")
+    p_backup_list.add_argument("--path", default="", help="只列该文件的备份")
+    p_backup_list.add_argument("--project-dir", default=None, help="项目目录（默认用配置）")
+    p_backup_restore = backup_sub.add_parser("restore", help="从备份恢复")
+    p_backup_restore.add_argument("backup_id")
+    p_backup_restore.add_argument("path")
+    p_backup_restore.add_argument("--project-dir", default=None, help="项目目录（默认用配置）")
+    p_backup.add_argument("--project-dir", default=None, help="项目目录（默认用配置）")
+
+    p_write = sub.add_parser("write", help="通过编码工具写文件（覆盖前自动备份）")
+    p_write.add_argument("path")
+    p_write.add_argument("content")
+    p_write.add_argument("--project-dir", default=None, help="项目目录（默认用配置）")
+
     p_memory = sub.add_parser("memory", help="记忆管理：列表/清空/清理/导出")
     mem_sub = p_memory.add_subparsers(dest="mem_cmd", required=True)
     p_mem_list = mem_sub.add_parser("list", help="列出记忆（可按类别筛选）")
@@ -125,6 +167,8 @@ def _make_parser():
     p_skill_auth = skill_sub.add_parser("auth", help="用 Access Secret 配置认证（stdin 输入，不回显）")
     p_skill_auth.add_argument("name")
     p_skill_auth.add_argument("--binary", default=None, help="CLI 可执行文件绝对路径（默认 %LOCALAPPDATA%\\ZhihuCLI\\current\\zhihu-cli.exe）")
+
+    sub.add_parser("shell", help="打印当前命令 Shell 环境")
     return parser
 
 
@@ -149,6 +193,13 @@ def _run(argv, default_config=None):
             mod = plugins[name]
             meta = getattr(mod, "META", {})
             print(f"{name}: {meta.get('label', '')}")
+        return 0
+
+    if cmd == "shell":
+        import tools as tools_mod
+
+        print(tools_mod.shell_name())
+        print(tools_mod.shell_hint())
         return 0
 
     if cmd == "collect":
@@ -230,18 +281,31 @@ def _run(argv, default_config=None):
         return 0
 
     if cmd == "db":
-        _, _, database, _, _, _ = _load(config)
+        _, _, database, _, _, ag = _load(config)
         if args.db_cmd == "info":
             print("memory:", len(database.memory_items(limit=10_000)))
             print("chat_messages:", len(database.chat_items(limit=10_000)))
+            print("sessions:", len(database.list_sessions()))
             print("vec_ready:", database.vec_ready)
             return 0
-        database.clear_chat()
+        ag.clear_chat_history()
         print("chat cleared")
         return 0
 
+    if cmd == "session":
+        return _session_cmd(config, args)
+
     if cmd == "memory":
         return _memory_cmd(config, args)
+
+    if cmd == "todo":
+        return _todo_cmd(config, args)
+
+    if cmd == "backup":
+        return _backup_cmd(config, args)
+
+    if cmd == "write":
+        return _write_cmd(config, args)
 
     if cmd == "embed":
         cfg_path, cfg, _, _, _, _ = _load(config)
@@ -283,6 +347,104 @@ def _coding_cmd(args):
     reply = ag.coding_task(args.request, on_status=on_status)
     print("reply:", reply)
     print(f"elapsed: {time.time() - t0:.2f}s")
+    return 0
+
+
+def _project_dir(cfg, args):
+    """CLI 项目目录：--project-dir 优先，否则用配置；没有则返回 None。"""
+    project_dir = args.project_dir or str(cfg.get("project_dir", "") or "").strip()
+    if not str(project_dir or "").strip():
+        print("未配置 project_dir。用 --project-dir 指定项目目录。")
+        return None
+    return str(project_dir)
+
+
+def _session_cmd(config, args):
+    _, _, database, _, _, _ = _load(config)
+    if args.session_cmd == "list":
+        for s in database.list_sessions():
+            print(
+                f"{s['id']} | {s['name']} | dir={s['project_dir'] or '-'} "
+                f"| msgs={s['message_count']}"
+            )
+        return 0
+    if args.session_cmd == "new":
+        sid = database.create_session(args.name)
+        print(f"created: {sid}")
+        return 0
+    if args.session_cmd == "rename":
+        database.rename_session(args.id, args.name)
+        print("renamed")
+        return 0
+    if args.session_cmd == "delete":
+        ok = database.delete_session(args.id)
+        print("deleted" if ok else "删除失败：默认会话不可删或不存在")
+        return 0 if ok else 1
+    return 2
+
+
+def _todo_cmd(config, args):
+    from kernel.permission import SOURCE_USER
+    import tools as tools_mod
+
+    _, cfg, _, _, _, _ = _load(config)
+    project_dir = _project_dir(cfg, args)
+    if project_dir is None:
+        return 1
+    payload = {"action": args.todo_cmd}
+    if args.todo_cmd == "add":
+        payload["item"] = args.item
+    elif args.todo_cmd == "done":
+        payload["id"] = args.id
+    result = tools_mod.execute(
+        "todo", json.dumps(payload),
+        mode="full", source=SOURCE_USER, project_dir=project_dir,
+    )
+    print(result)
+    return 0
+
+
+def _backup_cmd(config, args):
+    from kernel.permission import SOURCE_USER
+    import tools as tools_mod
+
+    _, cfg, _, _, _, _ = _load(config)
+    project_dir = _project_dir(cfg, args)
+    if project_dir is None:
+        return 1
+    if args.backup_cmd == "list":
+        payload = {"path": args.path or ""}
+        result = tools_mod.execute(
+            "list_backups", json.dumps(payload),
+            mode="full", source=SOURCE_USER, project_dir=project_dir,
+        )
+        print(result)
+        return 0
+    payload = {"backup_id": args.backup_id, "path": args.path}
+    result = tools_mod.execute(
+        "restore_backup", json.dumps(payload),
+        mode="full", source=SOURCE_USER,
+        confirm_cb=lambda _d: True, project_dir=project_dir,
+    )
+    print(result)
+    return 0 if "已从备份" in result else 1
+
+
+def _write_cmd(config, args):
+    from kernel.permission import SOURCE_USER
+    import tools as tools_mod
+
+    _, cfg, _, _, _, _ = _load(config)
+    project_dir = _project_dir(cfg, args)
+    if project_dir is None:
+        return 1
+    result = tools_mod.execute(
+        "write_file",
+        json.dumps({"path": args.path, "content": args.content}),
+        mode="full", source=SOURCE_USER,
+        confirm_cb=lambda _d: True, project_dir=project_dir,
+    )
+    print(result)
     return 0
 
 
@@ -458,6 +620,79 @@ def _selfcheck(config):
             _require("idle" in frames, f"{name} missing idle")
     check("skins build", skin_build)
 
+    def sessions_step():
+        sid = database.create_session("selfcheck-tmp")
+        _require(database.session(sid) is not None, "session create failed")
+        database.rename_session(sid, "selfcheck-renamed")
+        _require(
+            database.session(sid)["name"] == "selfcheck-renamed",
+            "session rename failed",
+        )
+        _require(database.delete_session(sid), "session delete failed")
+    check("sessions CRUD", sessions_step)
+
+    def todo_backup_step():
+        import tools as tools_mod
+        from kernel.permission import SOURCE_USER
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            proj = Path(tmp) / "proj"
+            proj.mkdir()
+            (proj / "a.txt").write_text("v1", encoding="utf-8")
+            orig_udd = tools_mod.user_data_dir
+            tools_mod.user_data_dir = lambda: tmp
+            try:
+                result = tools_mod.execute(
+                    "write_file", json.dumps({"path": "a.txt", "content": "v2"}),
+                    mode="full", source=SOURCE_USER,
+                    confirm_cb=lambda _d: True, project_dir=str(proj),
+                )
+                _require("已写入" in result, f"write failed: {result}")
+                result = tools_mod.execute(
+                    "todo", json.dumps({"action": "add", "item": "自检待办"}),
+                    mode="full", source=SOURCE_USER, project_dir=str(proj),
+                )
+                _require("已添加" in result, f"todo add failed: {result}")
+                result = tools_mod.execute(
+                    "list_backups", json.dumps({"path": "a.txt"}),
+                    mode="full", source=SOURCE_USER, project_dir=str(proj),
+                )
+                _require("最近备份" in result, f"list backups failed: {result}")
+                backup_id = result.split("[")[1].split("]")[0]
+                (proj / "a.txt").write_text("broken", encoding="utf-8")
+                result = tools_mod.execute(
+                    "restore_backup",
+                    json.dumps({"backup_id": backup_id, "path": "a.txt"}),
+                    mode="full", source=SOURCE_USER,
+                    confirm_cb=lambda _d: True, project_dir=str(proj),
+                )
+                _require("已从备份" in result, f"restore failed: {result}")
+                _require(
+                    (proj / "a.txt").read_text(encoding="utf-8") == "v1",
+                    "restore content mismatch",
+                )
+            finally:
+                tools_mod.user_data_dir = orig_udd
+    check("todo + backup tools", todo_backup_step)
+
+    def safety_step():
+        import tools as tools_mod
+
+        _require(
+            "***" in tools_mod.redact_secrets("key=sk-abc123456789"),
+            "redact failed",
+        )
+        _require(bool(tools_mod.shell_hint()), "shell hint empty")
+        names = {
+            d["function"]["name"]
+            for d in tools_mod.coding_declarations(cfg)
+        }
+        _require(
+            {"todo", "list_backups", "restore_backup"} <= names,
+            "coding tools missing",
+        )
+    check("redact + shell + coding tools", safety_step)
+
     def embed_step():
         embedder = rag.default_embedder(cfg, cfg_path.parent)
         vec = embedder.embed_one("selfcheck")
@@ -504,7 +739,7 @@ def run(argv, default_config=None):
     if sys.platform == "win32":
         for stream in (sys.stdout, sys.stderr):
             try:
-                stream.reconfigure(errors="replace")
+                stream.reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
     try:

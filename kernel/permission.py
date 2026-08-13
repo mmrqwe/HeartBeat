@@ -149,6 +149,8 @@ def human_brief(name, arguments):
             args = {}
     if name == "run_bash":
         return ("执行命令：" + str(args.get("command", "")))[:80]
+    if name == "bash":
+        return ("执行命令：" + str(args.get("command", "")))[:80]
     if name == "web_search":
         return ("搜索：" + str(args.get("query", "")))[:80]
     if name == "download_file":
@@ -163,6 +165,8 @@ def human_brief(name, arguments):
         return ("配置技能认证：" + str(args.get("name", "")))[:80]
     if name == "read_file":
         return ("读取文件：" + str(args.get("path", "")))[:80]
+    if name == "read":
+        return ("读取文件：" + str(args.get("path", "")))[:80]
     if name == "list_files":
         return ("查看目录：" + str(args.get("path", ".")))[:80]
     if name == "search_files":
@@ -171,8 +175,32 @@ def human_brief(name, arguments):
         return ("匹配文件：" + str(args.get("pattern", "")))[:80]
     if name == "write_file":
         return ("写入文件：" + str(args.get("path", "")))[:80]
+    if name == "write":
+        return ("写入文件：" + str(args.get("path", "")))[:80]
     if name == "edit_file":
         return ("编辑文件：" + str(args.get("path", "")))[:80]
+    if name == "edit":
+        return ("编辑文件：" + str(args.get("path", "")))[:80]
+    if name == "glob":
+        return ("匹配文件：" + str(args.get("pattern", "")))[:80]
+    if name == "grep":
+        return ("搜索代码：" + str(args.get("pattern", "")))[:80]
+    if name == "web":
+        return ("联网搜索：" + str(args.get("query", "")))[:80]
+    if name == "bg":
+        action = str(args.get("action", "exec"))
+        detail = str(args.get("task_id", "") or args.get("command", ""))
+        return ("后台任务：" + action + " " + detail)[:80]
+    if name == "skill":
+        action = str(args.get("action", "list"))
+        name_arg = str(args.get("name", "") or "")
+        return ("技能：" + action + (f" {name_arg}" if name_arg else ""))[:80]
+    if name == "backup":
+        action = str(args.get("action", "list"))
+        return ("备份：" + action + " " + str(args.get("path", "")))[:80]
+    if name == "note":
+        action = str(args.get("action", "list"))
+        return ("项目约定：" + action)[:80]
     if name == "bg_exec":
         return ("后台执行：" + str(args.get("command", "")))[:80]
     if name == "bg_check":

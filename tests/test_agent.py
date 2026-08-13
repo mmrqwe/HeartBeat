@@ -352,7 +352,7 @@ def test_chat_llm_tool_loop(monkeypatch, tmp_path):
     def fake_tools(self, messages, tools):
         calls["n"] += 1
         names = [t["function"]["name"] for t in tools]
-        assert "web_search" in names and "run_bash" in names  # 聊天路径声明了 bash 工具
+        assert "web" in names and "bash" in names  # 聊天路径声明了 web/bash 工具
         if calls["n"] == 1:
             return None, [
                 {
@@ -1328,10 +1328,53 @@ def test_live_inner_thought_speak(tmp_path):
             return ""
 
         def complete(self, messages, max_tokens=None, **kw):
-            return "SPEAK 我今天突然想学摄影了"
+            return "SPEAK 我今天突然想学摄影了！"
 
     a.brain = FakeBrain()
-    assert a.live({"collections": []}) == "我今天突然想学摄影了"
+    assert a.live({"collections": []}) == "我今天突然想学摄影了！"
+
+
+def test_live_inner_thought_incomplete_falls_back(tmp_path):
+    """主动思考输出被截断成半句话时，回退为完整问候，不再发残句。"""
+    cfg = _cfg()
+    cfg["api"]["api_key"] = "test-key"
+    a = _make_agent(tmp_path, cfg=cfg)
+    a.state["last_wake_date"] = a._energy_day()
+
+    class FakeBrain:
+        def _context_text(self, ctx):
+            return ""
+
+        def complete(self, messages, max_tokens=None, **kw):
+            return "SPEAK 外面飘着小雨，对了，C919"
+
+    a.brain = FakeBrain()
+    a.planner.greeting = lambda now=None: "今天也给你留了一盏灯～"
+    assert a.live({"collections": []}) == "今天也给你留了一盏灯～"
+
+
+def test_phrase_action_result_incomplete_falls_back(tmp_path):
+    """主动查结果后，如果模型只说了半句，用完整模板兜底。"""
+    cfg = _cfg()
+    cfg["api"]["api_key"] = "test-key"
+    a = _make_agent(tmp_path, cfg=cfg)
+
+    class FakeBrain:
+        def complete(self, messages, max_tokens=None, **kw):
+            return "我刚好看到 C919"
+
+    a.brain = FakeBrain()
+    assert a._phrase_action_result("C919", "C919 首飞") == (
+        "我刚好去看了看C919，C919 首飞。"
+    )
+
+
+def test_looks_complete_sentence():
+    from brain.agent_think import ThinkMixin
+
+    assert ThinkMixin._looks_complete("今天天气不错。")
+    assert ThinkMixin._looks_complete("快来看！")
+    assert not ThinkMixin._looks_complete("对了，C919")
 
 
 def test_live_inner_thought_action(monkeypatch, tmp_path):

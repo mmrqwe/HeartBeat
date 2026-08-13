@@ -18,9 +18,10 @@ from tempfile import TemporaryDirectory
 
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QFileDialog
 
 import core
+import db as dbmod
 import kernel
 import main as mainmod
 
@@ -276,7 +277,7 @@ def test_session_switch_and_dir_binding():
         # 切换到绑定目录的会话 → 全局编程目录跟随
         hb._switch_session(sid)
         assert hb.current_session_id == sid
-        assert hb.cfg["project_dir"] == proj
+        assert hb.cfg["project_dir"] == dbmod._normalize_project_dir(str(proj))
         # 会话消息落库后切换加载（无 UI 时只验证数据面）
         hb.agent.append_chat("user", "写个快排", session_id=sid)
         hb.agent.append_chat("user", "默认会话消息", session_id="default")
@@ -298,6 +299,28 @@ def test_session_switch_and_dir_binding():
         # 默认会话不可删
         hb._delete_session("default")
         assert hb.db.session("default") is not None
+    finally:
+        _cleanup(tmp, hb, orig_gather)
+
+
+def test_pick_dir_binds_current_empty_session(tmp_path, monkeypatch):
+    """新建空对话后选文件夹：直接绑定当前对话，不在左侧新增一项。"""
+    tmp, hb, orig_gather = _make_app()
+    try:
+        hb._new_session()
+        sid = hb.current_session_id
+        proj = tmp_path / "proj"
+        monkeypatch.setattr(
+            QFileDialog,
+            "getExistingDirectory",
+            staticmethod(lambda *a, **k: str(proj)),
+        )
+        hb._pick_project_dir()
+        assert hb.current_session_id == sid, "应继续使用当前空对话"
+        expected_dir = dbmod._normalize_project_dir(str(proj))
+        assert hb.db.session(sid)["project_dir"] == expected_dir
+        assert hb.cfg["project_dir"] == expected_dir
+        assert len(hb.db.list_sessions()) == 2, "不应新增会话"
     finally:
         _cleanup(tmp, hb, orig_gather)
 

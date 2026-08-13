@@ -33,6 +33,13 @@ class ThinkMixin:
         "wiki": "wiki",
     }
 
+    @staticmethod
+    def _looks_complete(text):
+        """一句话是否以中文/英文句末标点收尾（防止把截断的半句发给用户）。"""
+        return bool(
+            re.search(r"[。！？!?…~～]+[\"”』】\)]?$", str(text or "").strip())
+        )
+
     def live(self, ctx):
         """生活循环：睡眠/体力检查 → 唤醒 → 内心思考 → 欲望行动 → 角色化说话。"""
         now = self.clock()
@@ -133,10 +140,12 @@ class ThinkMixin:
                         ),
                     },
                 ],
-                max_tokens=80,
+                max_tokens=200,
             ) or ""
             reply = self._parse_agent_reply(raw).strip()
         except Exception:
+            reply = ""
+        if reply and not self._looks_complete(reply):
             reply = ""
         if not reply or "SILENT" in reply.upper():
             reply = self.planner.greeting(now) or ""
@@ -166,10 +175,12 @@ class ThinkMixin:
                         ),
                     },
                 ],
-                max_tokens=80,
+                max_tokens=200,
             ) or ""
             reply = self._parse_agent_reply(raw).strip()
         except Exception:
+            reply = ""
+        if reply and not self._looks_complete(reply):
             reply = ""
         return reply or "我在呀～想我了？"
 
@@ -217,10 +228,16 @@ class ThinkMixin:
             messages, int(max_tokens * ratio), keep_recent=10
         )
         try:
-            raw = self.brain.complete(messages, max_tokens=200) or ""
+            raw = self.brain.complete(messages, max_tokens=400) or ""
         except Exception:
             return None
-        return self._parse_life_reply(raw)
+        plan = self._parse_life_reply(raw)
+        if plan and plan.get("type") == "speak":
+            text = str(plan.get("text") or "").strip()
+            if not self._looks_complete(text):
+                # 输出被截断成半句话：宁可用完整问候，也不把残句发给主人
+                plan["text"] = self.planner.greeting(now) or text
+        return plan
 
     def _parse_life_reply(self, raw):
         for line in (raw or "").splitlines():
@@ -287,12 +304,14 @@ class ThinkMixin:
                         "content": f"我查了：{query}\n结果：{title}\n说一句话。",
                     },
                 ],
-                max_tokens=80,
+                max_tokens=200,
             ) or ""
             reply = self._parse_agent_reply(raw).strip()
         except Exception:
             reply = ""
-        return reply or f"我刚好去看了看{query}，{title}"
+        if reply and not self._looks_complete(reply):
+            reply = ""
+        return reply or f"我刚好去看了看{query}，{title}。"
 
     # ---------- 自主思考 ----------
 

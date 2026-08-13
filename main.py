@@ -497,12 +497,36 @@ class HeartBeatApp:
         existing = self.db.find_session_by_project_dir(path)
         if existing is not None:
             self._switch_session(existing["id"])
-        else:
-            sid = self.db.create_session(Path(path).name or "新会话", project_dir=path)
-            self._switch_session(sid)
+            self._set_status(f"编程目录：{path}")
+            return
+        info = self.db.session(self.current_session_id)
+        can_bind = (
+            info is not None
+            and info["id"] != "default"
+            and not info.get("project_dir")
+            and not self.db.chat_items(session_id=info["id"], limit=1)
+        )
+        if can_bind:
+            # 当前是刚新建的空对话：直接把它绑到文件夹，不在左侧多加一项
+            if self.db.bind_session_project_dir(info["id"], path):
+                if (info.get("name") or "").startswith("新对话"):
+                    self.db.rename_session(info["id"], Path(path).name or "新会话")
+                self._apply_project_dir(path)
+                self._refresh_sessions()
+                self._set_status(f"编程目录：{path}（已绑定到当前对话）")
+                return
+        sid = self.db.create_session(Path(path).name or "新会话", project_dir=path)
+        self._switch_session(sid)
         self._set_status(f"编程目录：{path}")
 
     # ---------- 多对话（会话列表） ----------
+
+    def _apply_project_dir(self, path):
+        """把全局编程目录切到 path（绑定当前会话后刷新目录按钮）。"""
+        self.cfg["project_dir"] = db._normalize_project_dir(path) or path
+        self.kernel.save_settings(self.cfg)
+        if self.chat_win:
+            self.chat_win.set_project_dir(self.cfg["project_dir"])
 
     def _refresh_sessions(self):
         """聊天窗会话列表刷新（消息数/活跃排序变化后调用）；非真实窗口则跳过。"""

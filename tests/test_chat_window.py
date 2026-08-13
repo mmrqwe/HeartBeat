@@ -47,23 +47,27 @@ def test_short_message_narrow():
 
 
 def test_medium_message_adaptive():
-    """中等长度：气泡宽度介于 MIN 与 MAX 之间（按内容自适应）。"""
+    """中等长度：气泡宽度介于 MIN 与窗口自适应上限之间。"""
     w = _make_window()
+    w.resize(800, 600)
     w.add_message("user", "今天天气怎么样呀，要不要一起出去走走")
     width = _bubble_width(w, 0)
-    assert chat_window.BUBBLE_MIN_W < width < chat_window.BUBBLE_MAX_W
+    assert chat_window.BUBBLE_MIN_W < width < w._max_bubble_width()
 
 
 def test_long_message_capped():
-    """长消息：撑到最大宽度后换行，不横向溢出。"""
+    """长消息：撑到窗口自适应上限后换行，不横向溢出。"""
     w = _make_window()
+    w.resize(800, 600)
     w.add_message("user", "这是一段特别长的消息内容" * 20)
-    assert _bubble_width(w, 0) == chat_window.BUBBLE_MAX_W
+    assert _bubble_width(w, 0) == w._max_bubble_width()
 
 
 def test_stream_grows_then_caps():
     """流式：文字变长 → 气泡宽度递增，超过上限后封顶。"""
     w = _make_window()
+    w.resize(800, 600)
+    cap = w._max_bubble_width()
     w.begin_stream()
     w.update_last_message("你好")
     w1 = _bubble_width(w, 0)
@@ -71,16 +75,39 @@ def test_stream_grows_then_caps():
     w2 = _bubble_width(w, 0)
     w.update_last_message("你好，这是一段比较长的回复" * 50)
     w3 = _bubble_width(w, 0)
-    assert w1 < w2 < w3 or w1 == w2 == chat_window.BUBBLE_MAX_W
-    assert w3 == chat_window.BUBBLE_MAX_W
+    assert w1 < w2 < w3 or w1 == w2 == cap
+    assert w3 == cap
     w.finish_stream("你好，这是一段比较长的回复" * 50)
 
 
 def test_super_long_word_capped():
-    """超长无空格串（URL）：clamp 到上限，不横向溢出。"""
+    """超长无空格串（URL）：clamp 到窗口自适应上限，不横向溢出。"""
     w = _make_window()
+    w.resize(800, 600)
     w.add_message("assistant", "https://example.com/" + "a" * 400)
-    assert _bubble_width(w, 0) == chat_window.BUBBLE_MAX_W
+    assert _bubble_width(w, 0) == w._max_bubble_width()
+
+
+def test_bubbles_resize_with_window():
+    """窗口拉宽后，已有气泡按新上限重新布局，不再锁死旧宽度。"""
+    w = _make_window()
+    w.show()
+    app = QApplication.instance()
+
+    def pump():
+        app.processEvents()
+
+    w.resize(420, 600)
+    pump()
+    w.add_message("user", "这是一段特别长的消息内容" * 20)
+    narrow = _bubble_width(w, 0)
+    w.resize(900, 600)
+    pump()
+    w._relayout_bubbles()
+    wide = _bubble_width(w, 0)
+    assert wide > narrow
+    assert wide == w._max_bubble_width()
+    w.close()
 
 
 def test_dir_button_picks_and_shows():
@@ -125,7 +152,7 @@ def test_stop_coding_button():
 
 
 def test_sessions_sidebar_render_and_switch():
-    """会话侧边栏：渲染/高亮/📁 标记；点击非当前会话回调宿主。"""
+    """会话侧边栏：渲染/高亮（不显示 📁 标记）；点击非当前会话回调宿主。"""
     w = _make_window()
     sessions = [
         {"id": "default", "name": "默认对话", "project_dir": None},
@@ -135,9 +162,11 @@ def test_sessions_sidebar_render_and_switch():
     assert w.session_list.count() == 2
     # 当前会话高亮
     assert w.session_list.currentItem().text() == "默认对话"
-    # 绑定目录的会话带 📁 前缀
+    # 绑定目录的会话不显示文件夹标记，目录信息放在 tooltip
     texts = [w.session_list.item(i).text() for i in range(2)]
-    assert "📁 快排项目" in texts
+    assert "快排项目" in texts
+    assert "📁" not in "".join(texts)
+    assert "目录：/tmp/proj" in w.session_list.item(1).toolTip()
     # 点击另一会话 → 回调宿主并传 sid
     switched = []
     w.on_switch_session = lambda sid: switched.append(sid)
@@ -150,8 +179,22 @@ def test_sessions_sidebar_render_and_switch():
     assert switched == ["abc123"]
 
 
+def test_sidebar_buttons_have_icons_and_tooltips():
+    """侧边栏三个操作按钮用小图标（加号/铅笔/垃圾桶）并保留 tooltip。"""
+    w = _make_window()
+    assert w.new_session_btn.text() == ""
+    assert w.rename_session_btn.text() == ""
+    assert w.delete_session_btn.text() == ""
+    assert not w.new_session_btn.icon().isNull()
+    assert not w.rename_session_btn.icon().isNull()
+    assert not w.delete_session_btn.icon().isNull()
+    assert w.new_session_btn.toolTip() == "新建对话"
+    assert w.rename_session_btn.toolTip() == "重命名选中的对话"
+    assert w.delete_session_btn.toolTip() == "删除选中的对话"
+
+
 def test_sessions_new_and_delete_callbacks():
-    """➕/🗑 按钮回调宿主；默认会话删除弹信息框（不回调）。"""
+    """新建/删除按钮回调宿主；默认会话删除弹信息框（不回调）。"""
     w = _make_window()
     new_calls = []
     del_calls = []

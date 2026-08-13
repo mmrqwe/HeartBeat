@@ -47,6 +47,26 @@ def test_create_and_find_session_by_project_dir(tmp_path):
     assert d.find_session_by_project_dir("")["id"] == "default"
 
 
+def test_find_session_normalizes_project_dir(tmp_path):
+    d = _make_db(tmp_path)
+    proj = tmp_path / "Proj"
+    sid = d.create_session("项目", project_dir=str(proj))
+    # 尾部分隔符/大小写差异（Windows）都应命中同一会话
+    assert d.find_session_by_project_dir(str(proj) + "/")["id"] == sid
+    assert d.find_session_by_project_dir(str(proj) + "\\")["id"] == sid
+
+
+def test_bind_session_project_dir(tmp_path):
+    d = _make_db(tmp_path)
+    sid = d.create_session("新对话 1")
+    proj = tmp_path / "proj"
+    assert d.bind_session_project_dir(sid, str(proj)) is True
+    assert d.find_session_by_project_dir(str(proj))["id"] == sid
+    # 已绑定不能再绑
+    assert d.bind_session_project_dir(sid, str(tmp_path / "other")) is False
+    assert d.session(sid)["project_dir"] == dbmod._normalize_project_dir(str(proj))
+
+
 def test_rename_session(tmp_path):
     d = _make_db(tmp_path)
     sid = d.create_session("旧名")

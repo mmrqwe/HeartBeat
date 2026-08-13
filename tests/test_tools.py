@@ -299,7 +299,8 @@ def test_execute_download_full_tier_still_confirms():
     patch = _Patch()
     try:
         with TemporaryDirectory() as d:
-            patch.setattr(tools, "_downloads_dir", lambda: Path(d))
+            import tools_skill
+            patch.setattr(tools_skill, "_downloads_dir", lambda: Path(d))
             patch.setattr(tools.kdownload, "download_file",
                           lambda url, dest, filename=None: (Path(dest) / "a.zip", 1))
             result = tools.execute(
@@ -352,7 +353,8 @@ def test_execute_install_path_restriction():
     patch = _Patch()
     try:
         with TemporaryDirectory() as d:
-            patch.setattr(tools, "_downloads_dir", lambda: Path(d))
+            import tools_skill
+            patch.setattr(tools_skill, "_downloads_dir", lambda: Path(d))
             evil = Path(d).parent / "evil.zip"
             evil.write_bytes(b"PK\x03\x04")
             result = tools.execute("install_skill", json.dumps({"zip_path": str(evil)}),
@@ -386,8 +388,9 @@ def test_execute_install_success_with_manifest():
             downloads.mkdir()
             z = downloads / "zhihu-cli-skill.zip"
             z.write_bytes(b"PK\x03\x04")
-            patch.setattr(tools, "_downloads_dir", lambda: downloads)
-            patch.setattr(tools, "_skills_dir", lambda: skills)
+            import tools_skill
+            patch.setattr(tools_skill, "_downloads_dir", lambda: downloads)
+            patch.setattr(tools_skill, "_skills_dir", lambda: skills)
             patch.setattr(
                 tools.kdownload, "extract_skill_zip",
                 lambda zip_path, dest: (
@@ -430,7 +433,8 @@ def test_skill_script_runner_and_ctx_primitives():
         _install_fake_skill(Path(d))
         patch = _Patch()
         try:
-            patch.setattr(tools, "_skills_dir", lambda: Path(d))
+            import tools_skill
+            patch.setattr(tools_skill, "_skills_dir", lambda: Path(d))
             script = "run.ps1" if os.name == "nt" else "run.sh"
             rc, text = tools.run_skill_script("zhihu", script, ["status"])
             assert rc == 0 and "FAKE-STATUS" in text
@@ -446,7 +450,8 @@ def test_skill_setup_primitive_policy_and_exec():
         _install_fake_skill(Path(d))
         patch = _Patch()
         try:
-            patch.setattr(tools, "_skills_dir", lambda: Path(d))
+            import tools_skill
+            patch.setattr(tools_skill, "_skills_dir", lambda: Path(d))
             result = tools._exec_skill_setup(
                 {"name": "zhihu"}, tools.SOURCE_AUTO, None, None, "confirm",
             )
@@ -474,7 +479,8 @@ def test_skill_auth_helper_flow_and_policy():
         dummy.write_bytes(b"")
         patch = _Patch()
         try:
-            patch.setattr(tools, "_skills_dir", lambda: Path(d))
+            import tools_skill
+            patch.setattr(tools_skill, "_skills_dir", lambda: Path(d))
             result = tools._exec_skill_auth(
                 {"name": "zhihu", "secret": "s"}, tools.SOURCE_AUTO,
                 None, None, "confirm",
@@ -510,7 +516,8 @@ def test_skill_exec_auto_readonly_and_confirm_gate():
         dummy.write_bytes(b"")
         patch = _Patch()
         try:
-            patch.setattr(tools, "_resolve_skill_binary", lambda name: dummy)
+            import tools_skill
+            patch.setattr(tools_skill, "_resolve_skill_binary", lambda name: dummy)
             calls = []
 
             def fake_run(argv, input=None, capture_output=True, timeout=None, **kw):
@@ -595,41 +602,36 @@ def test_sandbox_read_write_list_run_and_policy():
 def test_declarations_default_has_bash():
     decls = tools.tool_declarations(_cfg("confirm"))
     names = [d["function"]["name"] for d in decls]
-    assert "web_search" in names and "run_bash" in names
-    assert "download_file" in names and "install_skill" in names
-    assert "sandbox_read" in names and "sandbox_write" in names
-    assert "sandbox_list" in names and "sandbox_run" in names
-    # 技能生命周期是 ctx 原语，不作为内置工具暴露（由 evolve tool 自升级生成）
-    assert "skill_status" not in names and "skill_setup" not in names
-    assert "skill_auth" not in names
-    assert len(decls) >= 9  # 9 内置 + 可能已自升级安装的进化工具
+    assert "web" in names and "bash" in names
+    assert "todo" in names and "skill" in names and "note" in names
+    assert "sandbox_read" not in names  # 沙盒已从默认声明移除
+    assert len(decls) == 5  # 未配置项目目录时只给通用工具
 
 
 def test_declarations_off_no_bash():
     decls = tools.tool_declarations(_cfg("off"))
     names = [d["function"]["name"] for d in decls]
-    assert "run_bash" not in names
-    assert "download_file" not in names and "install_skill" not in names
-    assert len(decls) == 6
+    assert "bash" not in names
+    assert "skill" not in names and "todo" not in names
+    assert len(decls) == 1  # off 档只保留只读搜索
 
 
 def test_declarations_readonly_has_download():
     # 声明与执行分离：readonly 档也声明，但执行时拒绝写操作
     decls = tools.tool_declarations(_cfg("readonly"))
     names = [d["function"]["name"] for d in decls]
-    assert "download_file" in names and "install_skill" in names
+    assert "skill" in names
 
 
 def test_declarations_download_mentions_dest():
     decls = tools.tool_declarations(_cfg("confirm"))
-    dl_decl = [d for d in decls if d["function"]["name"] == "download_file"][0]
-    assert "下载目录" in dl_decl["function"]["description"]
-    inst_decl = [d for d in decls if d["function"]["name"] == "install_skill"][0]
-    assert "zip_path" in inst_decl["function"]["parameters"]["required"]
+    skill = [d for d in decls if d["function"]["name"] == "skill"][0]
+    assert "download" in skill["function"]["description"]
+    assert "action" in skill["function"]["parameters"]["required"]
 
 def test_declarations_workdir():
     decls = tools.tool_declarations(_cfg("confirm"))
-    bash = [d for d in decls if d["function"]["name"] == "run_bash"][0]
+    bash = [d for d in decls if d["function"]["name"] == "bash"][0]
     assert "工作目录" in bash["function"]["description"]
 
 

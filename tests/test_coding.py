@@ -414,31 +414,31 @@ def test_edit_file_no_change(tmp_path):
 # ---------- 声明 ----------
 
 
-def test_coding_declarations_include_all_tools():
-    cfg = _cfg("confirm")
+def test_coding_declarations_include_all_tools(tmp_path):
+    cfg = _cfg("confirm", project_dir=str(tmp_path / "proj"))
     names = {d["function"]["name"] for d in tools.coding_declarations(cfg)}
     for t in tools.CODING_TOOLS:
         assert t in names
-    assert "web_search" in names
-    assert "run_bash" in names
+    assert "web" in names
+    assert len(names) == 12
 
 
 def test_coding_declarations_off_mode_readonly_only():
     cfg = _cfg("off")
     names = {d["function"]["name"] for d in tools.coding_declarations(cfg)}
     assert names & tools.CODING_TOOLS == set()
-    assert "run_bash" not in names
-    assert "web_search" in names
+    assert "bash" not in names
+    assert "web" in names
 
 
 def test_tool_declarations_coding_gated_by_project_dir():
     cfg = _cfg("confirm")
     names = {d["function"]["name"] for d in tools.tool_declarations(cfg)}
-    assert "read_file" not in names
+    assert "read" not in names
     cfg["project_dir"] = "/tmp"
     names = {d["function"]["name"] for d in tools.tool_declarations(cfg)}
-    assert "read_file" in names
-    assert "bg_exec" in names
+    assert "read" in names
+    assert "bg" in names
 
 
 def test_todo_tool_add_list_done_clear(tmp_path, monkeypatch):
@@ -456,6 +456,55 @@ def test_todo_tool_add_list_done_clear(tmp_path, monkeypatch):
     other.mkdir()
     assert "空的" in _exec("todo", {"action": "list"}, project_dir=other)
     assert "已清空" in _exec("todo", {"action": "clear"}, project_dir=proj)
+
+
+def test_note_tool_add_list_clear(tmp_path, monkeypatch):
+    proj = _make_project(tmp_path)
+    monkeypatch.setattr(tools, "user_data_dir", lambda: str(tmp_path))
+    out = _exec(
+        "note", {"action": "add", "text": "测试命令用 pytest -q"},
+        project_dir=proj,
+    )
+    assert "已记住" in out
+    out = _exec("note", {"action": "list"}, project_dir=proj)
+    assert "pytest -q" in out
+    assert "已清空" in _exec("note", {"action": "clear"}, project_dir=proj)
+
+
+def test_web_tool_category_dispatch(monkeypatch):
+    calls = []
+    monkeypatch.setitem(
+        tools.SEARCH_HANDLERS, "web_search",
+        lambda args: calls.append(args) or "ok",
+    )
+    out = _exec("web", {"category": "web", "query": "AI"})
+    assert out == "ok"
+    assert calls and calls[0]["query"] == "AI"
+
+
+def test_new_tool_names_work(tmp_path, monkeypatch):
+    proj = _make_project(tmp_path)
+    monkeypatch.setattr(tools, "user_data_dir", lambda: str(tmp_path))
+    out = _exec("read", {"path": "src/main.py"}, project_dir=proj)
+    assert "def hello()" in out
+    out = _exec("glob", {"pattern": "**/*.py"}, project_dir=proj)
+    assert "src/main.py" in out
+    out = _exec("grep", {"pattern": "def add"}, project_dir=proj)
+    assert "src/util.py" in out
+    _exec("write", {"path": "new.txt", "content": "x"}, project_dir=proj)
+    assert (proj / "new.txt").read_text(encoding="utf-8") == "x"
+    _exec(
+        "edit",
+        {"path": "src/main.py", "search": "return 'hi'", "replace": "return 'ok'"},
+        project_dir=proj,
+    )
+    assert "return 'ok'" in (proj / "src" / "main.py").read_text(encoding="utf-8")
+    out = _exec("bg", {"action": "exec", "command": "echo hi"}, project_dir=proj)
+    assert "已启动" in out
+    pid = out.split("：")[1].split("（")[0]
+    out = _exec("bg", {"action": "cancel", "task_id": pid}, project_dir=proj)
+    assert "取消" in out
+    assert "还没有安装技能" in _exec("skill", {"action": "list"}, project_dir=proj)
 
 
 def test_list_and_restore_backup(tmp_path, monkeypatch):
@@ -477,6 +526,26 @@ def test_list_and_restore_backup(tmp_path, monkeypatch):
     )
     assert "已从备份" in out
     assert "def hello()" in (proj / "src" / "main.py").read_text(encoding="utf-8")
+
+
+def test_backup_preview(tmp_path, monkeypatch):
+    proj = _make_project(tmp_path)
+    monkeypatch.setattr(tools, "user_data_dir", lambda: str(tmp_path))
+    _exec(
+        "write_file", {"path": "src/main.py", "content": "V2"},
+        project_dir=proj,
+    )
+    out = _exec("list_backups", {"path": "src/main.py"}, project_dir=proj)
+    backup_id = out.split("[")[1].split("]")[0]
+    (proj / "src" / "main.py").write_text("BROKEN", encoding="utf-8")
+    out = _exec(
+        "backup",
+        {"action": "preview", "backup_id": backup_id, "path": "src/main.py"},
+        project_dir=proj,
+    )
+    assert "当前内容" in out
+    assert "备份内容" in out
+    assert "def hello()" in out
 
 
 def test_plan_confirm_true_appends_plan(tmp_path):
